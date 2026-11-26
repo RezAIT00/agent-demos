@@ -8,6 +8,7 @@ Fixed prompts for coding agents, and what different models built from them. Ever
 |---|---|---|
 | [New York](prompts/new-york/) | A voxel diorama of New York City on a floating island at blue hour: one three.js HTML file and a 12-second looping video | 2 |
 | [Creates Everything](prompts/creates-everything/) | A 40–50 second one-shot film, all in code with synthesized sound, in which the model types code and the world transforms | 1 |
+| [Ultra-Realistic Blockworld](prompts/ultra-realistic-blockworld/) | A playable, photoreal first-person voxel sandbox game in one three.js HTML file, and a 30-second 1080p60 cinematic | 1 |
 
 ## Layout
 
