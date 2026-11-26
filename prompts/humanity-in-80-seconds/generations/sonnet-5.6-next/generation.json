@@ -1,0 +1,33 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-26",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 143,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": null,
+  "renderer": "Canvas2D silhouettes and landscapes, plus a WebGL2 compositor for the sky, the planet, a lit rock wall, procedural fire, bloom and the projection look; the opening and closing hands are ray-marched 3D shapes; written by the agent, no libraries",
+  "film_title": "THE SAME FIRE",
+  "video": {
+    "file": "humanity_2100.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 24,
+    "frames": 1920,
+    "duration_seconds": 80.0,
+    "codec": "h264 High, yuv420p, crf 16, about 7.5 Mbit/s, faststart",
+    "audio": "AAC 320k, 48 kHz stereo, -14.1 LUFS integrated, true peak -2.2 dBTP",
+    "size_bytes": 77927192,
+    "not_in_repo": "humanity_2100_x.mp4 (7.1 Mbit/s two-pass copy for X, 71207274 bytes) and soundtrack.wav (24-bit, 23040044 bytes); the master carries the same picture and audio"
+  },
+  "time_rule": {
+    "start": "300,000 BCE",
+    "end": "2100 CE",
+    "span_years": 302099,
+    "rates_years_per_second": "25000x6, 12000x5, 7000x7, 3500x5, 3000x3, 2500, 1500x4, 1000x2, 600x5, 400x4, 250x2, 230, 60x7, 34x3, 33, 16x5, 15x4, 12x2, 10x2, 8, 6, 5, 4, 1x7",
+    "present_2026_at_seconds": 65,
+    "audit": "year_audit.txt: 23/23 checks pass on all 1,920 frames"
+  },
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. All 9 runs in the session reported claude-sonnet-5-5 as the executed model, and the agent started no subagents. Before the prompt, the same session answered one short no-tools question the repo owner uses to check which model is answering. The prompt was written by an orchestrating Claude Opus 5.5 session that only prompted; all code is the Sonnet session's own. It was sent as one message, with the output folder filled in, an opening line saying the check had passed, a line saying the machine runs Windows with Python 3 (use a venv inside the output folder), and a note that the machine had under 10 GB of free disk. prompt.md leaves those out. About 50 minutes in, one operator note said a second agent session had started on the same CPU, GPU and disk and repeated the 3 GB folder limit; it did not change the brief. The session's later turns were wake-ups from its own background renders and audits finishing."
+}

@@ -1,0 +1,82 @@
+LUMA AND FLASH AUDIT - humanity_2100.mp4
+======================================================================
+mean luma over the film: min 1.7, max 129.3 (0-255)
+
+PASS  1,920 frames measured  [1920]
+PASS  no one-frame brightness pops (out and back by > 2 of 255)  [none]
+PASS  no unexplained jump in mean luma (> 5 of 255 between frames)  [largest step anywhere 18.75 at t=62.208 s]
+PASS  no single-frame step anywhere above 20 of 255, intended or not  [largest 18.75 at t=62.208 s]
+PASS  general flashes: at most 3 in any one second (whole frame)  [worst 1]
+PASS  general flashes: at most 3 in any one second (worst of 48 tiles)  [worst 1 in tile 4 near t=60.33 s]
+PASS  saturated-red flashes: at most 3 in any one second  [worst 2]
+
+OVERALL: PASS
+
+frame-to-frame steps above 5/255, with their cause (57):
+  t=26.958  step +5.36  the first dawn rising from the horizon
+  t=27.000  step +5.89  the first dawn rising from the horizon
+  t=27.042  step +5.47  the first dawn rising from the horizon
+  t=44.875  step -11.53  carried through the dark
+  t=44.917  step -13.53  carried through the dark
+  t=44.958  step -7.65  carried through the dark
+  t=45.208  step +10.85  carried through the dark
+  t=45.250  step +10.75  carried through the dark
+  t=46.917  step -7.76  carried through the dark
+  t=47.167  step +8.63  carried through the dark
+  t=47.208  step +9.63  carried through the dark
+  t=47.250  step +8.12  carried through the dark
+  t=48.875  step -5.60  carried through the dark
+  t=52.250  step +6.37  carried through the dark
+  t=52.292  step +6.03  carried through the dark
+  t=56.500  step -5.33  the lamp-lit scene burning away into the war (transition runs 56.15-56.75)
+  t=59.667  step +6.91  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=59.708  step +11.45  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=59.750  step +14.84  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=59.792  step +16.10  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=59.833  step +15.53  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=59.875  step +10.90  the 1945 light swelling (no flash: it rises over a third of a second)
+  t=60.083  step -7.49  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.125  step -12.16  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.167  step -16.49  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.208  step -18.01  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.250  step -15.13  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.292  step -9.25  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.625  step +5.07  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.667  step +5.87  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=60.708  step +5.57  carried through the dark, from 1945 to a living room (transition runs 60.01-60.83)
+  t=61.208  step +7.10  push into the television
+  t=61.333  step -5.50  push into the television
+  t=61.750  step -6.31  carried through the dark, from the Moon to a village
+  t=61.792  step -8.47  carried through the dark, from the Moon to a village
+  t=61.833  step -10.19  carried through the dark, from the Moon to a village
+  t=61.875  step -6.82  carried through the dark, from the Moon to a village
+  t=62.125  step +10.72  carried through the dark, from the Moon to a village
+  t=62.167  step +16.92  carried through the dark, from the Moon to a village
+  t=62.208  step +18.75  carried through the dark, from the Moon to a village
+  t=62.250  step +15.54  carried through the dark, from the Moon to a village
+  t=62.292  step +10.98  carried through the dark, from the Moon to a village
+  t=62.917  step -5.93  pull back from the evening village to the night planet
+  t=62.958  step -8.67  pull back from the evening village to the night planet
+  t=63.000  step -9.35  pull back from the evening village to the night planet
+  t=63.042  step -8.18  pull back from the evening village to the night planet
+  t=63.083  step -6.55  pull back from the evening village to the night planet
+  t=63.125  step -5.77  pull back from the evening village to the night planet
+  t=65.708  step +6.34  the 2026 line crossing the frame
+  t=65.750  step +6.60  the 2026 line crossing the frame
+  t=65.792  step +6.54  the 2026 line crossing the frame
+  t=65.833  step +6.40  the 2026 line crossing the frame
+  t=65.875  step +5.95  the 2026 line crossing the frame
+  t=65.917  step +5.77  the 2026 line crossing the frame
+  t=65.958  step +5.60  travelling from the night room out into morning
+  t=66.000  step +5.79  travelling from the night room out into morning
+  t=66.042  step +5.27  travelling from the night room out into morning
+
+mean luma per second (first frame of each):
+   0s:    8  11  15  13  16  17  29  29  28  30
+  10s:   30  18  19  21  21  21  21  23  32  35
+  20s:   34  31  35  46  56  57  20  52  67  76
+  30s:   86  91  89  92 122 120 126 128 126 120
+  40s:  113 110 104  86  56   3  30   2  36   2
+  50s:   19  20   2  29  29  29  37  22  21   9
+  60s:   91  33   2  48  17  34  91 109 120 106
+  70s:   96  74  62  52  33  34  23  22  23  22

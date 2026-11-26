@@ -1,0 +1,39 @@
+DELIVERY CHECKS
+======================================================================
+
+--- humanity_2100.mp4 ---
+size 74.3 MiB, total bitrate 7.79 Mbit/s, video 7.47 Mbit/s, audio 317 kbit/s
+PASS  H.264, 1920x1080, yuv420p, 24 fps  [h264 High 1920x1080 yuv420p 24/1]
+PASS  exactly 1,920 video frames (counted by decoding)  [1920]
+PASS  video duration 80.000 s  [80.000000 s]
+PASS  audio stream duration matches (80.000 s)  [80.000000 s, aac 48000 Hz 2 ch]
+PASS  container duration 80.000 s  [80.000000 s]
+PASS  +faststart (moov before mdat)  [ftyp moov free mdat]
+PASS  full decode with ffmpeg -v error is clean  [no messages]
+PASS  integrated loudness about -14 LUFS  [-14.1 LUFS, loudness range 4.6 LU]
+PASS  true peak at or below -1 dBTP  [-2.2 dBTP]
+PASS  no clipped samples after decoding  [0 clipped, sample peak -2.46 dBFS]
+decoded audio length: 3840000 sample frames = 80.0000 s
+
+--- humanity_2100_x.mp4 ---
+size 67.9 MiB, total bitrate 7.12 Mbit/s, video 6.80 Mbit/s, audio 317 kbit/s
+PASS  H.264, 1920x1080, yuv420p, 24 fps  [h264 High 1920x1080 yuv420p 24/1]
+PASS  exactly 1,920 video frames (counted by decoding)  [1920]
+PASS  video duration 80.000 s  [80.000000 s]
+PASS  audio stream duration matches (80.000 s)  [80.000000 s, aac 48000 Hz 2 ch]
+PASS  container duration 80.000 s  [80.000000 s]
+PASS  +faststart (moov before mdat)  [ftyp moov free mdat]
+PASS  full decode with ffmpeg -v error is clean  [no messages]
+PASS  integrated loudness about -14 LUFS  [-14.1 LUFS, loudness range 4.6 LU]
+PASS  true peak at or below -1 dBTP  [-2.2 dBTP]
+PASS  no clipped samples after decoding  [0 clipped, sample peak -2.46 dBFS]
+decoded audio length: 3840000 sample frames = 80.0000 s
+
+--- soundtrack.wav ---
+PASS  WAV is exactly 80.000 s (3,840,000 sample frames)  [3840000]
+PASS  WAV about -14 LUFS, true peak <= -1 dBTP, no clipping  [-14.0 LUFS, -2.4 dBTP, 0 clipped, LRA 4.6 LU]
+
+--- folder ---
+PASS  output folder under 3 GB  [176 MiB]
+
+OVERALL: PASS (23/23)

@@ -1,0 +1,4 @@
+PURITY CHECK - renderAt(t) depends only on t
+45 frames, two separate browser sessions; session A in order, session B shuffled with an unrelated frame before each one.
+pixel-identical: 45/45
+OVERALL: PASS
