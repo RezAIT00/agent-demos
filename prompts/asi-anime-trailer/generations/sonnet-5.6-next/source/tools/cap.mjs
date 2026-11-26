@@ -1,5 +1,5 @@
 // Frame-exact capture: headless Edge -> raw RGBA -> ffmpeg.
-// Plumbing adapted from opus55-creates/tools/cap.mjs (visuals are this film's own).
+// Plumbing adapted from an earlier project's capture script (visuals are this film's own).
 //   node tools/cap.mjs --times 1.2,3 --out out/s            stills (PNG)
 //   node tools/cap.mjs --times 1.2,3 --out out/s --tw 960   scaled stills
 //   node tools/cap.mjs --from 0 --to 87.5 --out out/video.mp4

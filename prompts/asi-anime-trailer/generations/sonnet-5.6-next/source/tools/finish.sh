@@ -2,7 +2,7 @@
 # Build everything from source, then run the delivery checks.
 #   bash tools/finish.sh            (render + audio + mux + checks)
 #   bash tools/finish.sh --no-render   (reuse out/video.mp4)
-# Adapted for plumbing from opus55-creates/tools/finish.sh.
+# Adapted for plumbing from an earlier project's finishing script.
 set -e
 cd "$(dirname "$0")/.."
 mkdir -p out

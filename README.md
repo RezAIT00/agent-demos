@@ -10,6 +10,7 @@ Fixed prompts for coding agents, and what different models built from them. Ever
 | [Creates Everything](prompts/creates-everything/) | A 40–50 second one-shot film, all in code with synthesized sound, in which the model types code and the world transforms | 1 |
 | [Ultra-Realistic Blockworld](prompts/ultra-realistic-blockworld/) | A playable, photoreal first-person voxel sandbox game in one three.js HTML file, and a 30-second 1080p60 cinematic | 1 |
 | [ASI Anime Trailer](prompts/asi-anime-trailer/) | A 60–90 second anime trailer about artificial superintelligence, with an original story and a synthesized score, all in code | 1 |
+| [Pelican Anime Trailer](prompts/pelican-anime-trailer/) | A 60–75 second action-anime trailer starring the pelican from the "pelican riding a bicycle" benchmark, with believable riding and a synthesized score, all in code | 1 |
 
 ## Layout
 
