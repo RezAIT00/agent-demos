@@ -1,0 +1,24 @@
+{
+  "label": "Opus 5.5 (Claude Code)",
+  "date": "2026-11-25",
+  "harness": "Claude Code",
+  "model_requested": "claude-opus-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 152,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": null,
+  "renderer": "custom WebGPU, written by the agent, no libraries",
+  "video": {
+    "file": "opus55_creates_x.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 60,
+    "frames": 3300,
+    "duration_seconds": 55.0,
+    "codec": "h264 High, yuv420p, about 7.7 Mbit/s",
+    "audio": "AAC, -14.1 LUFS integrated, true peak -1.5 dBTP",
+    "size_bytes": 54526749,
+    "master": "opus55_creates.mp4, crf 16, AAC 320k, 388135899 bytes, not in the repo"
+  },
+  "notes": "Fresh session on an RTX 5090, shared for part of the run with another agent session. Before the prompt, the session answered one short no-tools question the repo owner uses to check which model is answering. This generation was produced in a staged session (a proof of the opening, then the full film, then a fix pass); prompt.md consolidates those instructions into one prompt for future runs."
+}

@@ -1,0 +1,1645 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Opus 5.5 creates</title>
+<style>html,body{margin:0;background:#000;height:100%;overflow:hidden}canvas{width:100vw;height:100vh;object-fit:contain;display:block}</style></head>
+<body><canvas id="c" width="1920" height="1080"></canvas><script>
+"use strict";
+const WGSL={};
+WGSL["common"]=String.raw`
+struct Uniforms {
+  vp : mat4x4f, ivp : mat4x4f, svp : mat4x4f, rvp : mat4x4f,
+  cam : vec4f,    // xyz, t
+  sun : vec4f,    // direction to sun, sky light on (0..1)
+  sunC : vec4f,   // sun radiance (after atmosphere), w: exposure
+  birth : vec4f,  // ring centre x,z, radius R, ring strength
+  sky : vec4f,    // reveal angle, warp scale, haze density, flash
+  wave : vec4f,   // base stage, cam z, peel far drop, rise time
+  fr : vec4f,     // freeze front z, freeze on, nave z end, shatter time (s since, <0 = not yet)
+  res : vec4f,    // w,h,sub idx,nsub
+  jit : vec4f,    // rnd0..3
+  nave : vec4f,   // W, HW, GR, GB
+  flow : vec4f,   // face flow metres, displacement gain, foam gain, inside (0..1)
+  camF : vec4f, camR : vec4f, camU : vec4f, // w of camF: hfov, camR.w: aspect, camU.w: pass id (0 main,1 reflect,2 shadow)
+  misc : vec4f,   // frozen ocean flag, spray time, vol density, dust
+  seg : vec4f,    // t - T_FLY, t - T_CITY, t - T_GRAV, t - T_TIME
+  seg2 : vec4f,   // collapse, night, city.floors, space
+  gal : vec4f,    // galaxy centre, radius
+  gal2 : vec4f,   // galaxy time (from time.scale), lantern->star morph, star ignition, t - T_SEA
+  city : vec4f,   // boulevard x, city z0, -gravity, t - smash
+  ext : vec4f,    // x: the planar-reflection pass was rendered for this sub-frame (tRefl is valid), 0 otherwise
+};
+@group(0) @binding(0) var<uniform> u : Uniforms;
+@group(0) @binding(1) var sRep : sampler;
+@group(0) @binding(2) var sClamp : sampler;
+@group(0) @binding(3) var tDisp : texture_2d_array<f32>;
+@group(0) @binding(4) var tDeriv : texture_2d_array<f32>;
+@group(0) @binding(5) var tLut : texture_2d<f32>;
+@group(0) @binding(6) var tDome : texture_2d<f32>;
+@group(0) @binding(7) var tFoam : texture_2d<f32>;
+@group(0) @binding(8) var tShD : texture_depth_2d;
+@group(0) @binding(9) var tShC : texture_2d<f32>;
+@group(0) @binding(10) var tRefl : texture_2d<f32>;
+@group(0) @binding(11) var<storage, read> grid : array<f32>;
+@group(0) @binding(12) var sCmp : sampler_comparison;
+@group(0) @binding(13) var<storage, read> tubes : array<vec4f>;
+@group(0) @binding(14) var tNoise : texture_3d<f32>;
+@group(0) @binding(15) var tDepth : texture_depth_2d;
+@group(0) @binding(16) var<storage, read> birdsB : array<vec4f>;
+
+const PI = 3.14159265;
+const LC = vec4f(997.0, 211.0, 47.0, 11.0);
+fn sat(x:f32)->f32 { return clamp(x,0.0,1.0); }
+fn hash1(p:f32)->f32 { return fract(sin(p*127.1)*43758.5453); }
+fn hash21(p:vec2f)->f32 { var q=fract(vec3f(p.xyx)*0.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+fn hash22(p:vec2f)->vec2f { var q=fract(vec3f(p.xyx)*vec3f(0.1031,0.1030,0.0973)); q+=dot(q,q.yzx+33.33); return fract((q.xx+q.yz)*q.zy); }
+fn hash33(p:vec3f)->vec3f { var q=fract(p*vec3f(0.1031,0.1030,0.0973)); q+=dot(q,q.yxz+33.33); return fract((q.xxy+q.yxx)*q.zyx); }
+fn vnoise(p:vec2f)->f32 { let i=floor(p); let f=fract(p); let w=f*f*(3.0-2.0*f); return mix(mix(hash21(i),hash21(i+vec2f(1,0)),w.x),mix(hash21(i+vec2f(0,1)),hash21(i+vec2f(1,1)),w.x),w.y); }
+fn fbm2(p0:vec2f)->f32 { var p=p0; var a=0.5; var s=0.0; for(var i=0;i<4;i++){ s+=a*vnoise(p); p=mat2x2f(1.6,1.2,-1.2,1.6)*p; a*=0.5; } return s; }
+fn ign(p:vec2f, k:f32)->f32 { let q=p+5.588238*k; return fract(52.9829189*fract(0.06711056*q.x+0.00583715*q.y)); }
+fn hg(c:f32,g:f32)->f32 { let g2=g*g; return (1.0-g2)/(4.0*PI*pow(max(1.0+g2-2.0*g*c,1e-4),1.5)); }
+
+// --- dome mapping (dir <-> uv). Extra azimuth resolution ahead (+z), extra elevation resolution at the horizon.
+fn domeUV(d:vec3f)->vec2f {
+  let az=atan2(d.x,d.z)/PI; let el=asin(clamp(d.y,0.0,1.0));
+  return vec2f(0.5+0.5*sign(az)*pow(abs(az),0.75), sqrt(el/(0.5*PI)));
+}
+fn domeDir(uv:vec2f)->vec3f {
+  let q=uv.x*2.0-1.0; let az=sign(q)*pow(abs(q),1.0/0.75)*PI; let el=uv.y*uv.y*0.5*PI;
+  return vec3f(sin(az)*cos(el), sin(el), cos(az)*cos(el));
+}
+fn domeRaw(d:vec3f,lod:f32)->vec4f { var v=domeUV(d); v.y=max(v.y,0.5/1024.0); return textureSampleLevel(tDome,sClamp,v,lod); }
+// sky with the birth warp: the whole sky is thrown outward from the sun point
+fn skyWarp(d:vec3f)->vec4f { // xyz warped dir, w reveal
+  let c=clamp(dot(d,u.sun.xyz),-1.0,1.0); let ang=acos(c);
+  var dd=d;
+  if(u.sky.y<0.999){ let az0=atan2(u.sun.x,u.sun.z); var da=atan2(d.x,d.z)-az0; da-=2.0*PI*floor((da+PI)/(2.0*PI)); let az=az0+da/u.sky.y; let el=min(asin(clamp(d.y,-1.0,1.0))/mix(u.sky.y,1.0,0.35),1.5); dd=vec3f(sin(az)*cos(el),sin(el),cos(az)*cos(el)); }
+  let rev=1.0-smoothstep(u.sky.x*0.72,u.sky.x,ang);
+  return vec4f(dd,rev);
+}
+fn dome(d:vec3f,lod:f32)->vec4f {
+  let w=skyWarp(d); let q=domeRaw(normalize(vec3f(w.x,max(w.y,0.001),w.z)),max(lod,4.0*smoothstep(0.004,-0.004,w.y)));
+  let c=dot(d,u.sun.xyz); let ang=acos(clamp(c,-1.0,1.0));
+  let eq=(ang-u.sky.x*0.85)/(0.10+0.06*u.sky.x); let edge=exp(-eq*eq)*step(0.001,u.sky.x)*(1.0-smoothstep(1.2,2.6,u.sky.x));
+  return vec4f(q.rgb*w.w*u.sun.w + vec3f(1.0,0.62,0.30)*edge*2.2*u.sun.w, q.a);
+}
+
+// --- the sheet
+fn lutAt(s:f32,a:f32)->vec3f { // X offset, Y, heading
+  let x=clamp((s+120.0)/0.25,0.0,2046.0); let y=clamp(a*64.0,0.0,127.99);
+  let i=i32(floor(x)); let j=i32(floor(y)); let fx=x-f32(i); let fy=y-f32(j);
+  let a0=textureLoad(tLut,vec2i(i,j),0).xyz; let b0=textureLoad(tLut,vec2i(i+1,j),0).xyz;
+  let a1=textureLoad(tLut,vec2i(i,j+1),0).xyz; let b1=textureLoad(tLut,vec2i(i+1,j+1),0).xyz;
+  return mix(mix(a0,b0,fx),mix(a1,b1,fx),fy);
+}
+fn frontNoise(s:f32,z:f32)->f32 { return (vnoise(vec2f(s*0.085,z*0.06))-0.5)*16.0+(vnoise(vec2f(s*0.4,z*0.4))-0.5)*5.0; }
+// freeze amount at (s,z): 0 water .. 1 glass
+fn freezeAt(s:f32,z:f32)->f32 { return u.fr.y*sat((u.fr.x+frontNoise(s,z)-z)/60.0)*(1.0-step(u.fr.z+3.0,z)*smoothstep(-0.6,-0.4,u.fr.w)); }
+fn barrelStage(z:f32)->f32 { let n=(vnoise(vec2f(z/52.0,1.5))-0.5)*0.11+(vnoise(vec2f(z/17.0,7.5))-0.5)*0.035; return clamp(u.wave.x*(1.0-u.wave.z*smoothstep(70.0,460.0,z-u.wave.y))+n*u.wave.x*(1.0-0.5*u.wave.x),0.0,1.0); }
+fn stageAt(s:f32,z:f32)->f32 {
+  let b=barrelStage(z); let f=u.fr.y*sat((u.fr.x-z)/85.0);
+  let g=1.0-pow(1.0-f,3.0); let o=g+0.10*sin(g*PI)*sin(f*9.0);
+  let e=1.0-smoothstep(u.fr.z+3.0,u.fr.z+4.0,z)*step(0.5,u.fr.y)*smoothstep(-0.6,-0.4,u.fr.w);
+  return mix(b,2.0,clamp(o,0.0,1.0))*e;
+}
+struct Surf { p:vec3f, n:vec3f, ts:vec3f, tz:vec3f, y0:f32, st:f32, fz:f32, rim:f32 };
+fn flowS(s:f32)->f32 { return u.flow.x*smoothstep(-420.0,-60.0,s)*(1.0-smoothstep(150.0,170.0,s)); }
+fn waveMask(s:f32)->f32 { return smoothstep(-60.0,10.0,s)*(1.0-smoothstep(250.0,310.0,s)); }
+fn baseSurf(s:f32,z:f32)->Surf {
+  var o:Surf; let a=stageAt(s,z); let l=lutAt(s,a); let l1=lutAt(s,stageAt(s,z+2.0));
+  o.st=a; o.fz=freezeAt(s,z);
+  o.p=vec3f(s+l.x,l.y,z);
+  o.ts=vec3f(cos(l.z),sin(l.z),0.0); o.tz=normalize(vec3f((l1.x-l.x)*0.5,(l1.y-l.y)*0.5,1.0));
+  o.n=normalize(cross(o.tz,o.ts)); o.y0=l.y; return o;
+}
+fn seaDisp(q:vec2f,lod:f32,big:f32)->vec4f {
+  var d=vec4f(0.0);
+  for(var i=0;i<4;i++){ let L=LC[i]; let lo=max(0.0,lod+log2(256.0/L)); let w=select(1.0,big,i==0);
+    let t=textureSampleLevel(tDisp,sRep,q/L,i,lo); d+=vec4f(t.xyz*w,0.0); d.w+=(1.0-t.w)*w; }
+  return d;
+}
+fn ringAt(x:f32,z:f32)->vec3f { // height, sea gain, crest mask
+  let d=vec2f(x,z)-u.birth.xy; let r=length(d); let R=u.birth.z; let k=r-R;
+  let an=atan2(d.x,d.y); let nzl=vnoise(vec2f(an*10.0,u.cam.w*1.1))-0.5; let nzh=vnoise(vec2f(an*70.0,u.cam.w*5.0))-0.5; let early=exp(-max(R,0.0)/420.0); let fing=pow(vnoise(vec2f(an*31.0,u.cam.w*0.6)),3.0)*smoothstep(-34.0,-4.0,k)*early*0.0; let nz=nzl+0.22*nzh+fing*2.2;
+  let kk=k+nzl*26.0+nzh*6.0; let front=1.0/(1.0+exp(kk/7.0)); let hq=kk/select(64.0,24.0,kk>0.0); let h=exp(-hq*hq);
+  let gain=front*(1.0+0.6*exp(kk/260.0))*(1.0-0.55*h*u.birth.w);
+  let lump=mix(1.0,0.75+0.5*vnoise(vec2f(an*6.0,2.0+u.cam.w*0.7)),exp(-max(R,0.0)/900.0)); return vec3f(u.birth.w*h*(96.0+nz*22.0)*front*1.35*lump*(0.12+0.88*smoothstep(0.0,160.0,R)), gain, h*front*u.birth.w);
+}
+fn surf(s:f32,z:f32,lod:f32)->Surf {
+  var o=baseSurf(s,z);
+  let m=waveMask(s)*sat(u.wave.x*1.4); let big=mix(1.0,0.10,m);
+  let q=vec2f(s-flowS(s),z); var d=seaDisp(q,lod,big);
+  let ring=ringAt(o.p.x,z);
+  let keep=(1.0-o.fz)*u.flow.y*ring.y*mix(1.0,0.55,m)*(1.0-smoothstep(118.0,148.0,s)*(1.0-smoothstep(300.0,330.0,s))*sat(u.wave.x*2.0)*0.92);
+  let outN=d.y*keep;
+  o.p+=o.ts*d.x*keep+vec3f(0,0,1)*d.z*keep+o.n*outN;
+  let mq=(s+25.0)/7.5; o.p.y+=ring.x+(1.0-o.fz)*exp(-mq*mq)*smoothstep(0.72,1.0,o.st)*(1.0-step(1.5,o.st))*(6.0+3.5*(vnoise(vec2f(z*0.2,u.cam.w*2.0))-0.3)); o.rim=ring.z; let cw=cityWater(o.p.x,z); o.p.y+=cw.x; if(u.birth.w>0.001&&u.birth.z<20000.0){ let e=2.0; let gx=(ringAt(o.p.x+e,z).x-ring.x)/e; let gz=(ringAt(o.p.x,z+e).x-ring.x)/e; let g=vec3f(gx,0.0,gz); o.n=normalize(o.n*1.0-g); o.ts=normalize(o.ts+vec3f(0.0,gx,0.0)); o.tz=normalize(o.tz+vec3f(0.0,gz,0.0)); }
+  let dc=o.p.xz-u.cam.xz; o.p.y-=dot(dc,dc)/12742000.0;
+  return o;
+}
+
+// --- analytic nave: what a ray inside the cathedral hits (for reflections in crystal and stone)
+fn palette(i:i32)->vec3f {
+  switch(i%7){ case 0:{return vec3f(0.006,0.035,0.62);} case 1:{return vec3f(0.80,0.008,0.016);} case 2:{return vec3f(1.0,0.40,0.015);} case 3:{return vec3f(0.005,0.34,0.20);} case 4:{return vec3f(0.22,0.012,0.55);} case 5:{return vec3f(0.012,0.22,0.80);} default:{return vec3f(0.95,0.09,0.12);} }
+}
+const BAY = 14.0;
+// stained glass: rgb transmittance, a = lead / stone coverage
+fn vor(p:vec2f)->vec4f { let ip=floor(p); var d1=9.0; var d2=9.0; var id=vec2f(0); for(var j=-1;j<=1;j++){for(var i=-1;i<=1;i++){ let c=ip+vec2f(f32(i),f32(j)); let o=c+0.15+0.7*hash22(c); let d=distance(o,p); if(d<d1){d2=d1;d1=d;id=c;}else if(d<d2){d2=d;} }} return vec4f(d1,d2,id); }
+fn stained(z:f32,s:f32)->vec4f {
+  let W=u.nave.x; let HW=u.nave.y; let bayI=floor(z/BAY+0.5); let x=z-bayI*BAY; // x in -7..7, columns at +-7
+  var y=-1.0; var side=0.0;
+  if(s>W && s<W+HW){y=s-W;side=1.0;} else if(s>W+HW+70.0 && s<W+2.0*HW+70.0){y=W+2.0*HW+70.0-s;side=-1.0;}
+  if(y>=0.0){
+    let hw=5.5; let spr=19.5; let R=8.4; // pointed arch window
+    let ax=abs(x); var dw=hw-ax; if(y>spr){ dw=R-length(vec2f(ax+(R-hw),y-spr)); } dw=min(dw,y-2.2);
+    if(dw<0.0){ return vec4f(vec3f(0.16,0.30,0.34)*0.5,0.86); }
+    // tracery: 3 lights + roses
+    let lw=hw*2.0/3.0; let li=floor(x/lw+0.5); let lx=x-li*lw; let top=18.0;
+    var cell=0.0; var c=vec2f(lx,y); var edge=0.0; var key=0;
+    let rose=length(vec2f(x,y-22.6)); let r2=length(vec2f(ax-2.75,y-18.6));
+    if(rose<2.35){ key=7; c=vec2f(x,y-22.6); } else if(r2<1.55){ key=8; c=vec2f(ax-2.75,y-18.6); } else { key=i32(li)+1; }
+    let v=vor(vec2f(x,y)*1.15+vec2f(bayI*17.0,side*9.0));
+    let h=hash22(v.zw+bayI*3.1);
+    var base:i32; let bi=i32(bayI)+100;
+    if(key==7){ let a=atan2(c.y,c.x); let pet=floor((a/PI*0.5+0.5)*8.0); base=select(2,1,fract(pet*0.5)>0.25); if(length(c)<0.75){base=5;} }
+    else if(key==8){ base=3; }
+    else { // each bay keeps one ground colour; medallions carry the accent
+      let seq=array<i32,6>(0,0,4,1,2,5); let gb=seq[(bi/2+select(0,3,side<0.0))%6]; base=gb; let ab=seq[(bi/2+2+select(0,3,side<0.0))%6];
+      let med=fract((y+f32(key%2)*2.3)/4.6)*4.6-2.3; let qq=abs(vec2f(lx*1.05,med)); let quat=min(min(length(qq-vec2f(0.72,0.0)),length(qq-vec2f(0.0,0.72)))-0.62,(qq.x+qq.y)*0.707-0.72); let rr=length(qq); let sect=fract(floor((atan2(med,lx)/PI*0.5+0.5)*8.0)*0.5)>0.25;
+      if(quat<0.0){ base=select(ab,(ab+1)%7,sect&&rr>0.5); if(rr<0.42){base=2;} } else if(quat<0.17){ base=2; } else { let lat=abs(fract((lx+med)*0.62)-0.5)+abs(fract((lx-med)*0.62)-0.5); if(lat>0.83){ base=ab; } } }
+    var col=palette(base); let alt=palette((base+5)%7);
+    col=mix(col,alt,step(0.90,h.y)); col=mix(col,vec3f(0.9,0.75,0.45),step(0.992,h.x)*0.5);
+    col*=0.35+0.95*h.x*h.x+0.15*h.y;
+    var lead=1.0-smoothstep(0.035,0.075,(v.y-v.x)*0.55);
+    lead=max(lead,1.0-smoothstep(0.02,0.06,abs(abs(lx)-lw*0.5)*step(y,16.5)+10.0*step(16.5,y)));
+    lead=max(lead,1.0-smoothstep(0.0,0.14,dw));
+    return vec4f(col,lead);
+  }
+  // vault + floor edge: pale panels between ribs
+  let vs=(s-(W+HW)); let v2=vor(vec2f(z*0.42,vs*0.42)); let hh=hash22(v2.zw);
+  // midnight vault with gold stars
+  let sc=vec2f(z,vs)*0.55; let sv=vor(sc+40.0); let star=1.0-smoothstep(0.05,0.085,sv.x*(0.75+0.35*abs(sin(atan2(sc.y-sv.w-0.5,sc.x-sv.z-0.5)*2.5)))); let nv=mix(vec3f(0.006,0.035,0.17),vec3f(0.02,0.012,0.16),hh.x)*(0.5+0.8*hh.y);
+  return vec4f(mix(nv,vec3f(1.0,0.55,0.12)*1.2,star*step(0.35,hash21(sv.zw))),(1.0-smoothstep(0.015,0.04,(v2.y-v2.x)*0.5))*0.8);
+}
+fn skyThrough(d:vec3f,lod:f32)->vec3f { var q=d; q.y=abs(q.y)+0.03; let k=domeRaw(normalize(q),lod).rgb*u.sun.w; let c=sat(dot(d,u.sun.xyz)); return k+u.sunC.rgb*(hg(c,0.90)*0.10+hg(c,0.985)*0.030); }
+fn naveHit(p:vec3f,d:vec3f)->vec3f { // x: t, y: z, z: s
+  let W=u.nave.x; let HW=u.nave.y; let GR=u.nave.z;
+  var t=1e9; var zz=0.0; var ss=0.0;
+  if(d.y<-1e-4){ let tf=-p.y/d.y; t=tf; zz=p.z+d.z*tf; ss=-1.0; }
+  if(abs(d.x)>1e-4){ let tw=(sign(d.x)*W-p.x)/d.x; let y=p.y+d.y*tw; if(tw>0.0&&tw<t&&y>=0.0&&y<=HW){ t=tw; zz=p.z+d.z*tw; ss=select(W+2.0*HW+70.0-y,W+y,d.x>0.0); } }
+  for(var k=0;k<2;k++){ let sg=select(-1.0,1.0,k==0); let c=vec2f(-sg*(GR-W),HW); let o=p.xy-c; let a=dot(d.xy,d.xy); let b=dot(o,d.xy); let q=dot(o,o)-GR*GR; let disc=b*b-a*q;
+    if(disc>0.0&&a>1e-6){ let tt=(-b+sqrt(disc))/a; let h=p.xy+d.xy*tt; if(tt>0.0&&tt<t&&h.y>=HW&&h.x*sg>=-0.01){ t=tt; zz=p.z+d.z*tt; let an=asin(clamp((h.y-HW)/GR,0.0,1.0)); ss=select(W+HW+70.0-an*GR,W+HW+an*GR,sg>0.0); } } }
+  return vec3f(t,zz,ss);
+}
+fn shadowAt(p:vec3f,j:vec2f)->vec3f {
+  let q=u.svp*vec4f(p,1.0); let uv=q.xy*vec2f(0.5,-0.5)+0.5+j;
+  if(any(uv<vec2f(0.002))||any(uv>vec2f(0.998))){return vec3f(1.0);}
+  let v=textureSampleCompareLevel(tShD,sCmp,uv,q.z-0.0012);
+  return textureSampleLevel(tShC,sClamp,uv,0.0).rgb*v;
+}
+fn naveEnv(p:vec3f,d:vec3f)->vec3f {
+  let h=naveHit(p,d); if(h.x>400.0){ return skyThrough(d,3.0)*0.5; }
+  if(h.z<0.0){ let hp=p+d*h.x; return shadowAt(hp+vec3f(0,0.05,0),vec2f(0.0))*u.sunC.rgb*max(u.sun.y,0.05)*0.16+vec3f(0.02,0.03,0.05)*u.sun.w; }
+  let g=stained(h.y,h.z); return g.rgb*(1.0-g.a*0.9)*skyThrough(d,3.0)*1.25;
+}
+fn fogColor(d:vec3f)->vec3f { let h=normalize(vec3f(d.x,0.012,d.z)); return dome(h,3.5).rgb; }
+`;
+WGSL["common2"]=String.raw`
+// ===== shared by the rose, the birds and the city (appended to common at build time)
+struct PO { @builtin(position) pos:vec4f, @location(0) uv:vec2f, @location(1) wp:vec3f, @location(2) mi:vec4f };
+fn ringRw(tau:f32)->f32 { return 260.0*(1.0-exp(-tau/0.35))+110.0*tau+1400.0*max(0.0,tau-1.6)*max(0.0,tau-1.6); }
+fn crownHw(tau:f32)->f32 { return 310.0*(1.0-exp(-tau*3.2))*(1.0-0.78*smoothstep(1.0,2.7,tau)); }
+fn roseVert(i:vec2f)->vec2f { let j=(hash22(i+71.0)-0.5)*0.72; let cell=vec2f(40.0/144.0,60.0/216.0); return vec2f(-20.0,0.0)+(i+j)*cell; }
+fn roseAt(p:vec2f)->vec4f { // rgb, stone
+  let c=p-vec2f(0.0,30.0); let r=length(c); let th=atan2(c.x,c.y)/(2.0*PI)+0.5; var st=1.0; var key=0.0; var seed=0.0;
+  if(r<1.7){ st=0.0; key=2.0; }
+  else if(r<6.6){ let f=th*12.0; let i=floor(f); let l=abs(fract(f)-0.5)*2.0*PI*r/12.0; let w=mix(0.25,1.35,smoothstep(1.7,5.4,r)); let cap=length(vec2f(l,max(r-5.2,0.0)))-1.35; if((l<w&&r<5.2&&r>2.1)||(cap<0.0&&r>=5.2)){ st=0.0; key=select(0.0,1.0,fract(i*0.5)>0.25); seed=i; } }
+  else if(r<11.6){ let f=th*24.0+0.5; let i=floor(f); let l=abs(fract(f)-0.5)*2.0*PI*r/24.0; let w=mix(0.55,1.28,smoothstep(7.0,10.2,r)); let cap=length(vec2f(l,max(r-10.1,0.0)))-1.25; if((l<w&&r<10.1&&r>7.0)||(cap<0.0&&r>=10.1)){ st=0.0; key=select(4.0,5.0,fract(i/2.0)>0.25); if(fract(i/4.0)>0.7){key=2.0;} seed=i+30.0; } }
+  else if(r<14.6){ let f=th*24.0; let i=floor(f); let a=(i+0.5)/24.0*2.0*PI; let q=length(c-vec2f(sin(a-PI),cos(a-PI))*12.95); if(q<1.18){ st=0.0; key=select(6.0,3.0,fract(i/2.0)>0.25); if(q<0.5){key=2.0;} seed=i+60.0; } }
+  else if(p.y<14.2&&p.y>3.0&&abs(p.x)<14.0){ let li=floor(p.x/4.0+0.5); let lx=p.x-li*4.0; var w=1.5; if(p.y>11.8){ w=sqrt(max(0.0,2.4*2.4-(p.y-11.8)*(p.y-11.8)))-0.9; } if(abs(lx)<w){ st=0.0; key=f32((i32(li)+20)%7); seed=li+90.0; } }
+  let v=vor(p*1.35+seed); let h=hash22(v.zw+seed); var col=palette(i32(key)); col=mix(col,palette(i32(key)+1+i32(h.x*3.0)),step(0.78,h.y)); col*=0.7+0.6*h.x;
+  let lead=1.0-smoothstep(0.03,0.07,(v.y-v.x)*0.5); return vec4f(col,max(st,lead*0.95));
+}
+// slow-motion burst: shards race out, then hang; shards that do not become birds fall after the birds leave
+struct SD { mid:vec2f, off:vec3f, ax:vec3f, an:f32, tt:f32, hax:vec2f };
+fn isBirdCell(c:vec2f)->bool { let k=u32(c.y)*144u+u32(c.x); return birdsB[BIRD_OFF1+k/4u][k%4u]>0.5; }
+fn shardDyn(c:vec2f,t:f32,bird:bool)->SD {
+  var o:SD; let flip=hash21(c)>0.5; var d0=roseVert(c); var d1=roseVert(c+vec2f(1.0,1.0)); if(flip){ d0=roseVert(c+vec2f(1.0,0.0)); d1=roseVert(c+vec2f(0.0,1.0)); }
+  o.mid=(d0+d1)*0.5; o.hax=normalize(d1-d0); let h=hash33(vec3f(c,1.0)); let h2=hash33(vec3f(c.yx,6.0));
+  let tau=t-13.0+0.07; var ts=select(0.62*(1.0-exp(-tau/0.24)),0.0,tau<=0.0); if(!bird){ ts+=max(t-13.15,0.0)*0.9; }
+  let rel=o.mid-vec2f(0.0,30.0); let r=length(rel); let tt=max(ts-r*0.006,0.0); o.tt=tt; let sp=mix(78.0,16.0,sat(r/17.0))*(0.30+h.x);
+  o.off=vec3f(rel/max(r,0.2)*sp*0.42*tt+(h2.xy-0.5)*9.0*tt, sp*1.5*tt*(0.3+h.y)+(h2.z-0.5)*9.0*tt); o.off.y-=1.2*tt*tt+select(0.0,14.0*max(t-13.15,0.0)*max(t-13.15,0.0),!bird);
+  o.ax=normalize(h2-0.5); o.an=tt*(3.0+14.0*h.z); return o;
+}
+fn rotA(p:vec3f,ax:vec3f,an:f32)->vec3f { return p*cos(an)+cross(ax,p)*sin(an)+ax*dot(ax,p)*(1.0-cos(an)); }
+// ---- the city that comes out of the sea
+const CELL = 50.0;
+struct Tower { c:vec2f, hw:vec2f, H:f32, top:f32, tr:f32, tl:f32, h:vec4f, ok:f32, lift:f32, rise:f32 };
+fn towerAt(ij:vec2i)->Tower {
+  var T:Tower; let fi=vec2f(ij); let h=hash22(fi+vec2f(31.7,77.1)); let h2=hash22(fi.yx+vec2f(5.3,9.1)); let h3=hash22(fi+vec2f(13.0,2.0));
+  T.h=vec4f(h,h2); T.c=vec2f(u.city.x+fi.x*CELL,u.city.y+fi.y*CELL);
+  T.ok=select(0.0,1.0,ij.x!=0&&h.x>0.08&&ij.y>=0&&ij.y<CITYNZ_C);
+  T.hw=vec2f(9.0+9.5*h.y,9.0+9.5*h2.x); let ax=abs(fi.x*CELL);
+  T.H=u.seg2.z*3.6*(0.20+0.80*pow(h2.y,0.6))*(1.0-0.55*smoothstep(380.0,1000.0,ax))*(0.72+0.28*smoothstep(0.0,700.0,fi.y*CELL));
+  T.tr=T_CITY_C+0.30+length(vec2f(fi.x*CELL,fi.y*CELL-120.0))*0.00115+0.45*h3.x;
+  let k=sat((u.cam.w-T.tr)/2.4); T.rise=1.0-(1.0-k)*(1.0-k)*(1.0-k);
+  T.tl=T_GRAV_C+0.15+0.6*h3.y+0.0003*length(fi*CELL-vec2f(0.0,700.0)); let dt=max(u.cam.w-T.tl,0.0); T.lift=0.5*u.city.z*0.8*dt*dt;
+  T.top=T.H*T.rise+T.lift; return T;
+}
+fn cityWater(x:f32,z:f32)->vec3f { // water heaped up and foaming round the rising towers
+  if(u.seg.y<-0.2||u.seg2.w>0.99){ return vec3f(0.0); }
+  let base=vec2i(round((vec2f(x,z)-u.city.xy)/CELL)); var bump=0.0; var foam=0.0; var glow=0.0;
+  for(var j=-1;j<=1;j++){ for(var i=-1;i<=1;i++){ let T=towerAt(base+vec2i(i,j)); if(T.ok<0.5){continue;} let age=u.cam.w-T.tr; if(age<0.0){continue;}
+    let q=abs(vec2f(x,z)-T.c)-T.hw; let d=length(max(q,vec2f(0.0)))+min(max(q.x,q.y),0.0); if(d>60.0){continue;}
+    bump+=9.0*exp(-max(d,0.0)/10.0)*sat(age*2.5)*(1.0-sat(age/3.2))*(1.0-sat(T.lift*0.05));
+    glow+=exp(-max(d,0.0)/18.0)*sat(age*2.0)*(1.0-sat(age/3.0))*min(T.H*0.0008,0.45); foam=max(foam,exp(-max(d,0.0)/2.5)*0.9*(1.0-sat(age/3.5))*(1.0-sat(T.lift*0.02))); } }
+  return vec3f(bump,foam,glow);
+}
+fn starField(d:vec3f,k:f32)->vec3f {
+  let n=d/(abs(d.x)+abs(d.y)+abs(d.z)); var uv=n.xz; if(n.y<0.0){ uv=(1.0-abs(n.zx))*sign(n.xz+vec2f(1e-6)); }
+  var c=vec3f(0.0);
+  for(var l=0;l<2;l++){ let sc=select(700.0,1500.0,l==1); let g=uv*sc; let ip=floor(g); let h=hash22(ip+vec2f(7.1+f32(l)*13.0,3.3)); let f=fract(g)-0.15-0.7*h; let b=pow(hash21(ip+11.0+f32(l)*5.0),select(28.0,14.0,l==1));
+    let tint=mix(vec3f(0.65,0.78,1.0),vec3f(1.0,0.82,0.62),hash21(ip+3.0)); c+=tint*b*exp(-dot(f,f)*sc*0.9)*select(60.0,22.0,l==1); }
+  let gal=normalize(vec3f(0.35,0.62,-0.70)); let band=exp(-pow(dot(d,gal)/0.16,2.0))*(0.4+0.6*fbm2(uv*9.0));
+  return c*k+vec3f(0.55,0.58,0.75)*band*0.035*k;
+}
+`;
+WGSL["compute"]=String.raw`
+// ---------- FFT ocean ----------
+struct FU { t:f32, gain:f32, choppy:f32, pad:f32 };
+@group(0) @binding(0) var<uniform> fu : FU;
+@group(0) @binding(1) var<storage,read> h0 : array<vec4f>;      // h0(k), conj h0(-k)
+@group(0) @binding(2) var<storage,read_write> buf : array<vec4f>; // [c][y][x][2]
+@group(0) @binding(3) var oDisp : texture_storage_2d_array<rgba16float, write>;
+@group(0) @binding(4) var oDer : texture_storage_2d_array<rgba16float, write>;
+const N = 256u; const PI2 = 6.28318530718;
+const LCs = vec4f(997.0, 211.0, 47.0, 11.0);
+fn cmul(a:vec2f,b:vec2f)->vec2f { return vec2f(a.x*b.x-a.y*b.y,a.x*b.y+a.y*b.x); }
+fn im(a:vec2f)->vec2f { return vec2f(-a.y,a.x); }
+@compute @workgroup_size(8,8,4)
+fn spectrum(@builtin(global_invocation_id) g:vec3u){
+  let L=LCs[g.z]; let kx=f32(select(i32(g.x)-256,i32(g.x),g.x<128u))*PI2/L; let kz=f32(select(i32(g.y)-256,i32(g.y),g.y<128u))*PI2/L;
+  let k=max(sqrt(kx*kx+kz*kz),1e-6); let w=sqrt(9.81*k*(1.0+k*k/(370.0*370.0))); let ph=w*fu.t; let e=vec2f(cos(ph),sin(ph));
+  let q=h0[g.z*N*N+g.y*N+g.x]; let h=(cmul(q.xy,e)+cmul(q.zw,vec2f(e.x,-e.y)))*fu.gain; let ih=im(h);
+  let Dx=ih*(kx/k); let Dz=ih*(kz/k); let Dy=h; let sx=ih*kx; let sz=ih*kz; let dzx=-h*(kx*kz/k); let dxx=-h*(kx*kx/k); let dzz=-h*(kz*kz/k);
+  let A=Dx+im(Dz); let B=Dy+im(dzx); let C=sx+im(sz); let E=dxx+im(dzz);
+  let i=(g.z*N*N+g.y*N+g.x)*2u; buf[i]=vec4f(A,B); buf[i+1u]=vec4f(C,E);
+}
+var<workgroup> a : array<vec4f,512>;
+fn rev8(x:u32)->u32 { return reverseBits(x)>>24u; }
+fn fftN(li:u32){
+  for(var m=0u;m<8u;m++){ workgroupBarrier(); let half=1u<<m; let grp=li>>m; let k=li&(half-1u); let i0=grp*2u*half+k; let i1=i0+half;
+    let an=PI2*f32(k)/f32(2u*half); let w=vec2f(cos(an),sin(an));
+    for(var c=0u;c<2u;c++){ let x=a[i0*2u+c]; let y=a[i1*2u+c]; let wy=vec4f(cmul(w,y.xy),cmul(w,y.zw)); a[i0*2u+c]=x+wy; a[i1*2u+c]=x-wy; } }
+  workgroupBarrier();
+}
+@compute @workgroup_size(128)
+fn fftRow(@builtin(local_invocation_id) l:vec3u,@builtin(workgroup_id) wg:vec3u){
+  let base=(wg.y*N*N+wg.x*N)*2u;
+  for(var c=0u;c<2u;c++){ for(var q=0u;q<2u;q++){ let j=l.x*2u+c; a[rev8(j)*2u+q]=buf[base+j*2u+q]; } }
+  fftN(l.x);
+  for(var c=0u;c<2u;c++){ for(var q=0u;q<2u;q++){ let j=l.x*2u+c; buf[base+j*2u+q]=a[j*2u+q]; } }
+}
+@compute @workgroup_size(128)
+fn fftCol(@builtin(local_invocation_id) l:vec3u,@builtin(workgroup_id) wg:vec3u){
+  let base=(wg.y*N*N+wg.x)*2u;
+  for(var c=0u;c<2u;c++){ for(var q=0u;q<2u;q++){ let j=l.x*2u+c; a[rev8(j)*2u+q]=buf[base+j*N*2u+q]; } }
+  fftN(l.x);
+  for(var c=0u;c<2u;c++){ for(var q=0u;q<2u;q++){ let j=l.x*2u+c; buf[base+j*N*2u+q]=a[j*2u+q]; } }
+}
+@compute @workgroup_size(8,8,4)
+fn assemble(@builtin(global_invocation_id) g:vec3u){
+  let i=(g.z*N*N+g.y*N+g.x)*2u; let p=buf[i]; let q=buf[i+1u]; let l=fu.choppy;
+  let jx=1.0+l*q.z; let jz=1.0+l*q.w; let J=jx*jz-l*l*p.w*p.w;
+  let sx=q.x/max(jx,0.35); let sz=q.y/max(jz,0.35);
+  textureStore(oDisp,g.xy,g.z,vec4f(l*p.x,p.z,l*p.y,J));
+  textureStore(oDer,g.xy,g.z,vec4f(sx,sz,sx*sx+sz*sz,J));
+}
+`;
+WGSL["mips"]=String.raw`
+@group(0) @binding(0) var tIn : texture_2d_array<f32>;
+@group(0) @binding(1) var tOut : texture_storage_2d_array<rgba16float, write>;
+@compute @workgroup_size(8,8,1)
+fn mip(@builtin(global_invocation_id) g:vec3u){
+  let d=vec2i(textureDimensions(tIn,0)); let p=vec2i(g.xy)*2; let l=i32(g.z);
+  let s=textureLoad(tIn,min(p,d-1),l,0)+textureLoad(tIn,min(p+vec2i(1,0),d-1),l,0)+textureLoad(tIn,min(p+vec2i(0,1),d-1),l,0)+textureLoad(tIn,min(p+vec2i(1,1),d-1),l,0);
+  textureStore(tOut,g.xy,l,s*0.25);
+}
+`;
+WGSL["noise"]=String.raw`
+// Cloud noise volume (128^3, tiling) and foam lace texture, both generated once on the GPU.
+@group(0) @binding(0) var oVol : texture_storage_3d<rgba8unorm, write>;
+@group(0) @binding(1) var oFoam : texture_storage_2d<rgba8unorm, write>;
+fn h33(p:vec3f)->vec3f { var q=fract(p*vec3f(0.1031,0.1030,0.0973)); q+=dot(q,q.yxz+33.33); return fract((q.xxy+q.yxx)*q.zyx); }
+fn wrap(p:vec3f,n:f32)->vec3f { return p-floor(p/n)*n; }
+fn worley(p:vec3f,n:f32)->f32 { let ip=floor(p*n); let f=fract(p*n); var d=9.0; for(var z=-1;z<=1;z++){for(var y=-1;y<=1;y++){for(var x=-1;x<=1;x++){ let o=vec3f(f32(x),f32(y),f32(z)); let c=h33(wrap(ip+o,n)+n*7.0); let r=o+c-f; d=min(d,dot(r,r)); }}} return 1.0-clamp(sqrt(d),0.0,1.0); }
+fn grad(p:vec3f,f:vec3f)->f32 { let g=h33(p)*2.0-1.0; return dot(g,f); }
+fn perlin(p:vec3f,n:f32)->f32 { let q=p*n; let i=floor(q); let f=fract(q); let w=f*f*f*(f*(f*6.0-15.0)+10.0); var v=array<f32,8>(); for(var k=0;k<8;k++){ let o=vec3f(f32(k&1),f32((k>>1)&1),f32((k>>2)&1)); v[k]=grad(wrap(i+o,n)+n*3.0,f-o); }
+  let x0=mix(v[0],v[1],w.x); let x1=mix(v[2],v[3],w.x); let x2=mix(v[4],v[5],w.x); let x3=mix(v[6],v[7],w.x); return mix(mix(x0,x1,w.y),mix(x2,x3,w.y),w.z); }
+fn remap(x:f32,a:f32,b:f32,c:f32,d:f32)->f32 { return c+(x-a)/(b-a)*(d-c); }
+@compute @workgroup_size(4,4,4)
+fn vol(@builtin(global_invocation_id) g:vec3u){
+  let p=(vec3f(g)+0.5)/128.0;
+  var pf=0.0; var a=0.5; var n=4.0; for(var i=0;i<5;i++){ pf+=a*perlin(p,n); n*=2.0; a*=0.5; }
+  pf=clamp(pf*0.9+0.5,0.0,1.0);
+  let w0=worley(p,4.0)*0.625+worley(p,8.0)*0.25+worley(p,16.0)*0.125;
+  let pw=clamp(remap(pf,0.0,1.0,w0,1.0),0.0,1.0);
+  let w1=worley(p,8.0)*0.625+worley(p,16.0)*0.25+worley(p,32.0)*0.125;
+  let w2=worley(p,16.0)*0.625+worley(p,32.0)*0.25+worley(p,64.0)*0.125;
+  textureStore(oVol,g,vec4f(pw,w1,w2,pf));
+}
+fn w2d(p:vec2f,n:f32,sd:f32)->vec2f { let ip=floor(p*n); let f=fract(p*n); var d1=9.0; var d2=9.0; for(var y=-1;y<=1;y++){for(var x=-1;x<=1;x++){ let o=vec2f(f32(x),f32(y)); let c=ip+o; let cw=c-floor(c/n)*n; let r=o+h33(vec3f(cw,sd)).xy-f; let d=length(r); if(d<d1){d2=d1;d1=d;}else if(d<d2){d2=d;} }} return vec2f(d1,d2); }
+fn lace(p:vec2f,n:f32,sd:f32)->f32 { let w=w2d(p,n,sd); return 1.0-smoothstep(0.0,0.32,w.y-w.x); }
+@compute @workgroup_size(8,8)
+fn foam(@builtin(global_invocation_id) g:vec3u){
+  let p=(vec2f(g.xy)+0.5)/1024.0;
+  let wx=vec2f(perlin(vec3f(p,0.3),6.0),perlin(vec3f(p,0.7),6.0))*0.05+vec2f(perlin(vec3f(p,0.1),24.0),perlin(vec3f(p,0.9),24.0))*0.012;
+  let q=fract(p+wx);
+  let l=max(max(lace(q,14.0,1.0),lace(q,31.0,2.0)*0.75),lace(q,67.0,3.0)*0.55);
+  let bub=w2d(q,90.0,4.0).x; let b=1.0-smoothstep(0.10,0.45,bub);
+  let cl=perlin(vec3f(p,0.5),5.0)*0.9+perlin(vec3f(p,0.5),13.0)*0.5+perlin(vec3f(p,.5),40.0)*0.25;
+  textureStore(oFoam,g.xy,vec4f(clamp(l,0.0,1.0),b,clamp(cl*0.7+0.5,0.0,1.0),w2d(q,200.0,5.0).x));
+}
+`;
+WGSL["post"]=String.raw`
+struct PU { a:vec4f, b:vec4f, c:vec4f }; // c: time since the wall hit the lens, grade, collapse, - // a: exposure, bloom, t, flash ; b: texel x,y, mode, ca
+@group(0) @binding(0) var<uniform> pu : PU;
+@group(0) @binding(1) var smp : sampler;
+@group(0) @binding(2) var tA : texture_2d<f32>;
+@group(0) @binding(3) var tB : texture_2d<f32>;
+struct FO { @builtin(position) pos:vec4f, @location(0) uv:vec2f };
+@vertex fn vsFull(@builtin(vertex_index) i:u32)->FO { var o:FO; let p=vec2f(f32((i<<1u)&2u),f32(i&2u)); o.pos=vec4f(p*2.0-1.0,0.0,1.0); o.uv=vec2f(p.x,1.0-p.y); return o; }
+@fragment fn fsAccum(i:FO)->@location(0) vec4f { let c=textureLoad(tA,vec2i(i.pos.xy),0).rgb; return vec4f(min(c,vec3f(250.0))*pu.a.x,1.0); }
+fn S(uv:vec2f)->vec3f { return textureSampleLevel(tA,smp,uv,0.0).rgb; }
+@fragment fn fsDown(i:FO)->@location(0) vec4f {
+  let t=pu.b.xy; let uv=i.uv; var c=S(uv)*0.125; c+=(S(uv+t*vec2f(-1,-1))+S(uv+t*vec2f(1,-1))+S(uv+t*vec2f(-1,1))+S(uv+t*vec2f(1,1)))*0.125;
+  c+=(S(uv+t*vec2f(-2,0))+S(uv+t*vec2f(2,0))+S(uv+t*vec2f(0,-2))+S(uv+t*vec2f(0,2)))*0.0625; c+=(S(uv+t*vec2f(-2,-2))+S(uv+t*vec2f(2,-2))+S(uv+t*vec2f(-2,2))+S(uv+t*vec2f(2,2)))*0.03125;
+  if(pu.b.z>0.5){ let l=max(c.r,max(c.g,c.b)); c*=min(1.0,60.0/max(l,1e-4)); }
+  return vec4f(c,1.0);
+}
+@fragment fn fsUp(i:FO)->@location(0) vec4f {
+  let t=pu.b.xy; let uv=i.uv; var c=S(uv)*4.0; c+=(S(uv+t*vec2f(-1,0))+S(uv+t*vec2f(1,0))+S(uv+t*vec2f(0,-1))+S(uv+t*vec2f(0,1)))*2.0; c+=S(uv+t*vec2f(-1,-1))+S(uv+t*vec2f(1,-1))+S(uv+t*vec2f(-1,1))+S(uv+t*vec2f(1,1));
+  return vec4f(c/16.0*pu.a.y,1.0);
+}
+fn aces(x:vec3f)->vec3f {
+  let m1=mat3x3f(0.59719,0.07600,0.02840, 0.35458,0.90834,0.13383, 0.04823,0.01566,0.83777); let m2=mat3x3f(1.60475,-0.10208,-0.00327, -0.53108,1.10813,-0.07276, -0.07367,-0.00605,1.07602);
+  let v=m1*x; let a=v*(v+0.0245786)-0.000090537; let b=v*(0.983729*v+0.4329510)+0.238081; return clamp(m2*(a/b),vec3f(0.0),vec3f(1.0));
+}
+fn sat1(x:f32)->f32 { return clamp(x,0.0,1.0); }
+fn h(p:vec2f)->f32 { var q=fract(vec3f(p.xyx)*0.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+@fragment fn fsFinal(i:FO)->@location(0) vec4f {
+  var uv=i.uv; let c0=uv-0.5; let r2=dot(c0,c0); let ca=c0*r2*pu.b.w;
+  // water on the lens after the wall: each drop is a little inverted lens that slides and drains
+  var shade=1.0; var spec=0.0; var soft=0.0; let lt=pu.c.x;
+  if(lt>0.0&&lt<2.8){ for(var k=0;k<14;k++){ let fk=f32(k); let hk=vec3f(h(vec2f(fk,1.0)),h(vec2f(fk,2.0)),h(vec2f(fk,3.0))); let h2=vec2f(h(vec2f(fk,4.0)),h(vec2f(fk,5.0)));
+      let a=lt-hk.z*0.16; if(a<0.0){continue;} let rad=(0.007+0.020*hk.x*hk.x)*(1.0+0.15*min(a,1.0)); let cp=vec2f(0.04+0.92*h2.x,0.04+0.92*h2.y+0.060*a*a*(0.25+hk.y));
+      let life=1.0-smoothstep(0.5+hk.y*0.5,1.1+hk.y*0.5,a); let dv=(uv-cp)*vec2f(1.7778,1.0)*vec2f(1.0,0.55+0.35*hk.z); let d=length(dv)/rad; if(d<1.0&&life>0.01){ let w=life*smoothstep(1.0,0.82,d);
+        uv=mix(uv,cp-(uv-cp)*0.85,w); shade*=mix(1.0,0.82+0.18*(1.0-pow(d,6.0)),w); spec+=w*exp(-dot(dv/rad-vec2f(-0.35,-0.40),dv/rad-vec2f(-0.35,-0.40))*30.0)*0.04; soft=max(soft,w*0.4); } } }
+  var col=vec3f(textureSampleLevel(tA,smp,uv+ca,0.0).r,textureSampleLevel(tA,smp,uv,0.0).g,textureSampleLevel(tA,smp,uv-ca,0.0).b);
+  col=mix(col,textureSampleLevel(tB,smp,uv,0.0).rgb*1.2,soft)*shade+vec3f(spec);
+  let bl=textureSampleLevel(tB,smp,uv,0.0).rgb; col=mix(col,bl,pu.b.z);
+  col*=pu.a.x; col*=1.0-0.55*r2*smoothstep(0.0,0.6,r2)*1.6;
+  let l=dot(col,vec3f(0.2126,0.7152,0.0722)); col=max(mix(vec3f(l),col,1.14),vec3f(0.0));
+  col=aces(col*1.25); col=pow(col,vec3f(1.0/2.2));
+  let gk=pu.c.y; let lu=dot(col,vec3f(0.299,0.587,0.114)); col=mix(col,col*mix(vec3f(0.90,1.0,1.09),vec3f(1.07,1.0,0.91),smoothstep(0.12,0.72,lu)),0.55*gk); col=mix(col,col*col*(3.0-2.0*col),0.22*gk);
+  let g=(h(i.pos.xy+fract(pu.a.z*7.13)*vec2f(531.0,317.0))+h(i.pos.xy+fract(pu.a.z*3.7)*vec2f(131.0,717.0))-1.0); col+=g*(0.009+0.009*(1.0-sat1(l)));
+  return vec4f(col,1.0);
+}
+`;
+WGSL["screen"]=String.raw`
+struct FO { @builtin(position) pos:vec4f, @location(0) uv:vec2f };
+@vertex fn vsFull(@builtin(vertex_index) i:u32)->FO { var o:FO; let p=vec2f(f32((i<<1u)&2u),f32(i&2u)); o.pos=vec4f(p*2.0-1.0,0.0,1.0); o.uv=vec2f(p.x,1.0-p.y); return o; }
+fn viewDir(uv:vec2f)->vec3f { let th=tan(u.camF.w*0.5); let n=(uv*2.0-1.0)*vec2f(1.0,-1.0); return normalize(u.camF.xyz+u.camR.xyz*n.x*th+u.camU.xyz*n.y*th/u.camR.w); }
+@fragment fn fsSky(i:FO)->@location(0) vec4f {
+  var d=viewDir(i.uv+(u.jit.zw-0.5)/u.res.xy); if(u.camU.w>0.5&&u.camU.w<1.5){ d=normalize(vec3f(d.x,abs(d.y)+0.001,d.z)); }
+  let q=dome(d,0.0); var c=q.rgb; let mu=clamp(dot(d,u.sun.xyz),-1.0,1.0); let ang=acos(mu);
+  let disc=1.0-smoothstep(0.0075,0.0095,ang); let tr=mix(q.a,1.0,0.25);
+  c+=u.sunC.rgb*(disc*60.0*tr+exp(-ang*22.0)*0.55*tr+exp(-ang*5.0)*0.05)*u.sun.w;
+  c+=vec3f(1.0,0.86,0.66)*u.sky.w*(exp(-ang*46.0)*60.0+exp(-ang*9.0)*3.0);
+  c=c*(1.0-u.seg2.w)+starField(d,max(u.seg2.y,u.seg2.w)*(1.0-u.seg2.x));
+  return vec4f(c,1.0);
+}
+@fragment fn fsVol(i:FO)->@location(0) vec4f {
+  let px=vec2i(i.pos.xy); let z=textureLoad(tDepth,px,0); let d=viewDir(i.uv); var tmax=260.0;
+  if(z>1e-7){ let ndc=vec4f((i.uv*2.0-1.0)*vec2f(1.0,-1.0),z,1.0); let w=u.ivp*ndc; tmax=min(tmax,distance(w.xyz/w.w,u.cam.xyz)); }
+  let n=26; let j=ign(i.pos.xy,u.res.z+floor(u.jit.x*31.0)); var C=vec3f(0.0); var T=1.0; let mu=dot(d,u.sun.xyz); let ph=hg(mu,0.40)*0.62+hg(mu,0.82)*0.10+0.03; let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w;
+  for(var k=0;k<n;k++){ let a=(f32(k)+j)/f32(n); let t=tmax*a*a; let dt=tmax*2.0*a/f32(n); let p=u.cam.xyz+d*t;
+    let ins=step(p.z,u.fr.z); let nz=textureSampleLevel(tNoise,sRep,p/vec3f(46.0,30.0,46.0)+vec3f(0.0,-u.cam.w*0.01,u.cam.w*0.02),0.0);
+    let den=u.misc.z*(0.35+1.3*nz.x)*ins; if(den>1e-6){ let s=shadowAt(p,vec2f(0.0)); let S=s*u.sunC.rgb*ph*1.25+amb*vec3f(0.10,0.14,0.17)*0.05; let Tn=T*exp(-den*dt); C+=S*(T-Tn); T=Tn; } }
+  return vec4f(C,T);
+}
+// ---- waterspouts: hollow rotating columns from sea to cloud, marched per pixel
+const NSP = 7;
+/*SPOUTS*/
+fn spAxis(s:vec4f,y:f32)->vec2f { let t=u.cam.w; return s.xy+vec2f(sin(y*0.0052+s.w+t*0.9),cos(y*0.0043+s.w*1.7+t*0.7))*(y*0.034)*s.z/14.0+vec2f(sin(y*0.031+s.w-t*2.2),cos(y*0.027+s.w*2.0-t*2.0))*s.z*0.22; }
+fn spRad(s:vec4f,y:f32)->f32 { let k=y/760.0; return s.z*(0.40+0.55*exp(-y/26.0)+1.1*k+6.5*k*k*k*k); }
+@fragment fn fsSpout(i:FO)->@location(0) vec4f {
+  let px=vec2i(i.pos.xy); let z=textureLoad(tDepth,px,0); let d=viewDir(i.uv+(u.jit.zw-0.5)/u.res.xy); var tmax=6000.0; if(z>1e-7){ let ndc=vec4f((i.uv*2.0-1.0)*vec2f(1.0,-1.0),z,1.0); let w=u.ivp*ndc; tmax=min(tmax,distance(w.xyz/w.w,u.cam.xyz)); }
+  var C=vec3f(0.0); var T=1.0; let o=u.cam.xyz; let t=u.cam.w; let j=ign(i.pos.xy,u.res.z+floor(u.jit.x*31.0)); let mu=dot(d,u.sun.xyz); let ph=hg(mu,0.55)*0.30+hg(mu,0.2)*0.08+0.02; let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w; let dxz=length(d.xz);
+  for(var k=0;k<NSP;k++){ let s=SP[k]; let tau=t-s0(k); if(tau<0.0){continue;} let g=smoothstep(0.0,0.75,tau);
+    let Rb=s.z*7.0+60.0; let oc=o.xz-s.xy; let a=dot(d.xz,d.xz); let b=dot(oc,d.xz); let c=dot(oc,oc)-Rb*Rb; let h=b*b-a*c; if(h<0.0){continue;} let q=sqrt(h); var t0=max((-b-q)/a,0.3); var t1=min((-b+q)/a,tmax);
+    if(d.y>1e-4){ t1=min(t1,(860.0-o.y)/d.y); } else if(d.y<-1e-4){ t1=min(t1,(-6.0-o.y)/d.y); } if(t1<=t0){continue;}
+    let n=44; let dt=(t1-t0)/f32(n);
+    for(var m=0;m<n;m++){ let tt=t0+(f32(m)+j)*dt; let p=o+d*tt; let y=max(p.y,0.0); let ax=spAxis(s,y); let v=p.xz-ax; let r=length(v); let rr=r/spRad(s,y); var den=0.0;
+      if(rr<1.9){ let an=atan2(v.y,v.x)+y*0.011*14.0/s.z-t*4.2; let nz=textureSampleLevel(tNoise,sRep,vec3f(cos(an)*0.30+s.w,y/(s.z*13.0)-t*0.55+an*0.10,sin(an)*0.30),0.0); let n2=textureSampleLevel(tNoise,sRep,vec3f(cos(an)*0.95,y/(s.z*4.5)-t*0.9+an*0.16,sin(an)*0.95+s.w),0.0); let e=nz.x*0.6+n2.y*0.5; let shq=(rr-0.66-0.75*(e-0.5))/0.24; den=(exp(-shq*shq)+0.12*step(rr,0.75))*(0.05+1.9*smoothstep(0.46,0.72,e))*0.12*(14.0/s.z); den*=1.0-smoothstep(560.0,820.0,y)*0.8; den*=max(smoothstep(0.0,0.06,g*1.06-y/860.0),smoothstep(0.0,0.1,y/860.0-1.0+g*0.6)); }
+      if(y<90.0){ let m2=r/(s.z*(2.6+y*0.05)); let nn=textureSampleLevel(tNoise,sRep,vec3f(v.x,y*1.3-t*30.0,v.y)/64.0+vec3f(sin(t),0.0,cos(t))*0.2,0.0); den+=exp(-m2*m2)*exp(-y/24.0)*smoothstep(0.42,0.72,nn.x*0.7+nn.y*0.35)*0.035*g; }
+      if(den>1e-4){ let lx=normalize(u.sun.xz); let vl=dot(v,lx); let r0=spRad(s,y)*1.05; let ch=max(-vl+sqrt(max(r0*r0-r*r+vl*vl,0.0)),0.0); let lit=exp(-ch*0.10*14.0/s.z)+0.25*exp(-ch*0.025*14.0/s.z); let sg=mix(vec3f(dot(u.sunC.rgb,vec3f(0.3,0.5,0.2))),u.sunC.rgb,0.62); let S=sg*ph*(lit*1.0+0.6*exp(-ch*0.5))*0.30+amb*vec3f(0.70,0.82,0.95)*0.85*(0.6+0.4*min(y/160.0,1.0)); let Tn=T*exp(-den*dt); C+=S*(T-Tn); T=Tn; } }
+  }
+  let keep=step(0.5,u.sun.w); return vec4f(C*keep,mix(1.0,T,keep));
+}
+// ---- text
+struct Gl { r:vec4f, c:vec4f, m:vec4f };
+@group(1) @binding(0) var<storage,read> gl : array<Gl>;
+@group(1) @binding(1) var tGlyph : texture_2d<f32>;
+struct GO { @builtin(position) pos:vec4f, @location(0) uv:vec2f, @location(1) c:vec4f, @location(2) @interpolate(flat) m:vec4f, @location(3) q:vec2f };
+@vertex fn vsText(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->GO {
+  let g=gl[ii]; let c=array<vec2f,6>(vec2f(0,0),vec2f(1,0),vec2f(1,1),vec2f(0,0),vec2f(1,1),vec2f(0,1))[vi]; var o:GO;
+  let p=g.r.xy+c*g.r.zw; o.pos=vec4f(p.x*2.0-1.0,1.0-p.y*2.0,0.0,1.0); o.uv=c; o.c=g.c; o.m=g.m; o.q=p; return o;
+}
+fn glyphD(uv:vec2f,idx:f32,n:f32)->f32 { let w=1.0/n; let x=(idx+clamp(uv.x,0.01,0.99))*w; return textureSampleLevel(tGlyph,sClamp,vec2f(x,uv.y),0.0).r*0.5; }
+@fragment fn fsText(i:GO)->@location(0) vec4f {
+  var uv=i.uv; let mode=i.m.x; var d=9.0;
+  if(mode>1.5){ let dist=(i.q.y-0.5); uv.x+=sin(i.q.y*150.0+u.cam.w*5.0+sin(i.q.x*23.0+u.cam.w*2.0)*1.2)*0.045*(0.4+dist*2.0)+(ign(i.pos.xy,u.res.z*3.0)-0.5)*0.05; uv.y+=sin(i.q.x*41.0+u.cam.w*3.0)*0.012+(ign(i.pos.yx,u.res.z*5.0)-0.5)*0.10; }
+  if(fract(mode*0.5)>0.25){ let b=abs(uv-vec2f(0.5))-vec2f(0.30,0.36); d=(length(max(b,vec2f(0.0)))+min(max(b.x,b.y),0.0))*1.5+0.075; }
+  else { if(uv.x<0.0||uv.x>1.0||uv.y<0.0||uv.y>1.0){discard;} d=glyphD(uv,i.m.y,i.m.z); }
+  let aa=i.m.w; let core=1.0-smoothstep(0.075-aa,0.075+aa,d); let halo=exp(-max(d-0.06,0.0)*13.0); let sh=(1.0-smoothstep(0.05,0.34,d));
+  let col=i.c.rgb*(core+halo*0.10); let a=max(core,sh*0.34)*i.c.a;
+  if(mode>1.5){ let k=core*0.28+halo*0.10; return vec4f(i.c.rgb*k*i.c.a,0.0); }
+  return vec4f(col*i.c.a,a);
+}
+`;
+WGSL["sky"]=String.raw`
+// Sky dome: single scattering atmosphere + ray-marched cumulonimbus, written to a 4096x1024 HDR dome.
+struct SU { sun:vec4f, t:vec4f }; // sun dir; t.x time, t.y coverage, t.z turbidity, t.w tile index
+@group(0) @binding(0) var<uniform> s : SU;
+@group(0) @binding(1) var nTex : texture_3d<f32>;
+@group(0) @binding(2) var nS : sampler;
+@group(0) @binding(3) var oDome : texture_storage_2d<rgba16float, write>;
+const PI = 3.14159265;
+const RG = 6360000.0; const RT = 6420000.0;
+const BR = vec3f(5.802e-6,13.558e-6,33.1e-6); const BO = vec3f(0.65e-6,1.881e-6,0.085e-6);
+fn domeDir(uv:vec2f)->vec3f { let q=uv.x*2.0-1.0; let az=sign(q)*pow(abs(q),1.0/0.75)*PI; let el=uv.y*uv.y*0.5*PI; return vec3f(sin(az)*cos(el), sin(el), cos(az)*cos(el)); }
+fn rayS(o:vec3f,d:vec3f,r:f32)->vec2f { let b=dot(o,d); let c=dot(o,o)-r*r; let h=b*b-c; if(h<0.0){return vec2f(1e9,-1e9);} let q=sqrt(h); return vec2f(-b-q,-b+q); }
+fn dens(h:f32)->vec3f { return vec3f(exp(-h/8000.0),exp(-h/1200.0),max(0.0,1.0-abs(h-25000.0)/15000.0)); }
+fn ext(d:vec3f)->vec3f { return BR*d.x+vec3f(4.4e-6*s.t.z)*d.y+BO*d.z; }
+fn sunT(p:vec3f)->vec3f { let gr=rayS(p,s.sun.xyz,RG-20.0); if(gr.x>0.0){ return vec3f(0.0); } let L=rayS(p,s.sun.xyz,RT).y; var od=vec3f(0.0); let n=8; for(var i=0;i<n;i++){ let a=f32(i)/f32(n); let b=f32(i+1)/f32(n); let t0=L*a*a; let t1=L*b*b; let h=length(p+s.sun.xyz*(t0+t1)*0.5)-RG; od+=ext(dens(max(h,0.0)))*(t1-t0); } return exp(-od); }
+fn sunTc(p:vec3f)->vec3f { let gr=rayS(p,s.sun.xyz,RG-20.0); if(gr.x>0.0&&gr.x<1e8){ return vec3f(0.0); } let L=rayS(p,s.sun.xyz,RT).y; var od=vec3f(0.0); let n=8; for(var i=0;i<n;i++){ let a=f32(i)/f32(n); let b=f32(i+1)/f32(n); let t0=L*a*a; let t1=L*b*b; let h=length(p+s.sun.xyz*(t0+t1)*0.5)-RG; od+=ext(dens(max(h,0.0)))*(t1-t0); } return exp(-od); }
+fn hg(c:f32,g:f32)->f32 { let g2=g*g; return (1.0-g2)/(4.0*PI*pow(max(1.0+g2-2.0*g*c,1e-4),1.5)); }
+const E0 = vec3f(20.0,19.4,18.6);
+fn atmos(d:vec3f)->vec3f {
+  let o=vec3f(0.0,RG+60.0,0.0); let L=rayS(o,d,RT).y; let mu=dot(d,s.sun.xyz); let pr=3.0/(16.0*PI)*(1.0+mu*mu); let pm=hg(mu,0.76)*0.85+hg(mu,0.2)*0.15;
+  var T=vec3f(1.0); var C=vec3f(0.0); let n=26;
+  for(var i=0;i<n;i++){ let a=f32(i)/f32(n); let b=f32(i+1)/f32(n); let t0=L*a*a; let t1=L*b*b; let dt=t1-t0; let p=o+d*(t0+t1)*0.5; let h=max(length(p)-RG,0.0); let dn=dens(h); let e=ext(dn); let st=sunT(p);
+    let sr=BR*dn.x; let sm=4.0e-6*s.t.z*dn.y; let S=E0*(st*(sr*pr+sm*pm)+(sr+sm)*(0.006+0.045*st)); let Tn=T*exp(-e*dt); C+=S*(T-Tn)/max(e,vec3f(1e-9)); T=Tn; }
+  return C;
+}
+fn rm(x:f32,a:f32,b:f32,c:f32,d:f32)->f32 { return c+(x-a)/(b-a)*(d-c); }
+fn sat(x:f32)->f32 { return clamp(x,0.0,1.0); }
+fn hash(p:vec2f)->f32 { var q=fract(vec3f(p.xyx)*0.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+const CB = 800.0; const CT = 13500.0;
+// composed cloudscape: azimuth deg, distance km, radius km, top km
+const NTW = 9;
+const TW = array<vec4f,9>(vec4f(17.0,31.0,9.0,12.8),vec4f(70.0,27.0,9.5,12.0),vec4f(-24.0,38.0,12.0,11.5),vec4f(122.0,30.0,13.0,11.0),vec4f(50.0,105.0,16.0,6.2),vec4f(34.0,98.0,12.0,5.4),vec4f(88.0,62.0,10.0,9.0),vec4f(-66.0,34.0,14.0,9.5),vec4f(190.0,40.0,18.0,10.0));
+fn cloud(p:vec3f,detail:bool)->f32 { // p metres, y = altitude
+  if(p.y<CB||p.y>CT){return 0.0;}
+  let sh=vec3f(s.t.x*10.0,0.0,s.t.x*3.0);
+  let wn=textureSampleLevel(nTex,nS,vec3f(p.x/31000.0,0.2,p.z/31000.0),0.0); let wq=p.xz+(vec2f(wn.w,wn.y)-0.5)*7000.0;
+  var cov=0.0;
+  for(var i=0;i<NTW;i++){ let t=TW[i]; let a=t.x*PI/180.0; let c=vec2f(sin(a),cos(a))*t.y*1000.0; let r=distance(wq,c)/(t.z*1000.0); if(r<1.25){ let top=t.w*1000.0*(1.0-0.62*r*r); let hh=p.y/top; let body=(1.0-smoothstep(0.55,1.15,r+0.28*smoothstep(0.05,0.45,hh)*(1.0-smoothstep(0.6,0.95,hh))))*(1.0-smoothstep(0.80,1.0,hh)); cov=max(cov,body); } }
+  // low fair-weather deck, patchy
+  let w2=textureSampleLevel(nTex,nS,vec3f(p.xz/17000.0+0.4,0.7),0.0); let low=sat((w2.w*0.75+w2.y*0.35-0.60+s.t.y)*2.6)*(1.0-smoothstep(1300.0,2300.0,p.y))*0.9*smoothstep(36000.0,60000.0,length(p.xz)); cov=max(cov,low);
+  cov*=smoothstep(CB,CB+220.0,p.y); if(cov<0.02){return 0.0;}
+  let n=textureSampleLevel(nTex,nS,(p+sh)/6100.0,0.0); let sb=n.x*0.55+(n.y*0.625+n.z*0.25)*0.55;
+  var d=sat(rm(sb,1.0-cov*0.95,1.0,0.0,1.0))*1.25;
+  if(d>0.0&&detail){ let q=textureSampleLevel(nTex,nS,(p+sh*1.6)/1150.0+vec3f(n.y*0.10),0.0); let er=q.y*0.60+q.z*0.35; d=sat(rm(d,(er*0.60)*(1.0-d*0.5),1.0,0.0,1.0)); }
+  return d;
+}
+@compute @workgroup_size(8,8)
+fn main(@builtin(global_invocation_id) g:vec3u){
+  let dim=vec2f(textureDimensions(oDome)); let px=vec2u(g.x,g.y+u32(s.t.w)*128u); if(px.y>=u32(dim.y)){return;}
+  let uv=(vec2f(px)+0.5)/dim; let d=domeDir(uv); var sky=atmos(d); let sky0=sky; let o=vec3f(0.0,RG+30.0,0.0);
+  let st=E0*sunTc(vec3f(0.0,RG+4000.0,0.0)); let mu=dot(d,s.sun.xyz);
+  // cirrus sheet
+  { let tc=rayS(o,d,RG+10500.0).y; let cp=(o+d*tc).xz; let a=textureSampleLevel(nTex,nS,vec3f(cp.x/90000.0+cp.y/260000.0,0.4,cp.y/34000.0),0.0); let b=textureSampleLevel(nTex,nS,vec3f(cp.x/21000.0,0.6,cp.y/7600.0),0.0); let ci=sat((a.w*0.8+b.w*0.35-0.52)*2.6)*sat(0.5+b.y); let fade=exp(-tc/170000.0); sky+=st*(hg(mu,0.6)*0.40+0.018)*ci*fade*0.55; }
+  var C=vec3f(0.0); var T=1.0;
+  let t0=rayS(o,d,RG+CB).y; let t1=min(rayS(o,d,RG+CT).y,125000.0);
+  if(t0<120000.0){
+    let n=176; let jit=hash(vec2f(px));
+    let amb0=atmos(normalize(vec3f(-s.sun.x,0.9,-s.sun.z))); let ambh=atmos(normalize(vec3f(-s.sun.x*0.5,0.22,-s.sun.z)));
+    let a0=max(t0,1.0); let ratio=t1/a0;
+    for(var i=0;i<n;i++){
+      let k0=f32(i)/f32(n); let k1=f32(i+1)/f32(n); let ta=mix(a0+(t1-a0)*k0,a0*pow(ratio,k0),0.5); let tb=mix(a0+(t1-a0)*k1,a0*pow(ratio,k1),0.5); let dt=tb-ta; let t=ta+dt*jit;
+      let wp=o+d*t; let alt=length(wp)-RG; let dn=cloud(vec3f(wp.x,alt,wp.z),true);
+      if(dn>0.002){
+        var od=0.0; var lt=0.0; for(var j=0;j<7;j++){ let ls=80.0*pow(1.8,f32(j)); let lp=wp+s.sun.xyz*(lt+ls*0.5); let la=length(lp)-RG; od+=cloud(vec3f(lp.x,la,lp.z),j<4)*ls; lt+=ls; }
+        let sig=0.0075; var lum=0.0; var aa=1.0; var bb=1.0; var gg=1.0;
+        for(var m=0;m<4;m++){ let ph=mix(hg(mu,0.70*gg),hg(mu,-0.22*gg),0.28)+0.016; lum+=aa*ph*exp(-od*sig*bb); aa*=0.55; bb*=0.34; gg*=0.6; }
+        let powd=1.0-0.6*exp(-dn*10.0);
+        let hh=sat((alt-CB)/9000.0); let amb=mix(ambh*0.16,amb0*0.75,hh)*(0.25+0.75*hh);
+        let S=st*lum*powd*2.7+amb; let e=dn*sig; let Tn=T*exp(-e*dt); let ap=exp(-t/70000.0); C+=mix(sky0,S,ap)*(T-Tn); T=Tn; if(T<0.008){break;}
+      }
+    }
+  }
+  var c=sky*T+C; let hz=exp(-max(d.y,0.0)*42.0); c=mix(c,sky,hz*0.5);
+  textureStore(oDome,px,vec4f(min(c,vec3f(60.0)),T));
+}
+`;
+WGSL["surface"]=String.raw`
+// The sheet mesh: sea, barrel and cathedral are the same triangles.
+struct VO { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) q:vec2f, @location(2) n:vec3f, @location(3) ts:vec3f, @location(4) tz:vec3f, @location(5) mi:vec4f };
+override NX : u32 = 1500; override NZ : u32 = 1500;
+fn gridAt(vi:u32)->vec4f { let i=vi%NX; let j=vi/NX; let s=grid[i]; let z=grid[NX+j]; let ds=grid[min(i+1u,NX-1u)]-grid[max(i,1u)-1u]; let dz=grid[NX+min(j+1u,NZ-1u)]-grid[NX+max(j,1u)-1u]; return vec4f(s,z,0.5*ds,0.5*dz); }
+fn vsCommon(vi:u32,m:mat4x4f)->VO {
+  let g=gridAt(vi); let lod=log2(max(max(g.z,g.w),0.03)); // relative metres -> level handled in seaDisp
+  let o=surf(g.x,g.y,lod); var v:VO; v.wp=o.p; v.q=g.xy; v.n=o.n; v.ts=o.ts; v.tz=o.tz; v.mi=vec4f(o.st,o.fz,o.y0,o.rim); v.pos=m*vec4f(o.p,1.0); return v;
+}
+@vertex fn vsMain(@builtin(vertex_index) vi:u32)->VO { return vsCommon(vi,u.vp); }
+@vertex fn vsRefl(@builtin(vertex_index) vi:u32)->VO { var v=vsCommon(vi,u.vp); return v; }
+@vertex fn vsShadow(@builtin(vertex_index) vi:u32)->VO { return vsCommon(vi,u.svp); }
+
+fn ggx(nh:f32,a2:f32)->f32 { let d=nh*nh*(a2-1.0)+1.0; return a2/(PI*d*d); }
+fn thickness(s:f32)->f32 { return mix(26.0,1.1,smoothstep(0.0,118.0,s)); }
+
+struct Sea { n:vec3f, var2:f32, fold:f32, sl:vec2f };
+fn seaNormal(v:VO, dx:vec2f, dy:vec2f)->Sea {
+  var sl=vec2f(0.0); var m2=0.0; var fold=0.0; let m=waveMask(v.q.x)*sat(u.wave.x*1.4); let q=vec2f(v.q.x-flowS(v.q.x),v.q.y);
+  for(var i=0;i<4;i++){ let L=LC[i]; let t=textureSampleGrad(tDeriv,sRep,q/L,i,dx/L,dy/L); let w=select(1.0,mix(1.0,0.10,m),i==0); sl+=t.xy*w; m2+=max(t.z-dot(t.xy,t.xy),0.0)*w*w; fold+=(1.0-t.w)*w*select(1.0,0.75,i>2); }
+  let k=u.flow.y*ringAt(v.wp.x,v.wp.z).y*mix(1.0,0.72,m); sl*=k; m2*=k*k; fold*=k;
+  var o:Sea; o.sl=sl; o.n=normalize(v.n-v.ts*sl.x-v.tz*sl.y); o.var2=m2; o.fold=fold; return o;
+}
+fn foamTex(q:vec2f,dx:vec2f,dy:vec2f)->vec4f { let a=textureSampleGrad(tFoam,sRep,q/23.0,dx/23.0,dy/23.0); let b=textureSampleGrad(tFoam,sRep,q/5.3+vec2f(0.37,0.1),dx/5.3,dy/5.3); let c=textureSampleGrad(tFoam,sRep,q/131.0,dx/131.0,dy/131.0); return vec4f(a.r*0.65+b.r*0.35,max(a.g*0.5,b.g),c.b,b.a); }
+
+fn env0(p:vec3f,n:vec3f)->vec3f { return naveEnv(p+n*0.1,normalize(n+vec3f(0.0,-0.15,0.25))); }
+@fragment fn fsMain(v:VO, @builtin(front_facing) ff:bool) -> @location(0) vec4f {
+  let dx=dpdx(v.q); let dy=dpdy(v.q);
+  if(u.camU.w>0.5 && u.camU.w<1.5 && v.wp.y<0.25 && v.mi.x>0.5){ discard; }
+  if(u.fr.w>-0.65 && v.q.y>u.fr.z+2.4 && v.q.y<u.fr.z+9.0 && v.mi.x>0.001){ discard; }
+  if(v.mi.x>1.02 && v.q.x>151.5 && v.q.x<320.0){ discard; } // the outer skin of the wave is gone once it is a wall of glass
+  if(u.flow.w>0.25&&v.q.x>152.0&&v.q.x<318.0&&v.mi.x>0.3){ discard; }
+  let fringe=152.0-(1.0-smoothstep(0.9,1.1,v.mi.x))*smoothstep(0.3,0.6,v.mi.x)*(4.5*vnoise(vec2f(v.q.y*0.16,u.cam.w*0.8))+2.0*vnoise(vec2f(v.q.y*0.7,u.cam.w*2.0))); if(v.q.x>fringe&&v.q.x<156.0&&v.mi.x<1.1&&v.mi.x>0.45){ discard; }
+  if(u.camU.w>0.5&&u.camU.w<1.5&&u.birth.z<90000.0){ let rq=ringAt(v.wp.x,v.wp.z); if(rq.y+v.mi.w*3.0+rq.x*0.06<0.05){ discard; } }
+  let V=normalize(u.cam.xyz-v.wp); let dist=distance(u.cam.xyz,v.wp);
+  let L=u.sun.xyz; let light=u.sun.w;
+  // ------------ water
+  let sea=seaNormal(v,dx,dy); var n=sea.n; if(dot(n,V)<0.0){ n=normalize(n-V*dot(n,V)*1.02); }
+  let inB=waveMask(v.q.x)*smoothstep(0.05,0.30,v.mi.x);           // on the barrel wall
+  let wallS=smoothstep(4.0,26.0,v.q.x)*(1.0-smoothstep(172.0,190.0,v.q.x));
+  let a2=clamp(0.0016+sea.var2*1.3,0.0016,0.16); let rough=pow(a2,0.25);
+  let nv=max(dot(n,V),0.03); let F=0.02+0.98*pow(1.0-nv,5.0)/(1.0+6.0*sqrt(a2));
+  var R=reflect(-V,n); let below=R.y; R.y=abs(R.y)+0.01; R=normalize(R);
+  var sky=dome(R,1.0+rough*6.5).rgb*mix(1.0,0.55,sat(-below*4.0));
+  let scr=v.pos.xy/u.res.xy;
+  let refl=textureSampleLevel(tRefl,sClamp,clamp(scr+vec2f(n.x,-n.z)*vec2f(0.16,0.22),vec2f(0.002),vec2f(0.998)),1.5).rgb;
+  let tubeEnv=u.flow.w*(1.0-u.fr.y);
+  let floorK=smoothstep(0.6,0.9,v.n.y)*u.flow.w*step(u.camU.w,0.5);
+  sky=mix(sky,refl,floorK*0.85*u.ext.x); let cityK=u.ext.x*smoothstep(-0.2,0.35,u.seg.y)*step(u.camU.w,0.5)*(1.0-inB); sky=mix(sky,textureSampleLevel(tRefl,sClamp,clamp(scr+vec2f(n.x,-n.z)*vec2f(0.05,0.30),vec2f(0.002),vec2f(0.998)),1.0).rgb+starField(R,u.seg2.y)*0.4,cityK*(0.92-0.5*sat(-below*3.0)));
+  let R0=reflect(-V,n); let sunL=dot(u.sunC.rgb,vec3f(0.333));
+  let tubeC=vec3f(0.004,0.035,0.042)*sunL*(0.5+1.6*sat(R0.x)+0.6*sat(-R0.y))+fogColor(vec3f(0.2,0.1,1.0))*smoothstep(0.86,0.99,R0.z)*0.5;
+  sky=mix(sky,tubeC,inB*wallS*max(tubeEnv,smoothstep(0.45,0.8,v.mi.x)));
+  let sh=shadowAt(v.wp+v.n*0.6,(vec2f(u.jit.x,u.jit.y)-0.5)*0.0015);
+  let shOpen=mix(vec3f(1.0),sh,u.flow.w*smoothstep(0.6,0.9,v.n.y));
+  // deep body colour + forward scatter through crests
+  let up=sat(0.5+0.5*n.y); let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*light;
+  var body=vec3f(0.007,0.075,0.098)*(amb*2.8+u.sunC.rgb*max(L.y,0.0)*0.5);
+  let sssV=pow(sat(dot(-V,normalize(L-n*0.35))),5.0); let crest=sat(v.wp.y*0.055+sea.fold*0.55+v.mi.w*0.8);
+  body+=vec3f(0.010,0.19,0.19)*u.sunC.rgb*(sssV*1.2+0.04*sat(dot(V,vec3f(-L.x,0,-L.z))+0.4))*crest*crest*0.22;
+  // ring crest is thin water with the sun behind it
+  body+=vec3f(0.02,0.40,0.34)*u.sunC.rgb*v.mi.w*(0.015+0.22*sssV);
+  let sunL0=dot(u.sunC.rgb,vec3f(0.333)); let rk=smoothstep(0.02,0.30,v.mi.w); let yk=sat(v.wp.y/120.0); var ringFoam=0.0; var ringPat=0.0;
+  if(v.mi.w>0.005){ let crest0=v.mi.w/max(u.birth.w,0.01); let thr2=exp(-vec3f(0.42,0.11,0.10)*mix(45.0,2.0,pow(crest0,3.0))); let bw=vec3f(0.002,0.014,0.020)*sunL0+u.sunC.rgb*thr2*(hg(sat(dot(-V,L)),0.72)*1.1+0.015)+amb*vec3f(0.006,0.035,0.045); body=mix(body,bw,rk);
+    let rd2=v.wp.xz-u.birth.xy; let ra=atan2(rd2.x,rd2.y)*u.birth.z; let fa=textureSampleLevel(tFoam,sRep,vec2f(ra/64.0,v.wp.y/170.0+u.cam.w*0.9),1.0); let fb=textureSampleLevel(tFoam,sRep,vec2f(ra/17.0,v.wp.y/60.0+u.cam.w*1.6),0.5);
+    body+=vec3f(1.0,0.80,0.52)*dot(u.sunC.rgb,vec3f(0.333))*rk*exp(-u.birth.z/45.0)*1.2; ringPat=fa.b*0.55+fb.b*0.35+fb.r*0.25; let crest=v.mi.w/max(u.birth.w,0.01); ringFoam=rk*max(smoothstep(0.80,0.97,crest+(fa.b-0.5)*0.05+(fb.b-0.5)*0.03),0.7*exp(-v.wp.y/6.0)*smoothstep(0.35,0.7,fb.b)); }
+  // the wall of the barrel: backlit by the sun through metres of moving water
+  let thick=thickness(v.q.x)*(1.0+0.35*clamp(sea.sl.x+sea.sl.y,-0.9,0.9));
+  let rd=refract(-V,n,1.0/1.33); let thr=mix(-V,rd,0.75);
+  let ext=exp(-vec3f(0.44,0.104,0.092)*thick);
+  let cS=sat(dot(thr,L)); let glow=hg(cS,0.80)*0.55+hg(cS,0.93)*0.10+0.028;
+  let streak=0.6+0.8*textureSampleGrad(tFoam,sRep,vec2f(v.q.y/61.0,(v.q.x-flowS(v.q.x))/260.0),dx.yx/vec2f(61.0,260.0),dy.yx/vec2f(61.0,260.0)).b;
+  let caust=1.0+1.6*clamp(-(sea.fold-0.10),-0.5,0.9);
+  let wallC=vec3f(0.85,0.95,1.35)*(u.sunC.rgb*glow*ext*caust*1.0+skyThrough(thr,6.5)*ext*0.16+vec3f(0.0,0.085,0.10)*sunL*exp(-thick*0.10)*0.10)*streak*light;
+  body=mix(body,wallC,inB*wallS);
+  let Fr=mix(F,min(F,0.18),rk);
+  let faceStreak=rk*(1.0-smoothstep(0.80,0.95,v.mi.w/max(u.birth.w,0.01)))*smoothstep(0.45,0.85,textureSampleLevel(tFoam,sRep,vec2f(atan2(v.wp.x-u.birth.x,v.wp.z-u.birth.y)*u.birth.z/22.0,v.wp.y/70.0-u.cam.w*0.6),1.0).b);
+  var col=body*(1.0-Fr)+sky*Fr*mix(1.0,0.7,rk);
+  col=mix(col,vec3f(0.55,0.62,0.66)*(amb*0.9+u.sunC.rgb*0.05),faceStreak*0.5);
+  // sun glint
+  let H=normalize(V+L); let nh=sat(dot(n,H)); let spec=ggx(nh,a2)*(0.02+0.98*pow(1.0-sat(dot(V,H)),5.0))*sat(dot(n,L))*0.25/max(nv,0.25);
+  col+=u.sunC.rgb*min(spec,40.0)*shOpen*(1.0-inB*wallS*0.8);
+  // foam
+  let ft=foamTex(vec2f(v.q.x-flowS(v.q.x),v.q.y),dx,dy);
+  let wind=ft.z; let k0=u.flow.y*ringAt(v.wp.x,v.wp.z).y; var fc=smoothstep(0.16,0.85,sea.fold*1.9+wind*0.6-0.28)*u.flow.z;
+  fc=max(fc,smoothstep(0.50,0.95,ft.z*0.55+textureSampleGrad(tFoam,sRep,vec2f(dot(v.q,vec2f(0.75,0.66))/210.0,dot(v.q,vec2f(-0.66,0.75))/38.0),dx/60.0,dy/60.0).b*0.55)*0.42*(1.0-inB)*k0);
+  // white water: lip edge, curtain, trough impact line
+  let lip=smoothstep(112.0,148.0,v.q.x)*(1.0-smoothstep(175.0,215.0,v.q.x))*smoothstep(0.06,0.22,v.mi.x);
+  let up2=0.0;
+  let impact=exp(-pow((v.q.x+26.0)/10.0,2.0))*smoothstep(0.75,1.0,v.mi.x);
+  let faceF=inB*wallS*smoothstep(0.55,0.95,streak*0.62+ft.x*0.22)*0.5;
+  fc=sat(max(max(max(fc,lip*(0.55+0.6*wind)),max(up2*(0.5+wind),impact)),faceF)+0.0);
+  let cs=textureSampleGrad(tFoam,sRep,vec2f(v.q.y/9.0,(v.q.x-flowS(v.q.x)*1.6)/75.0),dx.yx/vec2f(9.0,75.0),dy.yx/vec2f(9.0,75.0)); let curt=smoothstep(112.0,132.0,v.q.x)*(1.0-smoothstep(160.0,175.0,v.q.x))*smoothstep(0.5,0.8,v.mi.x);
+  var pat=mix(ft.x*0.75+ft.y*0.35,cs.b*0.9+cs.r*0.35,curt); fc=max(fc,curt*(0.42+0.42*smoothstep(126.0,146.0,v.q.x))); pat=mix(pat,ringPat,rk); fc=mix(fc,ringFoam,rk);
+  let cw3=cityWater(v.wp.x,v.wp.z); let cwf=cw3.y; fc=max(fc,cwf); pat=mix(pat,ft.x*0.6+ft.y*0.5+0.15,cwf);
+  let cover=smoothstep(1.0-fc,1.0-fc+0.45,pat)*smoothstep(0.02,0.2,fc);
+  let fn2=normalize(n+v.ts*(ft.y-0.5)*0.35); let wrap=sat(dot(fn2,L)*0.6+0.4);
+  var foamC=vec3f(0.82,0.88,0.90)*(u.sunC.rgb*(wrap*0.20+0.10*pow(sat(dot(-V,L)),2.0))*shOpen+amb*1.35);
+  foamC=mix(foamC,foamC*vec3f(0.35,0.8,0.78)+wallC*0.7,inB*wallS*0.7);
+  col=mix(col,foamC*(0.65+0.5*ft.y),cover*0.92);
+  var litK=1.0; if(u.birth.z<90000.0){ let rr=ringAt(v.wp.x,v.wp.z); litK=smoothstep(0.02,0.5,rr.y+v.mi.w*3.0+rr.x*0.06); col*=litK; }
+  // ------------ glass
+  let fz=v.mi.y;
+  if(fz>0.001){
+    let g=stained(v.q.y,v.q.x); let isFloor=step(v.q.x,u.nave.x+0.3);
+    let vv=vor(v.q*0.75+3.0); let tilt=(hash22(vv.zw)-0.5); let facetAmt=mix(0.5,0.05,smoothstep(0.3,1.0,fz));
+    var gn=normalize(v.n+v.ts*tilt.x*facetAmt+v.tz*tilt.y*facetAmt);
+    if(dot(gn,V)<0.0){ gn=normalize(gn-V*dot(gn,V)*1.02); }
+    let rip=textureSampleGrad(tDeriv,sRep,v.q/6.0,2,dx/6.0,dy/6.0).xy*0.10;
+    var gc:vec3f;
+    if(isFloor>0.5){
+      // polished black-glass floor
+      let tile=abs(fract(v.q/vec2f(6.0,7.0)+0.5)-0.5); let gl=min(tile.x*6.0,tile.y*7.0); let line=1.0-smoothstep(0.03,0.07,gl);
+      let dia=abs(fract((v.q.x+v.q.y)/14.0)-0.5)+abs(fract((v.q.x-v.q.y)/14.0)-0.5); let inl=smoothstep(0.46,0.5,dia)*(1.0-smoothstep(0.5,0.54,dia));
+      let fl=0.04+0.96*pow(1.0-max(dot(v.n,V),0.0),5.0);
+      let rr=textureSampleLevel(tRefl,sClamp,clamp(scr+rip*0.05+tilt*0.0015,vec2f(0.002),vec2f(0.998)),0.6).rgb*u.ext.x;
+      let shf=shadowAt(v.wp+vec3f(0,0.05,0),(u.jit.xy-0.5)*0.0016);
+      gc=vec3f(0.010,0.013,0.018)*amb+shf*u.sunC.rgb*max(L.y,0.05)*0.30*(1.0-line*0.6);
+      gc=mix(gc,vec3f(1.0,0.72,0.3)*(shf*u.sunC.rgb*0.05+amb*0.1),inl*0.35);
+      gc+=rr*mix(0.28,1.0,fl);
+      gc+=u.sunC.rgb*shf*ggx(sat(dot(normalize(v.n+vec3f(rip.x,0,rip.y)),H)),0.004)*0.02;
+    } else {
+      let rr=refract(-V,normalize(gn+v.ts*rip.x*1.5+v.tz*rip.y*1.5),1.0/1.2); let td=mix(-V,rr,0.9);
+      let cL=sat(dot(-v.n,L));                       // sun striking the outside of this pane
+      let trans=g.rgb*(skyThrough(td,3.2)*1.15+u.sunC.rgb*cL*0.16);
+      let nvg=max(dot(gn,V),0.04); let Fg=0.04+0.96*pow(1.0-nvg,5.0);
+      let rdir=reflect(-V,gn); let env=naveEnv(v.wp+v.n*0.1,rdir);
+      let lead=vec3f(0.020,0.022,0.026)*(amb+u.sunC.rgb*0.2);
+      let shw=shadowAt(v.wp+v.n*0.5,(u.jit.xy-0.5)*0.0016); let st2=vor(v.q*vec2f(0.35,0.55)+9.0); let mason=0.55+0.45*hash21(st2.zw); let joint=smoothstep(0.02,0.09,st2.y-st2.x);
+      let stone=vec3f(0.30,0.34,0.40)*mason*mix(0.5,1.0,joint)*(amb*0.10+shw*u.sunC.rgb*sat(dot(gn,L))*0.55)+env0(v.wp,v.n)*0.06;
+      gc=mix(trans,mix(lead,stone,step(0.80,g.a)*(1.0-step(0.92,g.a))),g.a);
+      gc=gc*(1.0-Fg*0.7)+env*Fg*0.9;
+      let sg=ggx(sat(dot(gn,H)),0.0012); gc+=u.sunC.rgb*min(sg,30.0)*0.006*(1.0-g.a);
+    }
+    // the freezing edge: white-hot crystallisation, jagged
+    let e=sat(fz/0.10)*(1.0-smoothstep(0.10,0.55,fz)); let cr=1.0-smoothstep(0.0,0.10,(vv.y-vv.x));
+    gc+=vec3f(0.35,0.85,1.0)*(cr*0.9+0.10)*e*(0.6+dot(u.sunC.rgb,vec3f(0.10)));
+    col=mix(col,gc,smoothstep(0.0,0.06,fz));
+  }
+  col+=vec3f(1.0,0.62,0.30)*cw3.z*0.12*(1.0-cover*0.5);
+  // aerial perspective
+  let fd=-V; let fog=1.0-exp(-dist*u.sky.z*mix(1.0,0.15,u.flow.w)); let fcol=fogColor(fd);
+  let mieS=u.sunC.rgb*hg(sat(dot(fd,L)),0.80)*0.06*(1.0-u.flow.w);
+  col=mix(col,(fcol+mieS)*litK,fog);
+  if(litK<0.999&&u.camU.w<0.5){ let calm=mix(0.10,1.0,sat(u.gal2.w*4.0)); let rw=(textureSampleLevel(tDeriv,sRep,v.wp.xz/37.0+u.cam.w*0.02,2,0.0).xy*0.5+textureSampleLevel(tDeriv,sRep,v.wp.xz/9.0-u.cam.w*0.03,3,0.0).xy*0.3)*calm; let fm=0.02+0.98*pow(1.0-max(V.y,0.0),5.0); let mr=u.ext.x*textureSampleLevel(tRefl,sClamp,clamp(scr+vec2f(rw.x*0.10,rw.y*0.18),vec2f(0.002),vec2f(0.998)),0.0).rgb; col=mix(mr*fm*vec3f(0.80,0.92,1.0),col,litK); }
+  return vec4f(max(col,vec3f(0.0)),1.0);
+}
+// coloured transmittance seen from the sun (only panes that face it)
+@fragment fn fsShadow(v:VO)->@location(0) vec4f {
+  if(v.q.x<16.0||v.q.x>151.0||v.mi.x<0.3||v.q.y>u.fr.z+0.5){ discard; }
+  if(dot(v.n,u.sun.xyz)>-0.02){ discard; }
+  let th=thickness(v.q.x); let water=exp(-vec3f(0.30,0.055,0.06)*th*0.9)*0.9;
+  let g=stained(v.q.y,v.q.x); let gl=g.rgb*(1.0-g.a*0.94)*1.15;
+  return vec4f(mix(water,gl,smoothstep(0.02,0.3,v.mi.y)),1.0);
+}
+`;
+WGSL["tubes"]=String.raw`
+// Ribs, columns, tracery: tubes laid in the sheet's own (z,s,height) coordinates, so they are born with it.
+override ALONG : u32 = 24; override RING : u32 = 8; override FIRST : u32 = 0; override PER : u32 = 1;
+struct TO { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) n:vec3f, @location(2) mi:vec4f };
+fn tubePos(q:f32,inst:u32,a:vec4f,b:vec4f,bayZ:f32)->vec3f { let z=mix(a.x,a.z,q)+bayZ; let s=mix(a.y,a.w,q); let o=baseSurf(s,z); return o.p+o.n*b.z; }
+fn tubeVS(vi:u32,ii:u32,m:mat4x4f)->TO {
+  var v:TO; let bay=ii/PER; let k=ii%PER; let bayZ=(floor(u.cam.z/BAY)-2.0+f32(bay))*BAY;
+  let a=tubes[(FIRST+k)*2u]; let b=tubes[(FIRST+k)*2u+1u];
+  let tri=vi%6u; let cell=vi/6u; let ai=cell%ALONG; let ri=cell/ALONG;
+  let ca=array<vec2u,6>(vec2u(0,0),vec2u(1,0),vec2u(1,1),vec2u(0,0),vec2u(1,1),vec2u(0,1)); let c=ca[tri];
+  var q=f32(ai+c.x)/f32(ALONG); let an=f32(ri+c.y)/f32(RING)*2.0*PI;
+  let zc=mix(a.x,a.z,0.5)+bayZ; let sc=mix(a.y,a.w,0.5); let sy=min(sc,236.0-sc); // symmetric height order: ribs climb both walls
+  let g=u.fr.y*sat((u.fr.x-zc-sy*0.30)/34.0); let gl=1.0-pow(1.0-g,3.0); let over=1.0+0.9*sin(g*PI)*(1.0-g);
+  q=q*gl; let e=0.02;
+  if(g<=0.001||bayZ+a.x>u.fr.z-1.0||zc>u.fr.z-0.2){ v.pos=vec4f(0,0,-9,1); v.wp=vec3f(0); v.n=vec3f(0,1,0); v.mi=vec4f(0); return v; }
+  let p0=tubePos(q,ii,a,b,bayZ); let p1=tubePos(q+e,ii,a,b,bayZ); let z=mix(a.x,a.z,q)+bayZ; let s=mix(a.y,a.w,q);
+  let T=normalize(p1-p0); let o=baseSurf(s,z); let B=normalize(cross(T,o.n)); let N=cross(B,T);
+  let r=mix(b.x,b.y,q)*over*smoothstep(0.0,0.10,gl); let dir=B*cos(an)+N*sin(an);
+  // moulded section: a pointed roll rather than a pipe
+  let prof=1.0+0.16*cos(an*2.0)+0.10*cos(an*6.0);
+  v.wp=p0+dir*r*prof; v.n=dir; v.mi=vec4f(g,b.w,q,r); v.pos=m*vec4f(v.wp,1.0); return v;
+}
+@vertex fn vsTube(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->TO { return tubeVS(vi,ii,u.vp); }
+@vertex fn vsTubeSh(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->TO { return tubeVS(vi,ii,u.svp); }
+
+// crystal spikes riding the freeze front
+@vertex fn vsSpike(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->TO {
+  var v:TO; let row=ii/36u; let col=ii%36u; let dz=1.4; let zi=floor((u.fr.x-105.0)/dz)+f32(row); let h=hash33(vec3f(zi,f32(col),3.0)); let h2=hash33(vec3f(f32(col),zi,9.0));
+  let z=(zi+h.x)*dz; let s=8.0+(f32(col)+h.y)*4.0; let o=baseSurf(s,z); let d=(u.fr.x+frontNoise(s,z)-z);
+  let g=sat(d/7.0)*(1.0-smoothstep(16.0,88.0,d))*u.fr.y*(1.0-step(u.fr.z-1.0,z)); let len=g*(0.5+6.0*pow(h.z,5.0)); let r=len*0.055+0.015*g;
+  let dirv=normalize(o.n+o.ts*(h2.x-0.5)*1.1+vec3f(0,0,1)*(h2.y-0.15)*1.5);
+  let ax=normalize(cross(dirv,vec3f(0.3,0.5,0.8))); let ay=cross(dirv,ax);
+  let f=vi/3u; let k=vi%3u; let an0=f32(f)/6.0*2.0*PI; let an1=f32(f+1u)/6.0*2.0*PI;
+  var p=o.p; if(k==0u){ p+=(ax*cos(an0)+ay*sin(an0))*r; } else if(k==1u){ p+=(ax*cos(an1)+ay*sin(an1))*r; } else { p+=dirv*len; }
+  let am=0.5*(an0+an1); v.n=normalize(ax*cos(am)+ay*sin(am)+dirv*0.12); v.wp=p; v.mi=vec4f(0.6,9.0,f32(k/2u),g); v.pos=u.vp*vec4f(p,1.0); if(g<0.002){v.pos=vec4f(0,0,-9,1);} return v;
+}
+fn ggx2(nh:f32,a2:f32)->f32 { let d=nh*nh*(a2-1.0)+1.0; return a2/(PI*d*d); }
+@fragment fn fsTube(v:TO)->@location(0) vec4f {
+  if(u.camU.w>0.5 && u.camU.w<1.5 && v.wp.y<0.02){ discard; }
+  let V=normalize(u.cam.xyz-v.wp); var n=normalize(v.n); let L=u.sun.xyz; if(dot(n,V)<0.0){ n=normalize(n-V*dot(n,V)*1.02); }
+  let nv=max(dot(n,V),0.03); let F=0.045+0.955*pow(1.0-nv,5.0);
+  let sh=shadowAt(v.wp+n*0.35,(u.jit.xy-0.5)*0.0012); let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w;
+  let env=naveEnv(v.wp+n*0.05,reflect(-V,n)); let rd=refract(-V,n,1.0/1.42); let thru=naveEnv(v.wp+n*0.05,rd);
+  let nl=sat(dot(n,L)); let wrap=sat(dot(n,L)*0.5+0.5);
+  let tint=vec3f(0.80,0.95,0.97);
+  var col=thru*tint*0.95*(0.30+0.70*nv)+vec3f(0.55,0.66,0.80)*amb*(0.05+0.10*sat(n.y*0.5+0.5))+vec3f(0.5,0.7,0.9)*pow(1.0-nv,2.0)*amb*0.22+vec3f(0.85,0.95,1.0)*sh*u.sunC.rgb*(nl*0.30+pow(wrap,3.0)*0.05);
+  col=col*(1.0-F)+env*F*1.1;
+  let H=normalize(V+L); col+=u.sunC.rgb*sh*min(ggx2(sat(dot(n,H)),0.006),30.0)*0.05*F*4.0;
+  col+=vec3f(0.35,0.85,1.0)*pow(1.0-v.mi.x,3.0)*1.5*step(0.001,v.mi.x);
+  if(v.mi.y>8.5){ col=thru*vec3f(0.6,0.95,1.0)*0.9+env*F+skyThrough(rd,3.0)*0.22+vec3f(0.25,0.7,0.85)*(0.15+0.9*pow(v.mi.z,3.0))*0.12*dot(u.sunC.rgb,vec3f(1.0)); }
+  let dist=distance(u.cam.xyz,v.wp); let fog=1.0-exp(-dist*u.sky.z*0.15); col=mix(col,fogColor(-V),fog);
+  return vec4f(max(col,vec3f(0.0)),1.0);
+}
+
+// ---------------- the rose window, made of shards from the start so it can break
+struct RO { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) n:vec3f, @location(2) q:vec2f, @location(3) br:f32 };
+fn roseVS(vi:u32)->RO {
+  var v:RO; let cell=vi/6u; let k=vi%6u; let c=vec2f(f32(cell%144u),f32(cell/144u)); let flip=hash21(c)>0.5;
+  var o=array<vec2f,6>(vec2f(0,0),vec2f(1,0),vec2f(1,1),vec2f(0,0),vec2f(1,1),vec2f(0,1)); if(flip){ o=array<vec2f,6>(vec2f(0,0),vec2f(1,0),vec2f(0,1),vec2f(1,0),vec2f(1,1),vec2f(0,1)); }
+  let me=roseVert(c+o[k]); let bird=isBirdCell(c); let t=u.cam.w;
+  if(u.fr.y<0.5||u.fr.w>4.5||(bird&&t>=T_FLY_C)){ v.pos=vec4f(0,0,-9,1); return v; }
+  let sd=shardDyn(c,t,bird); let rot=rotA(vec3f(me-sd.mid,0.0),sd.ax,sd.an);
+  v.n=rotA(vec3f(0.0,0.0,-1.0),sd.ax,sd.an); v.wp=vec3f(sd.mid,u.fr.z)+rot+sd.off; v.q=me; v.br=smoothstep(0.0,0.05,sd.tt); v.pos=u.vp*vec4f(v.wp,1.0); return v;
+}
+@fragment fn fsRose(v:RO,@builtin(front_facing) ff:bool)->@location(0) vec4f {
+  let p=v.q; let W=u.nave.x; let HW=u.nave.y; let GR=u.nave.z; if(abs(p.x)>W||p.y<0.0){ discard; } if(p.y>HW){ if(length(vec2f(abs(p.x)+(GR-W),p.y-HW))>GR){ discard; } }
+  let born=u.fr.y*sat((u.fr.x-u.fr.z-length(p-vec2f(0.0,30.0))*1.2)/30.0); if(born<0.01){ discard; }
+  if(u.camU.w>0.5&&u.camU.w<1.5&&v.wp.y<0.02){ discard; }
+  let V=normalize(u.cam.xyz-v.wp); var n=normalize(v.n); if(dot(n,V)<0.0){n=-n;} let L=u.sun.xyz; let g=roseAt(p);
+  if(v.br>0.02&&u.camU.w<0.5){ let nvv=abs(dot(normalize(v.n),V)); let opa=mix(1.0,0.22+0.75*pow(1.0-nvv,3.0)+0.6*step(0.9,g.a),v.br); if(ign(v.pos.xy,u.res.z*7.0+floor(u.jit.x*61.0))>opa){ discard; } } let e=0.10; let sx=roseAt(p+vec2f(e,0)).a-roseAt(p-vec2f(e,0)).a; let sy=roseAt(p+vec2f(0,e)).a-roseAt(p-vec2f(0,e)).a;
+  let gn=normalize(n+vec3f(-sx,-sy,0.0)*0.8); let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w;
+  let trans=g.rgb*(skyThrough(-V+vec3f(hash22(floor(p*2.0))-0.5,0.0)*0.10,2.2)*1.9+u.sunC.rgb*(0.10+0.12*sat(L.z)));
+  let env=naveEnv(v.wp+vec3f(0,0,-0.2),reflect(-V,gn)); let stone=vec3f(0.30,0.36,0.38)*(amb*0.35)+env*0.30+vec3f(0.03,0.04,0.05)*amb;
+  var col=mix(trans,stone,g.a); let F=0.04+0.96*pow(1.0-max(dot(n,V),0.0),5.0);
+  let rfl=reflect(-V,n); let outside=dome(normalize(vec3f(rfl.x,abs(rfl.y)+0.01,rfl.z)),1.0).rgb; let rrf=refract(-V,n,1.0/1.45); let seen=dome(normalize(vec3f(rrf.x,abs(rrf.y)+0.01,rrf.z)),0.5).rgb+u.sunC.rgb*(hg(sat(dot(rrf,L)),0.97)*0.12+hg(sat(dot(-V,L)),0.55)*0.55); let edge2=pow(1.0-max(dot(n,V),0.0),2.0);
+  col=mix(col,mix(g.rgb,vec3f(0.80,0.92,0.97),0.55)*seen*0.9*(1.0-edge2*0.5)*(1.0-0.75*step(0.96,g.a))+outside*(F*1.2+0.05)+u.sunC.rgb*pow(sat(dot(reflect(-V,n),L)),300.0)*6.0,v.br);
+  let H=normalize(V+L); col+=u.sunC.rgb*min(ggx2(sat(dot(n,H)),0.0009),120.0)*0.03*v.br;
+  col+=vec3f(0.45,0.9,1.0)*pow(1.0-born,2.0)*1.5;
+  return vec4f(max(col,vec3f(0.0)),1.0);
+}
+
+@vertex fn vsRose(@builtin(vertex_index) vi:u32)->RO { return roseVS(vi); }
+@vertex fn vsRoseSh(@builtin(vertex_index) vi:u32)->RO { var v=roseVS(vi); v.pos=u.svp*vec4f(v.wp,1.0); if(u.fr.y<0.5){ v.pos=vec4f(0,0,-9,1); } return v; }
+@fragment fn fsRoseSh(v:RO)->@location(0) vec4f { let g=roseAt(v.q); let born=u.fr.y*sat((u.fr.x-u.fr.z-length(v.q-vec2f(0.0,30.0))*1.2)/30.0); let W=u.nave.x; let HW=u.nave.y; let GR=u.nave.z; if(abs(v.q.x)>W||(v.q.y>HW&&length(vec2f(abs(v.q.x)+(GR-W),v.q.y-HW))>GR)){ discard; } return vec4f(mix(vec3f(1.0),g.rgb*(1.0-g.a*0.97)*1.6,born),1.0); }
+// ---------------- spray / hanging droplets: instanced sprites
+
+@vertex fn vsSpray(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var v:PO; let c=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(1,1),vec2f(-1,-1),vec2f(1,1),vec2f(-1,1))[vi];
+  let side=400u; let gx=f32(ii%side); let gz=f32(ii/side); let cell=1.5; let org=floor(u.cam.xz/cell)+floor(u.camF.xz*95.0/cell);
+  let id=vec2f(gx,gz)-f32(side)*0.5+org; let h=hash22(id); let h2=hash22(id+57.0); let life=1.3+1.2*h2.x; let ph=fract(u.misc.y/life+h.x); let t0=floor(u.misc.y/life+h.x);
+  let q0=(id+hash22(id+t0*7.7))*cell; let m=sat(u.wave.x*1.4);
+  var b=baseSurf(q0.x,q0.y); var d=seaDisp(vec2f(q0.x-flowS(q0.x),q0.y),1.5,mix(1.0,0.1,waveMask(q0.x)*m)); let ring=ringAt(b.p.x,q0.y);
+  var src=smoothstep(0.38,0.95,d.w*u.flow.y*ring.y+ring.z*1.6);
+  let lipK=smoothstep(118.0,140.0,q0.x)*(1.0-smoothstep(153.0,160.0,q0.x))*smoothstep(0.4,0.8,b.st); src=max(src,lipK*0.8); let imp=exp(-pow(abs(q0.x+25.0)/7.0,2.0))*smoothstep(0.8,1.0,b.st)*(1.0-step(1.05,b.st)); src=max(src,imp);
+  let frozen=u.fr.y*0.0; let age=ph*life; let wind=vec3f(-u.sun.x,0.0,-u.sun.z)*(9.0+9.0*h2.y);
+  var p=b.p+b.ts*d.x*u.flow.y*ring.y+b.n*d.y*u.flow.y*ring.y+vec3f(0,ring.x,0); p+=vec3f(0.0,ring.z*age*16.0*h2.x,0.0)+wind*age*0.9+vec3f(h.y-0.5,0.0,h2.x-0.5)*age*3.0+vec3f(0,(2.0+7.0*h.x*(0.4+src))*age-3.2*age*age,0)+b.n*lipK*age*5.0;
+  let fz=freezeAt(q0.x,q0.y);
+  p+=vec3f(1.5,5.0*h2.x,0.0)*imp*age; let sz=(0.14+0.70*h2.y*h2.y+age*1.9*(0.5+ring.z*1.2+imp*1.1))*step(0.02,src)*(1.0-sat(fz*6.0)); let fade=sin(ph*PI)*src;
+  let dist=distance(p,u.cam.xyz); v.mi=vec4f(fade*smoothstep(1.5+20.0*ring.z,6.0+50.0*ring.z,dist)*(1.0-smoothstep(260.0,300.0,dist)),h.x,h2.x,sz); v.uv=c; v.wp=p;
+  let wp=p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz; v.pos=u.vp*vec4f(wp,1.0); if(sz<0.01||v.mi.x<0.004){v.pos=vec4f(0,0,-9,1);} return v;
+}
+@fragment fn fsSpray(v:PO)->@location(0) vec4f {
+  let r=length(v.uv); if(r>1.0){discard;} let V=normalize(u.cam.xyz-v.wp); let nz=textureSampleLevel(tFoam,sRep,v.uv*0.11+v.mi.yz*7.0,0.0);
+  var a=pow(1.0-r,1.4)*smoothstep(0.30,0.75,nz.b+0.25*(nz.r-0.5))*v.mi.x*0.42*exp(-v.mi.w*0.18);
+  let amb=domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w; let ph=hg(sat(dot(-V,u.sun.xyz)),0.45)*0.6+0.06; let c=u.sunC.rgb*ph*0.30*mix(1.0,0.25,u.flow.w)+amb*vec3f(0.80,0.92,1.05)*0.85;
+  return vec4f(c*a,a);
+}
+// the detonation: water thrown ballistically out of the point where the cursor was
+@vertex fn vsBurst(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  // water torn off the crown's rim and the column under the sun, thrown ballistically
+  var v:PO; let c=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(1,1),vec2f(-1,-1),vec2f(1,1),vec2f(-1,1))[vi]; let f=f32(ii); let h=hash33(vec3f(f,3.0,1.0)); let h2=hash33(vec3f(f,8.0,4.0));
+  let T=u.gal2.w; let th=h.x*2.0*PI; var p:vec3f; var sz:f32; var al:f32; let plume=f<5000.0;
+  if(plume){ let te=h2.x*0.25; let a=max(T-te,0.0); let jet=pow(vnoise(vec2f(th*5.0,1.0))*0.7+vnoise(vec2f(th*17.0,4.0))*0.3,2.0)*2.0; let up=(560.0+380.0*jet)*(1.0-exp(-a*3.6))*pow(h.z,0.7);
+    p=vec3f(u.birth.x,0.0,u.birth.y)+vec3f(sin(th),0.0,cos(th))*(6.0+h.y*30.0+a*(12.0+40.0*h.y))+vec3f(0.0,up-55.0*a*a,0.0); sz=(6.0+12.0*h2.y)*(1.0+1.2*a); al=0.35*smoothstep(0.0,0.05,a)*(1.0-smoothstep(0.5,1.9,a)); }
+  else { let te=pow(h2.x,1.5)*1.6; let a=T-te; if(a<0.0){ v.pos=vec4f(0,0,-9,1); return v; }
+    let R=ringRw(te); let H=crownHw(te); let rr=max(R*0.28,5.0)+3.0+H*0.32; let fing=vnoise(vec2f(th*10.19,1.3));
+    let p0=vec3f(u.birth.x+sin(th)*rr,H*(0.88+0.16*fing),u.birth.y+cos(th)*rr); let vo=30.0+110.0*h.y; let vu=10.0+90.0*h.z*h.z;
+    let drag=(1.0-exp(-a*1.4))/1.4; p=p0+vec3f(sin(th),0.0,cos(th))*vo*drag+vec3f((h2.y-0.5)*20.0,vu,(h2.z-0.5)*20.0)*drag-vec3f(0.0,22.0*a*a,0.0);
+    let big=step(0.97,h2.y); sz=mix(0.5+1.8*h2.z,2.5+4.0*h2.z,big)*(1.0+a*0.6); al=mix(2.0,0.35,big)*smoothstep(0.0,0.06,a)*(1.0-smoothstep(1.2,2.2,a))*step(0.3,p.y); }
+  let dist=distance(p,u.cam.xyz); v.mi=vec4f(al*smoothstep(25.0,110.0,dist)*step(0.0,T),h.x,h2.x,select(sz*0.25,2.0,plume)); v.uv=c; v.wp=p;
+  let wp=p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz; v.pos=u.vp*vec4f(wp,1.0); if(v.mi.x<0.004){v.pos=vec4f(0,0,-9,1);} return v; }
+// droplets hanging in frozen time
+@vertex fn vsDrop(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var v:PO; let c=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(1,1),vec2f(-1,-1),vec2f(1,1),vec2f(-1,1))[vi];
+  let f=f32(ii); let h=hash33(vec3f(f,1.0,2.0)); let h2=hash33(vec3f(f,5.0,9.0)); let span=170.0; let zc=u.cam.z+60.0; var z=h.x*span; z=z+floor((zc-z)/span+0.5)*span;
+  let p=vec3f((h.y-0.5)*30.0,1.5+h.z*34.0,z)+vec3f(sin(u.cam.w*0.7+f),cos(u.cam.w*0.5+f*1.3)*0.6-0.25*u.cam.w,0.0)*0.35; let g=u.fr.y*sat((u.fr.x-z)/20.0)*u.misc.w*(1.0-step(u.fr.z,z));
+  let sz=(0.018+0.10*pow(h2.x,6.0))*g; let dist=distance(p,u.cam.xyz); v.mi=vec4f(smoothstep(0.8,3.0,dist),h2.x,h2.y,sz); v.uv=c; v.wp=p;
+  let wp=p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz; v.pos=u.vp*vec4f(wp,1.0); if(sz<0.002){v.pos=vec4f(0,0,-9,1);} return v;
+}
+@fragment fn fsDrop(v:PO)->@location(0) vec4f {
+  let r2=dot(v.uv,v.uv); if(r2>1.0){discard;} let z=sqrt(1.0-r2); let V=normalize(u.cam.xyz-v.wp); let n=normalize(u.camR.xyz*v.uv.x+u.camU.xyz*v.uv.y+V*z);
+  let nv=max(dot(n,V),0.03); let F=0.04+0.96*pow(1.0-nv,5.0); let sh=shadowAt(v.wp,vec2f(0.0)); let env=naveEnv(v.wp,reflect(-V,n)); let thru=naveEnv(v.wp,refract(-V,n,1.0/1.5));
+  let H=normalize(V+u.sun.xyz); var col=thru*(1.0-F)*0.9+env*F*1.0+sh*u.sunC.rgb*(min(ggx2(sat(dot(n,H)),0.004),60.0)*0.02+pow(sat(dot(refract(-V,n,1.0/1.5),u.sun.xyz)),24.0)*0.8);
+  return vec4f(max(col,vec3f(0.0)),v.mi.x);
+}
+`;
+WGSL["worlds"]=String.raw`
+// ================= worlds 2..7: crown splash, birds, the rising city, lanterns, rain up, the galaxy
+fn wggx(nh:f32,a2:f32)->f32 { let d=nh*nh*(a2-1.0)+1.0; return a2/(PI*d*d); }
+fn ambSky()->vec3f { return domeRaw(vec3f(0.1,0.95,0.2),6.0).rgb*u.sun.w*(1.0-u.seg2.w); }
+const QD = array<vec2u,6>(vec2u(0,0),vec2u(1,0),vec2u(1,1),vec2u(0,0),vec2u(1,1),vec2u(0,1));
+const QS = array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(1,1),vec2f(-1,-1),vec2f(1,1),vec2f(-1,1));
+
+// ---------------------------------------------------------------- 1. the crown: a 300 m sheet of water thrown up round the cursor's sun
+struct CO { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) n:vec3f, @location(2) q:vec2f, @location(3) mi:vec4f };
+fn crownH(tau:f32)->f32 { return 310.0*(1.0-exp(-tau*3.2))*(1.0-smoothstep(0.85,1.9,tau)); }
+fn crownP(th:f32,v:f32,tau:f32)->vec3f {
+  let R=u.birth.z; let rb=max(R*0.28,5.0)+3.0; let H=crownH(tau);
+  let wob=(vnoise(vec2f(th*7.64,tau*0.9+v*2.0))-0.5)*0.26+(vnoise(vec2f(th*22.9,v*5.0-tau*2.0))-0.5)*0.07;
+  let fall=smoothstep(0.8,1.9,tau); let fl=(0.12*v+0.20*v*v)*(1.0+wob)+fall*v*v*0.28;
+  let r=rb+H*fl; let y=H*v*(1.0-0.08*v)*(1.0+wob*0.25)-fall*v*v*H*0.45;
+  return vec3f(u.birth.x+sin(th)*r,y,u.birth.y+cos(th)*r);
+}
+@vertex fn vsCrown(@builtin(vertex_index) vi:u32)->CO {
+  var o:CO; let tau=u.gal2.w; let c=QD[vi%6u]; let cell=vi/6u; let iu=cell%480u; let iv=cell/480u;
+  let th=f32(iu+c.x)/480.0*2.0*PI; let v=f32(iv+c.y)/96.0;
+  if(tau<0.0||tau>2.0){ o.pos=vec4f(0,0,-9,1); return o; }
+  let p=crownP(th,v,tau); let pt=crownP(th+0.01,v,tau); let pv=crownP(th,v+0.01,tau);
+  o.n=normalize(cross(pt-p,pv-p)); o.wp=p; o.q=vec2f(th,v); o.mi=vec4f(tau,crownH(tau),0,0); o.pos=u.vp*vec4f(p,1.0); return o;
+}
+@fragment fn fsCrown(v:CO)->@location(0) vec4f {
+  let tau=v.mi.x; let th=v.q.x; let vv=v.q.y;
+  // the rim tears into fingers, and the sheet itself tears open as it falls
+  let fing=vnoise(vec2f(th*10.19,1.3)); let nf=th*64.0/(2.0*PI); let fx=abs(fract(nf+vnoise(vec2f(th*3.0,vv*2.0))*0.6)-0.5);
+  let top=0.86+0.16*fing-0.75*smoothstep(0.9,1.8,tau)*(0.6+0.8*vnoise(vec2f(th*4.0,tau)));
+  if(vv>top){ let tip=(vv-top)/0.16; if(fx>0.30*(1.0-tip)){ discard; } }
+  let hole=vnoise(vec2f(th*18.0,vv*9.0-tau*1.5))+vnoise(vec2f(th*41.0,vv*20.0))*0.5; if(hole<smoothstep(0.9,1.8,tau)*1.4-0.15){ discard; }
+  let V=normalize(u.cam.xyz-v.wp); var n=normalize(v.n); if(dot(n,V)<0.0){ n=-n; } let L=u.sun.xyz;
+  let nrm=normalize(n+vec3f(vnoise(vec2f(th*90.0,vv*30.0-tau*4.0))-0.5,0.0,vnoise(vec2f(th*80.0+3.0,vv*28.0))-0.5)*0.35);
+  let nv=max(dot(nrm,V),0.03); let F=0.02+0.98*pow(1.0-nv,5.0); var R=reflect(-V,nrm); R.y=abs(R.y)+0.02; let sky=dome(normalize(R),1.5).rgb;
+  let d=mix(7.0,0.9,vv); let thr=normalize(mix(-V,refract(-V,nrm,0.75),0.7)); let ext=exp(-vec3f(0.42,0.10,0.09)*d);
+  let cS=sat(dot(thr,L)); let glow=hg(cS,0.78)*0.6+hg(cS,0.95)*0.12+0.03; let amb=ambSky();
+  let water=vec3f(0.85,0.95,1.3)*(u.sunC.rgb*glow*ext*1.2+skyThrough(thr,5.0)*ext*0.35)+vec3f(0.004,0.03,0.04)*amb;
+  // streaming white water up the sheet
+  let st=textureSampleLevel(tFoam,sRep,vec2f(th*7.0,vv*1.4-tau*1.1),1.0); let st2=textureSampleLevel(tFoam,sRep,vec2f(th*23.0,vv*4.0-tau*2.3),0.5);
+  let fm=smoothstep(0.55,1.05,st.b*0.7+st2.r*0.35+vv*0.25+exp(-vv*14.0)*0.8);
+  let fc=vec3f(0.9,0.95,1.0)*(u.sunC.rgb*(0.05+0.22*hg(sat(dot(-V,L)),0.55))+amb*vec3f(0.85,0.95,1.1)*1.1);
+  var col=mix(water*(1.0-F)+sky*F,fc,fm*0.85);
+  let dist=distance(u.cam.xyz,v.wp); col=mix(col,fogColor(-V),1.0-exp(-dist*u.sky.z));
+  return vec4f(max(col,vec3f(0.0)),1.0);
+}
+
+// ---------------------------------------------------------------- 2. birds: shards unfold into articulated stained-glass birds
+struct BO { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) n:vec3f, @location(2) @interpolate(flat) c:vec4f, @location(3) mi:vec4f };
+// 22 triangles: body 10, tail 2, per wing inner 2 + outer 3. seg: 0 body/tail, 1 inner wing, 2 outer wing; sign = side
+const BV = array<vec3f,15>(vec3f(0.0,0.02,0.52),vec3f(0.0,0.09,0.30),vec3f(0.0,0.10,0.0),vec3f(0.0,-0.10,0.05),vec3f(-0.085,0.0,0.1),vec3f(0.085,0.0,0.1),vec3f(0.0,0.03,-0.30),
+  vec3f(-0.16,0.02,-0.58),vec3f(0.0,0.03,-0.50),vec3f(0.16,0.02,-0.58), vec3f(0.07,0.04,0.20),vec3f(0.07,0.04,-0.12),vec3f(0.55,0.04,0.17),vec3f(0.55,0.04,-0.16),vec3f(1.05,0.04,-0.05));
+const BT = array<u32,36>(0u,1u,4u, 0u,5u,1u, 0u,4u,3u, 0u,3u,5u, 1u,2u,4u, 1u,5u,2u, 4u,2u,6u, 2u,5u,6u, 4u,6u,3u, 3u,6u,5u, 6u,7u,8u, 6u,8u,9u);
+fn birdLocal(k:u32,side:f32,a1:f32,a2:f32,fold:f32)->vec3f {
+  // wing triangles: inner (S1,E1,S2),(S2,E1,E2); outer (E1,P1,E2),(E2,P1,P2),(P1,Pt,P2)
+  let wi=array<u32,15>(10u,12u,11u, 11u,12u,13u, 12u,14u,13u, 13u,14u,15u, 14u,16u,15u);
+  let id=wi[k]; var p:vec3f;
+  if(id<15u){ p=BV[id]; } else if(id==15u){ p=vec3f(0.98,0.04,-0.26); } else { p=vec3f(1.12,0.04,-0.17); }
+  let seg=select(1.0,2.0,id>=12u); var q=p;
+  if(seg>1.5){ var e=q-vec3f(0.55,0.04,q.z); e.x*=fold; let ca=cos(a2); let sa=sin(a2); e=vec3f(e.x*ca-e.y*sa,e.x*sa+e.y*ca,e.z); q=vec3f(0.55,0.04,q.z)+e; }
+  if(id!=10u&&id!=11u){ var e=q-vec3f(0.07,0.04,q.z); let ca=cos(a1); let sa=sin(a1); e=vec3f(e.x*ca-e.y*sa,e.x*sa+e.y*ca,e.z); q=vec3f(0.07,0.04,q.z)+e; }
+  q.x*=side; return q;
+}
+fn birdPos(i:u32,f:f32)->vec4f { let fi=clamp(f,0.0,f32(BIRD_NF-1u)); let i0=u32(floor(fi)); let k=fi-f32(i0);
+  let a=birdsB[min(i0,BIRD_NF-1u)*NBIRDC+i]; let b=birdsB[min(i0+1u,BIRD_NF-1u)*NBIRDC+i]; let p0=birdsB[max(i0,1u)*NBIRDC-NBIRDC+i]; let p3=birdsB[min(i0+2u,BIRD_NF-1u)*NBIRDC+i];
+  let k2=k*k; let k3=k2*k; let cr=0.5*((2.0*a.xyz)+(-p0.xyz+b.xyz)*k+(2.0*p0.xyz-5.0*a.xyz+4.0*b.xyz-p3.xyz)*k2+(-p0.xyz+3.0*a.xyz-3.0*b.xyz+p3.xyz)*k3);
+  return vec4f(cr,max(a.w,b.w)); }
+@vertex fn vsBird(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->BO {
+  var o:BO; let t=u.cam.w; let f=(t-T_FLY_C)*30.0; let info=birdsB[BIRD_OFF2+ii]; if(info.z<0.5||t<T_FLY_C){ o.pos=vec4f(0,0,-9,1); return o; }
+  let cell=info.xy; let h=hash33(vec3f(cell,4.0)); let h2=hash33(vec3f(cell.yx,9.0));
+  let P=birdPos(ii,f); let P1=birdPos(ii,f+0.5); let P0=birdPos(ii,f-0.5); var vel=(P1.xyz-P0.xyz)*60.0; let acc=(P1.xyz-2.0*P.xyz+P0.xyz)*3600.0;
+  if(P.w>0.0&&t>P.w+0.05){ o.pos=vec4f(0,0,-9,1); return o; } // into the sea
+  let sp=max(length(vel),1.0); let fw=vel/sp; let lat=dot(acc,normalize(cross(vec3f(0,1,0),fw)));
+  var rt=normalize(cross(vec3f(0.0,1.0,0.0),fw)); var up=cross(fw,rt); let bank=clamp(lat*0.035,-1.1,1.1); let cb=cos(bank); let sb=sin(bank); let rt2=rt*cb+up*sb; up=up*cb-rt*sb; rt=rt2;
+  // wing beat: flap, glide, or tuck for the dive
+  let dive=smoothstep(T_CITY_C-0.2,T_CITY_C+0.6,t); let hz=3.2+1.4*h.x; let ph=t*hz*2.0*PI+h.y*6.28; let glide=smoothstep(0.55,0.75,sin(t*0.9+h.z*6.0));
+  let am=mix(mix(0.62,0.08,glide),0.0,dive); var a1=am*sin(ph)+0.10+mix(0.0,0.10,glide); var a2=am*0.8*sin(ph-0.9)-0.05; var fold=1.0-0.28*max(0.0,cos(ph))*(1.0-glide);
+  a1=mix(a1,-0.15,dive); fold=mix(fold,0.45,dive);
+  // geometry
+  let tri=vi/3u; let k=vi%3u; var lp:vec3f; var side=1.0; var seg=0.0;
+  if(tri<12u){ lp=BV[BT[tri*3u+k]]; } else { let w=tri-12u; side=select(-1.0,1.0,w<5u); let wk=(w%5u)*3u+k; var kk=wk; if(side<0.0){ kk=(w%5u)*3u+(2u-k); } lp=birdLocal(kk,side,a1,a2,fold); seg=select(2.0,1.0,(w%5u)<2u); }
+  let bs=1.0+0.7*h2.x;
+  // the morph: at T_FLY the bird is a flat silhouette lying in its shard, then it unfolds
+  let b=smoothstep(T_FLY_C+0.02,T_FLY_C+0.55+0.25*h.z,t);
+  let sd=shardDyn(cell,T_FLY_C,true); let sc=vec3f(sd.mid,u.fr.z)+sd.off; let hp=vec2f(-sd.hax.y,sd.hax.x);
+  let flatL=rotA(vec3f(hp*lp.x+sd.hax*lp.z,0.0)*0.55,sd.ax,sd.an);
+  let world3=fw*lp.z*bs+rt*lp.x*bs+up*lp.y*bs;
+  o.wp=mix(sc+flatL,P.xyz+world3,b);
+  let col=roseAt(sd.mid); o.c=vec4f(col.rgb,seg); o.mi=vec4f(b,dive,lp.x,lp.z);
+  let n0=rotA(vec3f(0.0,0.0,-1.0),sd.ax,sd.an); o.n=normalize(mix(n0,up+rt*lp.x*0.3*side,b)); o.pos=u.vp*vec4f(o.wp,1.0); return o;
+}
+@fragment fn fsBird(v:BO,@builtin(front_facing) ff:bool)->@location(0) vec4f {
+  let V=normalize(u.cam.xyz-v.wp); var n=normalize(v.n); if(dot(n,V)<0.0){ n=-n; } let L=u.sun.xyz; let amb=ambSky();
+  let nv=max(dot(n,V),0.03); let F=0.04+0.96*pow(1.0-nv,5.0); var R=reflect(-V,n); R.y=abs(R.y)+0.02; let env=dome(normalize(R),2.0).rgb;
+  let lead=1.0-smoothstep(0.03,0.07,abs(fract(v.mi.z*3.0+v.mi.w*2.0)-0.5)*0.4);
+  let back=hg(sat(dot(-V,L)),0.72)*1.4+0.02; let gcol=mix(vec3f(dot(v.c.rgb,vec3f(0.33))),v.c.rgb,0.75);
+  let glass=vec3f(0.012,0.012,0.016)*amb+gcol*(u.sunC.rgb*back*0.9+skyThrough(-V,3.0)*0.18);
+  var col=select(glass*(1.0-lead*0.85),vec3f(0.012,0.011,0.014)*amb+env*0.12,v.c.w<0.5)*(1.0-F)+env*F*0.6;
+  // as night falls the glass starts to burn; diving, they become the city's lights
+  let ember=smoothstep(T_CITY_C-3.4,T_CITY_C-0.9,u.cam.w); col+=v.c.rgb*mix(vec3f(1.0,0.75,0.45),vec3f(1.0),0.3)*ember*(2.2+4.0*v.mi.y)*select(1.0,0.35,v.c.w<0.5);
+  let dist=distance(u.cam.xyz,v.wp); col=mix(col,fogColor(-V),1.0-exp(-dist*u.sky.z));
+  return vec4f(max(col,vec3f(0.0)),1.0);
+}
+
+// ---------------------------------------------------------------- 3. the city: towers rise out of the sea, pouring water, lights coming on floor by floor
+struct TO2 { @builtin(position) pos:vec4f, @location(0) wp:vec3f, @location(1) n:vec3f, @location(2) @interpolate(flat) id:vec4f, @location(3) q:vec4f };
+@vertex fn vsTower(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->TO2 {
+  var o:TO2; let ij=vec2i(i32(ii%CITYNX_C)-i32(CITYNX_C/2u),i32(ii/CITYNX_C)); let T=towerAt(ij);
+  if(T.ok<0.5||u.cam.w<T.tr){ o.pos=vec4f(0,0,-9,1); return o; }
+  let tier=vi/30u; let k=vi%30u; let face=k/6u; let c=QD[k%6u];
+  let hw=select(T.hw,T.hw*vec2f(0.70,0.74),tier==1u); let base=T.top-T.H-45.0; let ysplit=T.top-T.H*0.26; var y0=base; var y1=ysplit; if(tier==1u){ y0=ysplit; y1=T.top+T.H*0.02; }
+  var p:vec3f; var n:vec3f; let a=f32(c.x); let b=f32(c.y);
+  if(face==0u){ p=vec3f(hw.x,mix(y0,y1,b),mix(-hw.y,hw.y,a)); n=vec3f(1,0,0); }
+  else if(face==1u){ p=vec3f(-hw.x,mix(y0,y1,b),mix(hw.y,-hw.y,a)); n=vec3f(-1,0,0); }
+  else if(face==2u){ p=vec3f(mix(hw.x,-hw.x,a),mix(y0,y1,b),hw.y); n=vec3f(0,0,1); }
+  else if(face==3u){ p=vec3f(mix(-hw.x,hw.x,a),mix(y0,y1,b),-hw.y); n=vec3f(0,0,-1); }
+  else { p=vec3f(mix(-hw.x,hw.x,a),y1,mix(-hw.y,hw.y,b)); n=vec3f(0,1,0); }
+  // after gravity flips, towers tumble slowly as they fall up
+  let tl=max(u.cam.w-T.tl,0.0); let rax=normalize(vec3f(T.h.x-0.5,0.3,T.h.y-0.5)); let an=tl*tl*0.006*(0.5+T.h.z);
+  let cen=vec3f(0.0,T.top-T.H*0.5,0.0); p=cen+rotA(p-cen,rax,an); n=rotA(n,rax,an);
+  o.wp=vec3f(T.c.x,0.0,T.c.y)+p; o.n=n; o.id=vec4f(f32(ij.x),f32(ij.y),f32(face),f32(tier)); o.q=vec4f(T.top,T.H,T.tr,T.tl);
+  o.pos=u.vp*vec4f(o.wp,1.0); return o;
+}
+fn winLit(ij:vec2f,fl:f32,bay:f32,face:f32,H:f32,tr:f32,tl:f32,v:f32)->vec2f { // x: on, y: colour seed
+  let h=hash33(vec3f(ij.x*7.0+face*131.0+bay*0.37,fl+ij.y*3.1,bay*1.7+face));
+  if(h.x<0.60){ return vec2f(0.0,h.y); }
+  let em=tr+2.4*(1.0-pow(clamp(v/max(H,1.0),0.0,1.0),0.3333));          // when this floor came out of the water
+  let on=smoothstep(em+0.25+0.9*h.y,em+0.35+0.9*h.y,u.cam.w);
+  let rel=T_GRAV_C+0.1+2.6*h.z;                                          // and when its light lets go
+  return vec2f(on*(1.0-step(rel,u.cam.w)),h.y);
+}
+@fragment fn fsTower(v:TO2)->@location(0) vec4f {
+  let V=normalize(u.cam.xyz-v.wp); let n=normalize(v.n); let face=v.id.z; let top=v.q.x; let H=v.q.y; let tr=v.q.z; let age=u.cam.w-tr;
+  if(u.camU.w>0.5&&u.camU.w<1.5&&v.wp.y<0.0){ discard; }
+  let th=hash22(v.id.xy+vec2f(3.3,8.1)); let style=floor(th.x*3.0);       // 0 punched grid, 1 ribbon bands, 2 fins
+  let lv=v.wp.y-(top-H); let fl=floor(lv/3.6); let fv=fract(lv/3.6);
+  let uu=select(v.wp.z,v.wp.x,abs(n.z)>0.5); let bw=select(3.1,select(6.0,1.6,style>1.5),style>0.5); let bay=floor(uu/bw); let fu=fract(uu/bw);
+  let amb=ambSky(); let nv=max(dot(n,V),0.02); let F=0.03+0.97*pow(1.0-nv,5.0); var R=reflect(-V,n); R.y=abs(R.y)+0.01;
+  let env=dome(normalize(R),1.0).rgb+starField(normalize(R),u.seg2.y)*0.3;
+  var col=vec3f(0.010,0.012,0.016)*amb+env*F*0.9;
+  var win=step(0.12,fu)*step(fu,0.88)*step(0.18,fv)*step(fv,0.86);
+  if(style>0.5&&style<1.5){ win=step(0.22,fv)*step(fv,0.80)*step(0.04,fu); }
+  if(style>1.5){ win=step(0.35,fu)*step(0.10,fv)*step(fv,0.92); }
+  win*=step(face,3.5);
+  if(win>0.5&&lv>0.0){ let w=winLit(v.id.xy,fl,bay,face,H,tr,v.q.w,lv);
+    let floorOn=step(0.30,hash21(vec2f(fl*1.7+v.id.x,v.id.y*3.1+face)));             // whole dark floors
+    let warm=mix(vec3f(1.0,0.58,0.26),vec3f(1.0,0.84,0.66),w.y); var wc=mix(warm,vec3f(0.62,0.80,1.0),step(0.80,w.y)); wc=mix(wc,vec3f(0.35,1.0,0.80),step(0.97,w.y));
+    let depth=0.45+0.55*sin(fu*PI)*(0.6+0.4*fv); let inten=(0.30+1.5*pow(fract(w.y*7.3),2.0))*floorOn;
+    col=col*0.5+wc*w.x*inten*depth+env*F*0.5; }
+  else if(face<3.5){ let mull=step(fu,0.05)+step(0.96,fv); col+=vec3f(0.05,0.06,0.08)*amb*mull*0.6+vec3f(1.0,0.7,0.4)*0.004*mull; }
+  let wet=exp(-max(age-2.0,0.0)/2.2)*sat(age*3.0); let st=textureSampleLevel(tFoam,sRep,vec2f(uu/9.0,(v.wp.y+u.cam.w*16.0)/60.0),1.0).b;
+  let riv=smoothstep(0.80,0.95,textureSampleLevel(tFoam,sRep,vec2f(uu/1.7,(v.wp.y+u.cam.w*22.0)/90.0),0.0).r); col+=vec3f(0.45,0.55,0.62)*amb*wet*riv*0.5+env*wet*0.10;
+  if(face>3.5){ let blink=step(0.5,fract(u.cam.w*0.7+v.id.x*0.13)); col+=vec3f(1.0,0.05,0.02)*blink*8.0*smoothstep(0.92,0.98,max(abs(fract(v.wp.x/14.0)-0.5),abs(fract(v.wp.z/14.0)-0.5))*2.0); }
+  let dist=distance(u.cam.xyz,v.wp); col=mix(col,(fogColor(-V)*0.6+vec3f(0.022,0.015,0.010)*u.seg2.y)*(1.0-u.seg2.w),1.0-exp(-dist*u.sky.z*2.6));
+  return vec4f(max(col,vec3f(0.0))*(1.0-u.seg2.w),1.0);
+}
+// water pouring off the roofs while a tower rises (real gravity, so it falls 4.9 t^2)
+@vertex fn vsCascade(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var o:PO; let c=QS[vi]; let cell=ii/192u; let kk=ii%192u; let ij=vec2i(i32(cell%CITYNX_C)-i32(CITYNX_C/2u),i32(cell/CITYNX_C)); let T=towerAt(ij);
+  if(T.ok<0.5){ o.pos=vec4f(0,0,-9,1); return o; }
+  let pk=kk%48u; let m=kk/48u; let h=hash33(vec3f(f32(ii),3.0,7.0)); let te=T.tr+f32(m)*0.55+h.x*0.5; let a=u.cam.w-te;
+  if(a<0.0||a>3.0||te>T.tr+2.3){ o.pos=vec4f(0,0,-9,1); return o; }
+  let ke=sat((te-T.tr)/2.4); let topE=T.H*(1.0-pow(1.0-ke,3.0));
+  let side=pk/12u; let s=(f32(pk%12u)+h.y)/12.0; var e:vec2f; var nn:vec2f;
+  if(side==0u){ e=vec2f(T.hw.x,mix(-T.hw.y,T.hw.y,s)); nn=vec2f(1,0); } else if(side==1u){ e=vec2f(-T.hw.x,mix(-T.hw.y,T.hw.y,s)); nn=vec2f(-1,0); } else if(side==2u){ e=vec2f(mix(-T.hw.x,T.hw.x,s),T.hw.y); nn=vec2f(0,1); } else { e=vec2f(mix(-T.hw.x,T.hw.x,s),-T.hw.y); nn=vec2f(0,-1); }
+  let out=(2.5+4.0*h.z)*a; let p=vec3f(T.c.x+e.x+nn.x*out,topE-4.9*a*a,T.c.y+e.y+nn.y*out);
+  if(p.y<0.5){ o.pos=vec4f(0,0,-9,1); return o; }
+  let sz=1.2+2.6*a+1.5*h.y; let dist=distance(p,u.cam.xyz); o.mi=vec4f(0.30*smoothstep(4.0,25.0,dist)*(1.0-smoothstep(2.0,3.0,a)),h.x,h.y,sz*0.10); o.uv=c; o.wp=p;
+  o.pos=u.vp*vec4f(p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz,1.0); return o;
+}
+// window lights that let go when gravity flips, and fall up
+fn lanternPos(ii:u32,t:f32,ok:ptr<function,bool>)->vec4f {
+  let cell=ii/160u; let kk=ii%160u; let ij=vec2i(i32(cell%CITYNX_C)-i32(CITYNX_C/2u),i32(cell/CITYNX_C)); let T=towerAt(ij);
+  *ok=T.ok>0.5; let hk=hash33(vec3f(f32(ii),1.0,5.0)); let face=f32(kk%4u); let H=T.H;
+  let fl=floor(hk.x*max(H/3.6-1.0,1.0)); let lv=(fl+0.5)*3.6; var uu=0.0; var wp:vec3f; let base=T.top-H;
+  let along=(hk.y*2.0-1.0); let hwx=T.hw.x; let hwy=T.hw.y;
+  if(face<0.5){ wp=vec3f(hwx+0.6,0.0,along*hwy); uu=T.c.y+along*hwy; } else if(face<1.5){ wp=vec3f(-hwx-0.6,0.0,along*hwy); uu=T.c.y+along*hwy; } else if(face<2.5){ wp=vec3f(along*hwx,0.0,hwy+0.6); uu=T.c.x+along*hwx; } else { wp=vec3f(along*hwx,0.0,-hwy-0.6); uu=T.c.x+along*hwx; }
+  let bay=floor(uu/3.1); let w=winLit(vec2f(ij),fl,bay,face,H,T.tr,T.tl,lv); let h=hash33(vec3f(f32(ij.x)*7.0+face*131.0+bay*0.37,fl+f32(ij.y)*3.1,bay*1.7+face));
+  let rel=T_GRAV_C+0.1+2.6*h.z; if(h.x<0.60){ *ok=false; }
+  let emo=T.tr+2.4*(1.0-pow(clamp(lv/max(H,1.0),0.0,1.0),0.3333))+0.35+0.9*h.y; if(emo>rel){ *ok=false; }
+  let dt=max(t-rel,0.0); let a=u.city.z*(2.2+1.4*hk.z);
+  var p=vec3f(T.c.x,base+lv+T.lift*0.0,T.c.y)+wp; p.y=min(p.y, base+lv);
+  let rise=0.5*a*dt*dt; p.y+=rise;
+  // the river of light converges on one axis as it climbs, and turns
+  let ax=vec2f(u.city.x,u.city.y+700.0); let k=smoothstep(60.0,1400.0,rise); let rel2=p.xz-ax; let an=rise*0.0011+dt*0.25; let ca=cos(an); let sa=sin(an);
+  let rr=vec2f(rel2.x*ca-rel2.y*sa,rel2.x*sa+rel2.y*ca)*mix(1.0,0.10,k); p=vec3f(ax.x+rr.x,p.y,ax.y+rr.y);
+  return vec4f(p,select(0.0,1.0-0.92*k,t>rel));
+}
+@vertex fn vsLantern(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var o:PO; let c=QS[vi]; var ok=true; let L=lanternPos(ii,u.cam.w,&ok);
+  if(!ok||L.w<0.01||u.gal2.y>0.16){ o.pos=vec4f(0,0,-9,1); return o; }
+  let h=hash33(vec3f(f32(ii),2.0,8.0)); let warm=mix(vec3f(1.0,0.62,0.30),vec3f(1.0,0.86,0.70),h.y); let dist=distance(L.xyz,u.cam.xyz);
+  let sz=max(0.9+0.9*h.x,dist*0.0012); o.mi=vec4f(warm*(3.0+3.0*h.z)*min(1.0,(0.9+0.9*h.x)/sz*1.2)*smoothstep(3.0,25.0,dist)*L.w*(1.0-smoothstep(0.06,0.15,u.gal2.y))*mix(1.0,0.25,sin(PI*sat(u.seg.w/2.8))),1.0); o.uv=c; o.wp=L.xyz;
+  o.pos=u.vp*vec4f(L.xyz+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz,1.0); return o;
+}
+@fragment fn fsSpray2(v:PO)->@location(0) vec4f {
+  let r=length(v.uv); if(r>1.0){discard;} let V=normalize(u.cam.xyz-v.wp); let nz=textureSampleLevel(tFoam,sRep,v.uv*0.11+v.mi.yz*7.0,0.0);
+  let a=pow(1.0-r,1.4)*smoothstep(0.30,0.75,nz.b+0.25*(nz.r-0.5))*v.mi.x*0.55; let amb=ambSky();
+  let c=amb*vec3f(0.55,0.62,0.72)*1.2+vec3f(1.0,0.72,0.45)*0.012; return vec4f(c*a,a);
+}
+@fragment fn fsGlow(v:PO)->@location(0) vec4f { let r2=dot(v.uv,v.uv); if(r2>1.0){discard;} let k=exp(-r2*6.0)+0.08*exp(-r2*1.5); return vec4f(v.mi.rgb*k*v.mi.w,0.0); }
+// the sea lets go too: drops and blobs falling upward
+@vertex fn vsRainUp(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var o:PO; let c=QS[vi]; let side=400u; let cell=3.0; let id=vec2f(f32(ii%side),f32(ii/side))-vec2f(200.0,40.0)+floor(u.cam.xz/cell);
+  let h=hash22(id); let h2=hash22(id+17.0); let t0=T_GRAV_C+0.2+2.8*h.x; let dt=u.cam.w-t0; if(dt<0.0||u.seg2.w>0.9){ o.pos=vec4f(0,0,-9,1); return o; }
+  let big=step(0.985,h2.y); let p=vec3f((id.x+h2.x)*cell,0.5*u.city.z*(0.7+0.8*h2.y)*dt*dt+0.3,(id.y+h.y)*cell);
+  let dist=distance(p,u.cam.xyz); let sz=mix(0.10+0.12*h2.x,1.2+2.5*h.y,big); let px=max(sz,dist*0.0011);
+  o.mi=vec4f(mix(vec3f(0.55,0.62,0.75),vec3f(1.0,0.8,0.6),0.35)*0.45*min(1.0,sz/px)*(1.0-smoothstep(200.0,320.0,dist)),1.0); o.uv=c; o.wp=p;
+  o.pos=u.vp*vec4f(p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*px,1.0); return o;
+}
+
+// ---------------------------------------------------------------- 4. time.scale: the lights become stars, the stars a galaxy; collapse() pulls it into one point
+fn galPos(i:u32,ok:ptr<function,f32>)->vec4f { // xyz world, w brightness
+  let h=hash33(vec3f(f32(i)*0.013,f32(i%977u),7.0)); let h2=hash33(vec3f(f32(i%613u),f32(i)*0.007,3.0)); let h3=hash33(vec3f(f32(i)*0.017,1.0,f32(i%331u)));
+  var rn:f32; var th:f32; var hy:f32; var br=1.0;
+  if(h.x<0.13){ rn=0.16*pow(h.y,1.6); th=h.z*6.2832; hy=(h2.x-0.5)*0.22*(1.0-rn*3.0); br=1.6; }
+  else { rn=min(-0.30*log(1.0-h.y*0.96)+0.04,1.25); let arm=select(0.0,PI,h2.y>0.5); let inArm=step(h3.x,0.74); th=arm+log(rn+0.05)*4.4+(h2.z-0.5)*mix(6.28,0.95*(0.35+rn),inArm); hy=(h3.y-0.5)*0.028*(1.0+rn); br=mix(0.55,1.3,inArm);
+    if(h3.z<0.30&&rn>0.12){ let ci=floor(h3.z*1300.0); let ch=hash33(vec3f(ci,3.0,9.0)); let cr=0.15+0.85*ch.x; let ct=select(0.0,PI,ch.y>0.5)+log(cr+0.05)*4.4+(ch.z-0.5)*0.5; rn=cr+(h2.x-0.5)*0.035; th=ct+(h.z-0.5)*0.06/max(cr,0.1); br=1.8; } }
+  th+=u.gal2.x*(0.12+0.05/max(rn,0.10));
+  let c=u.seg2.x; let rn2=rn*(1.0-c); th+=6.0*c/(1.04-c); hy*=1.0-c;
+  *ok=br; return vec4f(u.gal.xyz+u.gal.w*vec3f(cos(th)*rn2,hy,sin(th)*rn2),rn);
+}
+@vertex fn vsStar(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var o:PO; let c=QS[vi]; var br=1.0; let G=galPos(ii,&br); var p=G.xyz; var vis=u.gal2.z;
+  if(ii<NLANT){ var ok=true; let L=lanternPos(ii,u.cam.w,&ok); if(ok&&L.w>0.01){ p=mix(L.xyz,G.xyz,u.gal2.y); vis=mix(L.w,1.0,u.gal2.y)*smoothstep(0.05,0.15,u.gal2.y); } }
+  let h=hash33(vec3f(f32(ii)*0.031,5.0,f32(ii%101u))); let rn=G.w; var lant=0.0; if(ii<NLANT){ lant=1.0-u.gal2.y; }
+  var col=mix(vec3f(0.62,0.74,1.0),vec3f(1.0,0.82,0.58),smoothstep(0.05,0.35,0.45-rn+h.x*0.3)); col=mix(col,vec3f(1.0,0.35,0.55),step(0.985,h.y)*step(0.15,rn));
+  let bright=br*(0.25+3.5*pow(h.z,9.0))*(1.0+3.0*u.seg2.x)*0.55;
+  let dist=distance(p,u.cam.xyz); let pxw=dist*2.0*tan(u.camF.w*0.5)/u.res.y; let sz=max(u.gal.w*0.00045*(0.5+h.x),pxw*1.15);
+  let k=min(1.0,u.gal.w*0.00045*(0.5+h.x)/sz); let fade=1.0-smoothstep(44.55,44.95,u.cam.w);
+  let hl=hash33(vec3f(f32(ii),2.0,8.0)); let lc=mix(vec3f(1.0,0.62,0.30),vec3f(1.0,0.86,0.70),hl.y)*(3.0+3.0*hl.z); let lsz=max(0.9+0.9*hl.x,pxw);
+  var mcol=col*bright*k*k; if(lant>0.0){ mcol=mix(mcol,lc*min(1.0,(0.9+0.9*hl.x)/lsz*1.2),lant*select(0.0,1.0,vis>0.009))*(1.0-0.85*sin(PI*u.gal2.y)); }
+  let szf=mix(sz,lsz,lant*select(0.0,1.0,vis>0.009));
+  let dcg=distance(u.cam.xyz,u.gal.xyz)/u.gal.w; let thru=sin(PI*sat(u.seg.w/2.8)); let dens=mix(1.0,clamp(dcg*dcg*0.30,0.035,1.0),u.gal2.y)*mix(1.0,0.07,thru)*smoothstep(4.0,70.0,dist);
+  o.mi=vec4f(mcol*vis*fade*dens*select(1.0,0.0,u.seg.w<0.0),1.0); o.uv=c; o.wp=p;
+  if(ii==0u){ // the core, which is the last thing left: one point
+    let core=u.gal.xyz; let pc=dist*0.0; let s2=mix(u.gal.w*0.06,pxw*2.2,smoothstep(43.0,44.9,u.cam.w));
+    o.mi=vec4f(vec3f(1.0,0.92,0.82)*(3.0+30.0*u.seg2.x)*u.gal2.z*select(1.0,0.0,u.seg.w<0.0)*(1.0-smoothstep(45.9,46.15,u.cam.w)),1.0); o.wp=core;
+    o.pos=u.vp*vec4f(core+(u.camR.xyz*c.x+u.camU.xyz*c.y)*s2+pc,1.0); return o; }
+  o.pos=u.vp*vec4f(p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*szf,1.0); if(o.mi.x+o.mi.y<1e-5){ o.pos=vec4f(0,0,-9,1); } return o;
+}
+@vertex fn vsDust(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->PO {
+  var o:PO; let c=QS[vi]; let h=hash33(vec3f(f32(ii)*0.021,9.0,f32(ii%457u))); let h2=hash33(vec3f(f32(ii%389u),f32(ii)*0.011,2.0));
+  let rn=0.12+0.75*pow(h.x,0.8); let arm=select(0.0,PI,h.y>0.5); var th=arm+log(rn+0.05)*4.4-0.16+(h2.x-0.5)*0.22; th+=u.gal2.x*(0.12+0.05/max(rn,0.10));
+  let cc=u.seg2.x; th+=6.0*cc/(1.04-cc); let r2=rn*(1.0-cc);
+  let p=u.gal.xyz+u.gal.w*vec3f(cos(th)*r2,(h2.y-0.5)*0.012,sin(th)*r2); let sz=u.gal.w*(0.006+0.012*h2.z);
+  o.mi=vec4f(vec3f(0.006,0.005,0.005),0.035*u.gal2.z*(1.0-cc)*select(1.0,0.0,u.seg.w<0.0)); o.uv=c; o.wp=p; o.pos=u.vp*vec4f(p+(u.camR.xyz*c.x+u.camU.xyz*c.y)*sz,1.0); return o;
+}
+@fragment fn fsDust(v:PO)->@location(0) vec4f { let r2=dot(v.uv,v.uv); if(r2>1.0){discard;} let n=textureSampleLevel(tFoam,sRep,v.uv*0.2+v.wp.xz*0.0003,0.0).b; let a=v.mi.w*exp(-r2*2.5)*smoothstep(0.3,0.7,n); return vec4f(v.mi.rgb*a,a); }
+`;
+// ---- script.js
+// THE PROGRAM. These strings are what types on screen AND what runs: at each `enter` time the engine
+// executes the string with new Function() against `world`, and the picture reads nothing else.
+// `steps` are live edits: [time, text on screen, cursor index].
+const glass = { ior: 1.52, stained: true, frozen: true };
+const PROGRAM = [
+  { type: [0.10, 0.80], enter: 1.00, code: 'sea.wind = 38' },
+  { type: [4.05, 4.65], enter: 5.00, code: 'wave.height = 54' },
+  { type: [8.30, 8.78], enter: 9.00, code: 'water = glass' },
+  // the line arrives as "= 6", the 6 is deleted and 18 typed over it: a whole day passes
+  { type: [10.28, 10.58], enter: 11.00, code: 'sky.hour = 18', from: 'sky.hour = 6', steps: [[10.68, 'sky.hour = '], [10.78, 'sky.hour = 1'], [10.88, 'sky.hour = 18']] },
+  { type: [13.25, 13.62], enter: 14.00, code: 'shards.fly()' },
+  { type: [18.22, 18.78], enter: 19.00, code: 'city.floors = 160' },
+  // arrives as 9.8; the cursor walks back three places and a minus goes in front of the 9
+  { type: [25.40, 25.80], enter: 27.00, code: 'gravity = -9.8', from: 'gravity = 9.8', steps: [[26.10, 'gravity = 9.8', 12], [26.20, 'gravity = 9.8', 11], [26.30, 'gravity = 9.8', 10], [26.52, 'gravity = -9.8', 11], [26.72, 'gravity = -9.8', 14]] },
+  { type: [33.45, 34.10], enter: 35.00, code: 'time.scale = 1e15' },
+  { type: [41.90, 42.30], enter: 43.00, code: 'collapse()' },
+];
+const FINALE = { lines: ["I'm Opus.", 'What should we make?'], cursorAt: 45.95, slide: [46.55, 46.95], type: [47.05, 49.85] };
+const DURATION = 55.0;
+function makeWorld() {
+  const w = { sea: { wind: 0 }, wave: { height: 0 }, water: null, sky: { hour: 6 }, city: { floors: 0 }, gravity: 9.8, time: { scale: 1 }, collapsed: false, flying: false };
+  w.shards = { fly: () => { w.flying = true; } }; w.collapse = () => { w.collapsed = true; }; return w;
+}
+function execLine(world, code) { new Function('world', 'glass', 'with(world){' + code + '}')(world, glass); }
+// Values reached after each line, read back from the world the code produced.
+const VALUES = (() => {
+  const w = makeWorld(), out = [];
+  for (const L of PROGRAM) { execLine(w, L.code); out.push({ t: L.enter, wind: w.sea.wind, height: w.wave.height, glass: w.water === glass ? 1 : 0, hour: w.sky.hour, fly: w.flying, floors: w.city.floors, g: w.gravity, ts: w.time.scale, col: w.collapsed }); }
+  return out;
+})();
+const V_WIND = VALUES[0].wind, V_HEIGHT = VALUES[1].height, V_HOUR0 = makeWorld().sky.hour, V_HOUR1 = VALUES[3].hour;
+const V_FLOORS = VALUES[5].floors, V_G0 = makeWorld().gravity, V_G1 = VALUES[6].g, V_TSCALE = VALUES[7].ts;
+const T_SEA = PROGRAM[0].enter, T_WAVE = PROGRAM[1].enter, T_GLASS = PROGRAM[2].enter, T_SUN = PROGRAM[3].enter, T_FLY = PROGRAM[4].enter;
+const T_CITY = PROGRAM[5].enter, T_GRAV = PROGRAM[6].enter, T_TIME = PROGRAM[7].enter, T_COLL = PROGRAM[8].enter, T_SMASH = 12.935;
+if (!VALUES[4].fly || !VALUES[8].col || !VALUES[2].glass) throw new Error('program did not run');
+
+// ---- math.js
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x)), lerp = (a, b, k) => a + (b - a) * k;
+const sstep = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+const ease5 = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * k * (k * (k * 6 - 15) + 10); };
+const outExp = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k >= 1 ? 1 : 1 - Math.pow(2, -9 * k); };
+function rng(seed) { let s = seed >>> 0; return () => { s = (s + 0x6D2B79F5) >>> 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+// monotone-ish cubic keys: [[t,v],...]  (Catmull-Rom tangents, limited)
+function keys(K) {
+  const n = K.length, m = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (i === 0 || i === n - 1) { m[i] = 0; continue; }
+    const d0 = (K[i][1] - K[i - 1][1]) / (K[i][0] - K[i - 1][0]), d1 = (K[i + 1][1] - K[i][1]) / (K[i + 1][0] - K[i][0]);
+    if (d0 * d1 <= 0) m[i] = 0; else { const h0 = K[i][0] - K[i - 1][0], h1 = K[i + 1][0] - K[i][0], w1 = 2 * h1 + h0, w2 = h1 + 2 * h0; m[i] = (w1 + w2) / (w1 / d0 + w2 / d1); }
+  }
+  return t => {
+    if (t <= K[0][0]) return K[0][1]; if (t >= K[n - 1][0]) return K[n - 1][1];
+    let i = 0; while (t > K[i + 1][0]) i++;
+    const h = K[i + 1][0] - K[i][0], k = (t - K[i][0]) / h, k2 = k * k, k3 = k2 * k;
+    return (2 * k3 - 3 * k2 + 1) * K[i][1] + (k3 - 2 * k2 + k) * h * m[i] + (-2 * k3 + 3 * k2) * K[i + 1][1] + (k3 - k2) * h * m[i + 1];
+  };
+}
+const v3 = { add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], norm: a => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; } };
+// column-major 4x4
+function mmul(a, b) { const o = new Float64Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; }
+function viewM(p, R, U, F) { return new Float64Array([R[0], U[0], -F[0], 0, R[1], U[1], -F[1], 0, R[2], U[2], -F[2], 0, -v3.dot(R, p), -v3.dot(U, p), v3.dot(F, p), 1]); }
+// reversed-z infinite perspective, hfov in radians, jitter in ndc
+function perspM(hfov, asp, n, jx, jy) { const f = 1 / Math.tan(hfov / 2), g = f * asp; return new Float64Array([f, 0, 0, 0, 0, g, 0, 0, jx, jy, 0, -1, 0, 0, n, 0]); }
+function orthoM(hw, hh, n, f) { return new Float64Array([1 / hw, 0, 0, 0, 0, 1 / hh, 0, 0, 0, 0, -1 / (f - n), 0, 0, 0, -n / (f - n), 1]); }
+function minv(m) {
+  const a = Array.from(m), inv = new Float64Array(16);
+  const A = []; for (let r = 0; r < 4; r++) { A.push([a[r], a[4 + r], a[8 + r], a[12 + r], r === 0 ? 1 : 0, r === 1 ? 1 : 0, r === 2 ? 1 : 0, r === 3 ? 1 : 0]); }
+  for (let c = 0; c < 4; c++) { let p = c; for (let r = c + 1; r < 4; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;[A[c], A[p]] = [A[p], A[c]]; const d = A[c][c]; for (let k = 0; k < 8; k++) A[c][k] /= d; for (let r = 0; r < 4; r++) if (r !== c) { const q = A[r][c]; for (let k = 0; k < 8; k++) A[r][k] -= q * A[c][k]; } }
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) inv[c * 4 + r] = A[r][4 + c]; return inv;
+}
+
+// ---- glyphs.js
+// Own letterforms: a rounded monospace drawn as strokes, baked to an SDF atlas on the CPU.
+const GL = (() => {
+  const arc = (cx, cy, rx, ry, a0, a1) => { const o = []; const n = Math.max(6, Math.ceil(Math.abs(a1 - a0) / 9)); for (let i = 0; i <= n; i++) { const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180; o.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]); } return o; };
+  const bz = (a, b, c) => { const o = []; for (let i = 0; i <= 14; i++) { const k = i / 14, q = 1 - k; o.push([q * q * a[0] + 2 * q * k * b[0] + k * k * c[0], q * q * a[1] + 2 * q * k * b[1] + k * k * c[1]]); } return o; };
+  const G = {
+    ' ': [], o: [arc(.6, .5, .42, .5, 0, 360)], a: [arc(.56, .5, .40, .5, 0, 360), [[.97, 1], [.97, 0]]], d: [arc(.56, .5, .40, .5, 0, 360), [[.97, 1.5], [.97, 0]]],
+    g: [arc(.56, .5, .40, .5, 0, 360), [...[[.97, 1]], ...arc(.56, -.08, .41, .42, 0, -145)]], e: [[...[[.18, .52]], ...[[1.02, .52]]], arc(.6, .5, .42, .5, 2, 318)],
+    h: [[[.22, 1.5], [.22, 0]], [...arc(.6, .58, .38, .42, 180, 0), [.98, 0]]], n: [[[.22, 1], [.22, 0]], [...arc(.6, .58, .38, .42, 180, 0), [.98, 0]]], m: [[[.14, 1], [.14, 0]], [...arc(.37, .7, .23, .3, 180, 0), [.6, 0]], [...arc(.83, .7, .23, .3, 180, 0), [1.06, 0]]],
+    i: [[[.3, 1], [.62, 1], [.62, 0]], [[.24, 0], [1.0, 0]], [[.6, 1.42], [.61, 1.42]]], k: [[[.25, 1.5], [.25, 0]], [[.95, 1], [.25, .42]], [[.5, .62], [1.0, 0]]],
+    l: [[[.28, 1.5], [.6, 1.5], [.6, .28], ...arc(.84, .26, .24, .26, 180, 280)]], r: [[[.3, 1], [.3, 0]], arc(.72, .56, .42, .44, 180, 38)],
+    s: [[...arc(.6, .755, .36, .245, 25, 270)], [...arc(.6, .26, .39, .26, 90, -155)]], t: [[[.48, 1.4], [.48, .3], ...arc(.78, .3, .30, .3, 180, 295)], [[.14, 1], [.98, 1]]],
+    u: [[[.22, 1], ...arc(.6, .42, .38, .42, 180, 360), [.98, 1]], [[.98, 1], [.98, 0]]], v: [[[.15, 1], [.6, 0], [1.05, 1]]], w: [[[.06, 1], [.32, 0], [.6, .8], [.88, 0], [1.14, 1]]],
+    y: [[[.15, 1], [.6, .02]], [[1.05, 1], [.52, -.2], ...arc(.3, -.22, .24, .24, 0, -80)]], c: [arc(.64, .5, .42, .5, 48, 312)], f: [[...arc(.86, 1.22, .30, .28, 20, 180), [.56, 1.1], [.56, 0]], [[.18, 1], [1.0, 1]]], b: [arc(.64, .5, .40, .5, 0, 360), [[.23, 1.5], [.23, 0]]], p: [arc(.64, .5, .40, .5, 0, 360), [[.23, 1], [.23, -.5]]],
+    '.': [[[.6, .03], [.61, .03]]], ',': [[[.64, .05], [.5, -.25]]], "'": [[[.6, 1.5], [.58, 1.1]]], '=': [[[.14, .72], [1.06, .72]], [[.14, .30], [1.06, .30]]], '(': [arc(1.1, .6, .6, .95, 130, 230)], ')': [arc(.1, .6, .6, .95, 50, -50)], '+': [[[.14, .5], [1.06, .5]], [[.6, .04], [.6, .96]]], '-': [[[.16, .5], [1.04, .5]]],
+    '0': [arc(.6, .725, .42, .725, 0, 360)], '1': [[[.25, 1.15], [.62, 1.45], [.62, 0]], [[.24, 0], [1, 0]]], '2': [[...arc(.58, 1.03, .40, .42, 165, -25), [.16, 0], [1.02, 0]]], '3': [arc(.55, 1.08, .37, .37, 150, -90), arc(.57, .36, .42, .36, 90, -155)], '4': [[[.8, 0], [.8, 1.45], [.1, .42], [1.1, .42]]],
+    '5': [[[.98, 1.45], [.3, 1.45], [.24, .80], ...arc(.58, .46, .43, .46, 128, -150)]], '6': [arc(.6, .44, .42, .44, 0, 360), bz([.86, 1.45], [.25, 1.1], [.18, .46])], '7': [[[.16, 1.45], [1.04, 1.45], [.46, 0]]], '8': [arc(.6, 1.09, .34, .36, 0, 360), arc(.6, .37, .42, .37, 0, 360)], '9': [arc(.6, 1.01, .42, .44, 0, 360), bz([.34, 0], [.95, .35], [1.02, 1.0])],
+    I: [[[.6, 1.45], [.6, 0]], [[.22, 1.45], [.98, 1.45]], [[.22, 0], [.98, 0]]], O: [arc(.6, .725, .48, .725, 0, 360)], W: [[[.02, 1.45], [.28, 0], [.6, 1.1], [.92, 0], [1.18, 1.45]]], S: [arc(.6, 1.08, .40, .37, 25, 270), arc(.6, .36, .43, .36, 90, -155)], '?': [[...arc(.58, 1.08, .38, .37, 165, -60), [.6, .4]], [[.6, .03], [.61, .03]]],
+  };
+  const CW = 96, CH = 144, EM = 56, OX = 14, BY = 104; // cell px, 1 unit = EM px, baseline row
+  const chars = Object.keys(G), data = new Uint8Array(CW * chars.length * CH), idx = {};
+  chars.forEach((c, n) => {
+    idx[c] = n; const segs = []; for (const pl of G[c]) for (let i = 0; i + 1 < pl.length; i++) segs.push([pl[i][0], pl[i][1], pl[i + 1][0], pl[i + 1][1]]);
+    for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++) {
+      const px = (x + .5 - OX) / EM, py = (BY - y - .5) / EM; let d = 9;
+      for (const s of segs) { const vx = s[2] - s[0], vy = s[3] - s[1], wx = px - s[0], wy = py - s[1]; const h = clamp((wx * vx + wy * vy) / (vx * vx + vy * vy + 1e-9)); d = Math.min(d, Math.hypot(wx - h * vx, wy - h * vy)); }
+      data[(y * CW * chars.length) + n * CW + x] = Math.round(clamp(d / 0.5) * 255); // distance to stroke centre, 0.5em max
+    }
+  });
+  return { CW, CH, EM, OX, BY, n: chars.length, data, idx, ADV: 1.2 };
+})();
+
+// ---- profile.js
+// The sheet. One continuous cross-section curve, parameterised by arc length s, whose heading angle is
+// integrated. stage a: 0 = flat sea, 1 = barrel of height wave.height, 2 = gothic nave. Every vertex in the
+// film lives on this sheet, so sea -> barrel -> cathedral is a single uninterrupted deformation.
+const PROF = (() => {
+  const NS = 2048, NA = 129, S0 = -120, DS = 0.25, R = V_HEIGHT / 2; // <- wave.height drives the curl radius
+  const W = 18, HW = 30, GB = 1.15, GR = 35 / GB;               // nave half width, wall height, arch angle + radius
+  const LA = 1.5 * Math.PI * R;                                 // barrel arc length (270 deg)
+  const S_TIP = 152, data = new Float32Array(NS * NA * 4);
+  const rad = Math.PI / 180;
+  const bar = (s, a) => s < 0 ? 0 : 270 * rad * a * Math.min(1, s / LA);
+  const goth = s => { // smoothed corners
+    const ss = (x, w) => sstep(-w, w, x);
+    let f = 0; f += 90 * rad * ss(s - W, .8); const q1 = clamp((s - (W + HW)) / 35), q2 = clamp((s - (W + HW + 35)) / 35);
+    f += GB * q1; f += (180 * rad - 2 * GB) * ss(s - (W + HW + 35), .6); f += GB * q2; return f;
+  };
+  for (let ia = 0; ia < NA; ia++) {
+    const a = ia / (NA - 1) * 2, b = clamp(a - 1), ab = Math.min(a, 1);
+    let X = S0, Y = 0; const hb = [];
+    for (let i = 0; i < NS; i++) {
+      const s = S0 + i * DS; let phi;
+      if (s <= S_TIP) phi = lerp(bar(s, ab), goth(s), b);
+      else { // back of the wave: wrap round the tip and run down to sea level
+        const lip = lerp(bar(S_TIP, ab), goth(S_TIP), b), q = clamp((s - S_TIP) / 150), tip = sstep(0, 2.5, s - S_TIP);
+        const turn = 180 * rad * sstep(.05, .35, ab);
+        const h0 = lip - turn * tip, hmid = -38 * rad * sstep(0, .3, ab); phi = lerp(h0, hmid, sstep(0, .75, q)); phi = lerp(phi, 0, sstep(.75, 1, q));
+      }
+      const o = (ia * NS + i) * 4; data[o] = X - s; data[o + 1] = Y; data[o + 2] = phi; data[o + 3] = 0; hb.push(Y);
+      X += Math.cos(phi) * DS; Y += Math.sin(phi) * DS;
+    }
+    // bring the back down to y=0 at s = S_TIP+150 and fade the horizontal shift away
+    const iTip = Math.round((S_TIP - S0) / DS), iEnd = Math.round((S_TIP + 150 - S0) / DS), yEnd = data[(ia * NS + iEnd) * 4 + 1];
+    for (let i = iTip; i < NS; i++) { const k = clamp((i - iTip) / (iEnd - iTip)); data[(ia * NS + i) * 4 + 1] -= yEnd * Math.pow(k, .8); if (i >= iEnd) data[(ia * NS + i) * 4 + 1] = 0; if (i > iEnd) data[(ia * NS + i) * 4] *= 1 - sstep(0, 1, (i - iEnd) / (NS - 1 - iEnd)); }
+  }
+  return { NS, NA, S0, DS, R, W, HW, GB, GR, S_TIP, data, APEX: HW + GR * Math.sin(GB) };
+})();
+
+// ---- tubes.js
+// Cathedral skeleton for one bay, in sheet coordinates (z, s). Each tube: [z0,s0,z1,s1, r0,r1,h,kind]
+const TUBES = (() => {
+  const W = PROF.W, HW = PROF.HW, S1 = W + HW, SR = S1 + 35, mir = s => 2 * SR - s;
+  const L = [], S = [];
+  const both = (a, f) => { f.push(a); f.push([a[0], mir(a[1]), a[2], mir(a[3]), a[4], a[5], a[6], a[7]]); };
+  // clustered shafts at the column line z=7
+  const sh = [[-1.25, .30, .30], [-.68, .85, .36], [0, 1.15, .52], [.68, .85, .36], [1.25, .30, .30]];
+  for (const [dz, h, r] of sh) both([7 + dz, W + .2, 7 + dz, S1 + .5, r, r * .95, h, 1], L);
+  // fan ribs
+  [-7, -5.2, -3.5, -1.75, 0, 1.75, 3.5, 5.2, 7].forEach(d => { const k = Math.abs(d) / 7; both([7 + d * .10, S1 - .5, 7 + d, SR, .30 - .10 * k, .17, .62 - .30 * k, 2], L); });
+  both([7, S1, 7, SR, .55, .45, .55, 2], L); // transverse arch
+  L.push([-7, SR, 7, SR, .34, .34, .25, 2]);
+  for (const ds of [15, 25]) both([-7, S1 + ds, 7, S1 + ds, .12, .12, .22, 2], L);
+  // string courses
+  for (const y of [1.8, 29.4]) both([-7, W + y, 7, W + y, .26, .26, .15, 1], L);
+  // plinths + capitals
+  both([7 - 1.5, W + .6, 7 + 1.5, W + .6, .85, .85, .55, 1], S); both([7 - 1.35, S1 - 1.0, 7 + 1.35, S1 - 1.0, .42, .42, .75, 1], S); both([7 - 1.2, S1 + .1, 7 + 1.2, S1 + .1, .30, .30, .95, 1], S); both([7, W + .1, 7, W + 2.2, 1.25, .75, .6, 1], S);
+  // window frames
+  const hw = 5.5, spr = 19.5, R = 8.4, ar = (cx, cy, r, a0, a1, n, th, h) => { for (let i = 0; i < n; i++) { const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180, b = (a0 + (a1 - a0) * (i + 1.06) / n) * Math.PI / 180; both([cx + r * Math.cos(a), W + cy + r * Math.sin(a), cx + r * Math.cos(b), W + cy + r * Math.sin(b), th, th, h, 1], S); } };
+  for (const sg of [-1, 1]) { both([sg * hw, W + 2.2, sg * hw, W + spr, .26, .26, .18, 1], S); both([sg * (hw + .55), W + 2.2, sg * (hw + .55), W + spr, .20, .20, .42, 1], S); }
+  ar(hw - R, spr, R, 0, 70, 7, .26, .18); ar(R - hw, spr, R, 180, 110, 7, .26, .18); ar(hw - R, spr, R + .6, 0, 71, 7, .20, .42); ar(R - hw, spr, R + .6, 180, 109, 7, .20, .42);
+  for (const x of [-hw / 3, hw / 3]) both([x, W + 2.2, x, W + 16.6, .13, .13, .14, 1], S);
+  for (const x of [-2 * hw / 3, 0, 2 * hw / 3]) ar(x, 15.2, hw / 3, 0, 180, 6, .11, .13);
+  ar(0, 22.6, 2.38, 0, 360, 14, .16, .16); ar(-2.75, 18.6, 1.58, 0, 360, 11, .12, .14); ar(2.75, 18.6, 1.58, 0, 360, 11, .12, .14);
+  for (let i = 0; i < 8; i++) { const a = (i + .5) * Math.PI / 4; both([.75 * Math.cos(a), W + 22.6 + .75 * Math.sin(a), 2.3 * Math.cos(a), W + 22.6 + 2.3 * Math.sin(a), .08, .08, .12, 1], S); }
+  ar(0, 22.6, .75, 0, 360, 8, .08, .12);
+  const pack = [...L, ...S], data = new Float32Array(pack.length * 8); pack.forEach((a, i) => data.set(a, i * 8));
+  return { data, nL: L.length, nS: S.length };
+})();
+
+// ---- worlds.js
+// CPU mirrors of a few GPU functions (f32-rounded so they agree with the shaders) and the baked flock.
+const F = Math.fround, fr = x => F(x - Math.floor(x));
+function h21(x, y) { let a = fr(F(x * F(.1031))), b = fr(F(y * F(.1031))), c = fr(F(x * F(.1031))); const d = F(F(a * F(b + 33.33)) + F(b * F(c + 33.33)) + F(c * F(a + 33.33))); a = F(a + d); b = F(b + d); c = F(c + d); return fr(F(F(a + b) * c)); }
+function h22(x, y) { let a = fr(F(x * F(.1031))), b = fr(F(y * F(.1030))), c = fr(F(x * F(.0973))); const d = F(F(a * F(b + 33.33)) + F(b * F(c + 33.33)) + F(c * F(a + 33.33))); a = F(a + d); b = F(b + d); c = F(c + d); return [fr(F(F(a + b) * c)), fr(F(F(a + c) * b))]; }
+function h33(x, y, z) { let a = fr(F(x * F(.1031))), b = fr(F(y * F(.1030))), c = fr(F(z * F(.0973))); const d = F(F(a * F(b + 33.33)) + F(b * F(a + 33.33)) + F(c * F(c + 33.33))); a = F(a + d); b = F(b + d); c = F(c + d); return [fr(F(F(a + b) * c)), fr(F(F(a + a) * b)), fr(F(F(b + a) * a))]; }
+function vnoiseJS(x, y) { const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, wx = fx * fx * (3 - 2 * fx), wy = fy * fy * (3 - 2 * fy); return lerp(lerp(h21(ix, iy), h21(ix + 1, iy), wx), lerp(h21(ix, iy + 1), h21(ix + 1, iy + 1), wx), wy); }
+// ---- the shock wall, same formula as ringAt() in common.wgsl (height only)
+function ringHeightJS(x, z, t, bx, bz, R, strength) {
+  const dx = x - bx, dz = z - bz, r = Math.hypot(dx, dz), k = r - R, an = Math.atan2(dx, dz);
+  const nzl = vnoiseJS(an * 10, t * 1.1) - .5, nzh = vnoiseJS(an * 70, t * 5) - .5, nz = nzl + .22 * nzh, kk = k + nzl * 26 + nzh * 6;
+  const front = 1 / (1 + Math.exp(kk / 7)), hq = kk / (kk > 0 ? 24 : 64), h = Math.exp(-hq * hq);
+  const lump = lerp(1, .75 + .5 * vnoiseJS(an * 6, 2 + t * .7), Math.exp(-Math.max(R, 0) / 900));
+  return strength * h * (96 + nz * 22) * front * 1.35 * lump * (.12 + .88 * sstep(0, 160, R));
+}
+// conservative upper bound of the wall height (noise at its worst), so the camera can never dip into it
+function ringBoundJS(x, z, R, S) { const r = Math.hypot(x - BC[0], z - BC[1]); let m = 0; for (let d = -18; d <= 18; d += 2) { const kk = r - R + d, front = 1 / (1 + Math.exp(kk / 7)), hq = kk / (kk > 0 ? 24 : 64); m = Math.max(m, front * Math.exp(-hq * hq)); } return S * m * 107 * 1.35 * 1.25 * (.12 + .88 * sstep(0, 160, R)); }
+// ---- rose shards: geometry + slow-motion dynamics, mirrored in tubes.wgsl (shardDyn)
+const ROSE = { NX: 144, NY: 216 };
+function roseVertJS(ix, iy) { const j = h22(ix + 71, iy + 71); return [-20 + (ix + (j[0] - .5) * .72) * 40 / 144, (iy + (j[1] - .5) * .72) * 60 / 216]; }
+function roseGlassJS(px, py) { // geometric stone/glass split of roseAt()
+  const cx = px, cy = py - 30, r = Math.hypot(cx, cy), th = Math.atan2(cx, cy) / (2 * Math.PI) + .5;
+  if (r < 1.7) return true;
+  if (r < 6.6) { const f = th * 12, l = Math.abs(fr(f) - .5) * 2 * Math.PI * r / 12, w = lerp(.25, 1.35, sstep(1.7, 5.4, r)), cap = Math.hypot(l, Math.max(r - 5.2, 0)) - 1.35; return (l < w && r < 5.2 && r > 2.1) || (cap < 0 && r >= 5.2); }
+  if (r < 11.6) { const f = th * 24 + .5, l = Math.abs(fr(f) - .5) * 2 * Math.PI * r / 24, w = lerp(.55, 1.28, sstep(7, 10.2, r)), cap = Math.hypot(l, Math.max(r - 10.1, 0)) - 1.25; return (l < w && r < 10.1 && r > 7) || (cap < 0 && r >= 10.1); }
+  if (r < 14.6) { const i = Math.floor(th * 24), a = (i + .5) / 24 * 2 * Math.PI; return Math.hypot(cx - Math.sin(a - Math.PI) * 12.95, cy - Math.cos(a - Math.PI) * 12.95) < 1.18; }
+  if (py < 14.2 && py > 3 && Math.abs(px) < 14) { const li = Math.floor(px / 4 + .5), lx = px - li * 4; let w = 1.5; if (py > 11.8) w = Math.sqrt(Math.max(0, 2.4 * 2.4 - (py - 11.8) ** 2)) - .9; return Math.abs(lx) < w; }
+  return false;
+}
+// slow motion: the burst decelerates to a hover; shards that are not birds fall once the birds have gone
+function shardTime(t) { const tau = t - 13.0 + .07; return tau <= 0 ? 0 : .62 * (1 - Math.exp(-tau / .24)); }
+function shardPosJS(ix, iy, t) {
+  const flip = h21(ix, iy) > .5; let d0 = roseVertJS(ix, iy), d1 = roseVertJS(ix + 1, iy + 1); if (flip) { d0 = roseVertJS(ix + 1, iy); d1 = roseVertJS(ix, iy + 1); }
+  const mid = [(d0[0] + d1[0]) / 2, (d0[1] + d1[1]) / 2], h = h33(ix, iy, 1), h2 = h33(iy, ix, 6), rel = [mid[0], mid[1] - 30], r = Math.hypot(rel[0], rel[1]);
+  const tt = Math.max(shardTime(t) - r * .006, 0), sp = lerp(78, 16, clamp(r / 17)) * (.3 + h[0]), rn = Math.max(r, .2);
+  return { p: [mid[0] + rel[0] / rn * sp * .42 * tt + (h2[0] - .5) * 9 * tt, mid[1] + rel[1] / rn * sp * .42 * tt + (h2[1] - .5) * 9 * tt - 1.2 * tt * tt, Z_END + sp * 1.5 * tt * (.3 + h[1]) + (h2[2] - .5) * 9 * tt], mid, h, h2 };
+}
+// ---- the flock: shards that are glass become birds; boids baked at 60 Hz, stored at 30 Hz
+const NBIRD = 6144, BIRD_HZ = 30, BIRD_T0 = 14.0, BIRD_T1 = 22.0, BIRD_NF = Math.round((BIRD_T1 - BIRD_T0) * BIRD_HZ) + 1;
+function pickBirds() {
+  const cand = [];
+  for (let iy = 0; iy < ROSE.NY; iy++) for (let ix = 0; ix < ROSE.NX; ix++) { const flip = h21(ix, iy) > .5; let d0 = roseVertJS(ix, iy), d1 = roseVertJS(ix + 1, iy + 1); if (flip) { d0 = roseVertJS(ix + 1, iy); d1 = roseVertJS(ix, iy + 1); } const m = [(d0[0] + d1[0]) / 2, (d0[1] + d1[1]) / 2]; if (Math.abs(m[0]) > PROF.W - .3 || m[1] < .3) continue; if (roseGlassJS(m[0], m[1])) cand.push([h21(ix + 913, iy + 377), ix, iy]); }
+  cand.sort((a, b) => a[0] - b[0]); return cand.slice(0, NBIRD).map(c => [c[1], c[2]]);
+}
+function bakeBirds(camP) {
+  const ids = pickBirds(), N = ids.length, pos = new Float32Array(N * 3), vel = new Float32Array(N * 3), out = new Float32Array(BIRD_NF * NBIRD * 4), dead = new Float32Array(N);
+  const isBird = new Uint8Array(ROSE.NX * ROSE.NY); ids.forEach(([ix, iy]) => isBird[iy * ROSE.NX + ix] = 1);
+  const rnd = rng(9123);
+  for (let i = 0; i < N; i++) { const s = shardPosJS(ids[i][0], ids[i][1], BIRD_T0); pos.set(s.p, i * 3); const rel = [s.mid[0], s.mid[1] - 30], rl = Math.hypot(...rel) + 1; vel.set([rel[0] / rl * 9 + (rnd() - .5) * 4, rel[1] / rl * 9 + 3 + (rnd() - .5) * 4, 16 + rnd() * 10], i * 3); }
+  const cs = 7, cell = new Int32Array(N), order = new Int32Array(N), start = new Map();
+  const steps = (BIRD_NF - 1) * 2, dt = 1 / (BIRD_HZ * 2);
+  const ph = Array.from({ length: N }, () => rnd() * 6.28);
+  for (let st = 0; st <= steps; st++) {
+    const t = BIRD_T0 + st * dt;
+    if (st % 2 === 0) { const f = st / 2; for (let i = 0; i < N; i++) { const o = (f * NBIRD + i) * 4; out[o] = pos[i * 3]; out[o + 1] = pos[i * 3 + 1]; out[o + 2] = pos[i * 3 + 2]; out[o + 3] = dead[i]; } }
+    if (st === steps) break;
+    // spatial hash (sorted cells)
+    const keys = new Array(N); for (let i = 0; i < N; i++) { const cx = Math.floor(pos[i * 3] / cs), cy = Math.floor(pos[i * 3 + 1] / cs), cz = Math.floor(pos[i * 3 + 2] / cs); keys[i] = cx * 73856093 ^ cy * 19349663 ^ cz * 83492791; }
+    start.clear(); for (let i = 0; i < N; i++) { const k = keys[i]; let a = start.get(k); if (!a) { a = []; start.set(k, a); } a.push(i); }
+    const c0 = camP(t), c = camP(t + .9), dive = sstep(T_CITY - .1, T_CITY + .8, t), a1 = t * .82, a2 = t * 1.31;
+    const tgt = [c[0] + 46 * Math.sin(a1) * (1 - dive), lerp(c[1] + 6 + 14 * Math.sin(a2), -40, dive), c[2] + lerp(78 + 30 * Math.cos(a1 * .7), 260, dive)];
+    for (let i = 0; i < N; i++) {
+      if (dead[i] > 0) continue; const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2]; let vx = vel[i * 3], vy = vel[i * 3 + 1], vz = vel[i * 3 + 2];
+      let sx = 0, sy = 0, sz = 0, ax = 0, ay = 0, az = 0, cx = 0, cy = 0, cz = 0, n = 0;
+      const bx = Math.floor(px / cs), by = Math.floor(py / cs), bz = Math.floor(pz / cs);
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        const L = start.get((bx + dx) * 73856093 ^ (by + dy) * 19349663 ^ (bz + dz) * 83492791); if (!L) continue;
+        for (const j of L) { if (j === i) continue; const ex = pos[j * 3] - px, ey = pos[j * 3 + 1] - py, ez = pos[j * 3 + 2] - pz, d2 = ex * ex + ey * ey + ez * ez; if (d2 > 49) continue; if (d2 < 4.4) { const w = 1 / (d2 + .05); sx -= ex * w; sy -= ey * w; sz -= ez * w; } ax += vel[j * 3]; ay += vel[j * 3 + 1]; az += vel[j * 3 + 2]; cx += ex; cy += ey; cz += ez; n++; if (n > 24) break; }
+      }
+      let fx = sx * 2.6, fy = sy * 2.6, fz = sz * 2.6;
+      if (n) { fx += (ax / n - vx) * 1.4 + cx / n * .9; fy += (ay / n - vy) * 1.4 + cy / n * .9; fz += (az / n - vz) * 1.4 + cz / n * .9; }
+      // steer to the moving target with a swirl around it: a murmuration, not a cloud
+      const tx = tgt[0] - px, ty = tgt[1] - py, tz = tgt[2] - pz, td = Math.hypot(tx, ty, tz) + 1e-3, pull = lerp(.9, 3.2, dive) * Math.min(1, td / 25);
+      fx += tx / td * 12 * pull; fy += ty / td * 12 * pull; fz += tz / td * 12 * pull;
+      { const ex = px - c0[0], ey = py - c0[1], ez = pz - c0[2], cd = Math.hypot(ex, ey, ez); if (cd < 34) { const k = (34 - cd) / 34 * 60 / (cd + 1); fx += ex * k; fy += ey * k; fz += ez * k; } }
+      const sw = 9 * (1 - dive); fx += -tz / td * sw * Math.sin(ph[i] * .1 + t * .5); fz += tx / td * sw * Math.sin(ph[i] * .1 + t * .5); fy += Math.sin(px * .021 + t * 1.7) * 5 * (1 - dive);
+      vx += fx * dt; vy += fy * dt; vz += fz * dt; const sp = Math.hypot(vx, vy, vz), mx = lerp(31, 58, dive), mn = 13; const k = sp > mx ? mx / sp : sp < mn ? mn / sp : 1; vx *= k; vy *= k; vz *= k;
+      vel[i * 3] = vx; vel[i * 3 + 1] = vy; vel[i * 3 + 2] = vz; pos[i * 3] = px + vx * dt; pos[i * 3 + 1] = py + vy * dt; pos[i * 3 + 2] = pz + vz * dt;
+      if (pos[i * 3 + 1] < 0 && dive > .05) dead[i] = t;
+    }
+  }
+  return { ids, data: out, isBird, N };
+}
+
+// ---- engine.js
+// WebGPU plumbing: device, textures, pipelines, passes.
+const ERRS = window.ERRS = [];
+const Q = new URLSearchParams(location.search), RW = +(Q.get('w') || 1920), RH = +(Q.get('h') || 1080), NSUB0 = +(Q.get('n') || 4);
+const NXG = 1500, NZG = 1500, LCASC = [997, 211, 47, 11], BIRDV = 66, TOWERV = 60, CITYNX = 44, CITYNZ = 60, CITYN = CITYNX * CITYNZ, NSTAR = 1100000, NDUST = 160000;
+const E = {};
+// JONSWAP spectrum. U10 is sea.wind, straight from the typed line.
+function makeSpectrum(wind, sunAz) {
+  const N = 256, g = 9.81, F = 260000, R = rng(5505), out = new Float32Array(4 * N * N * 4), modes = [];
+  const wp = 22 * Math.pow(g * g / (wind * F), 1 / 3), al = 0.076 * Math.pow(wind * wind / (F * g), 0.22), wdx = -Math.sin(sunAz + .25), wdz = -Math.cos(sunAz + .25);
+  const gauss = () => { const a = Math.max(R(), 1e-9), b = R(); return Math.sqrt(-2 * Math.log(a)) * Math.cos(2 * Math.PI * b); };
+  const cut = [0, 6 * 2 * Math.PI / LCASC[1], 6 * 2 * Math.PI / LCASC[2], 6 * 2 * Math.PI / LCASC[3], 1e9];
+  for (let c = 0; c < 4; c++) {
+    const L = LCASC[c], dk = 2 * Math.PI / L, a = new Float32Array(N * N * 2);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const kx = (x < 128 ? x : x - 256) * dk, kz = (y < 128 ? y : y - 256) * dk, k = Math.hypot(kx, kz), r1 = gauss(), r2 = gauss();
+      if (k < 1e-6 || k < cut[c] || k >= cut[c + 1]) continue;
+      const w = Math.sqrt(g * k), sig = w <= wp ? .07 : .09, r = Math.exp(-Math.pow(w - wp, 2) / (2 * sig * sig * wp * wp));
+      let S = al * g * g / Math.pow(w, 5) * Math.exp(-1.25 * Math.pow(wp / w, 4)) * Math.pow(3.3, r);
+      const cs = (kx * wdx + kz * wdz) / k, D = (cs > 0 ? 2 / Math.PI * cs * cs : 0) * .9 + .1 / (2 * Math.PI) * (cs > 0 ? 1 : .4);
+      S = S * D * (0.5 * Math.sqrt(g / k)) / k; S *= Math.exp(-Math.pow(k * .006, 2)); if (c > 0) S *= 1.25; else S *= 2.1;
+      const amp = Math.sqrt(S * dk * dk / 2) / Math.SQRT2; a[(y * N + x) * 2] = r1 * amp; a[(y * N + x) * 2 + 1] = r2 * amp;
+    }
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const i = y * N + x, j = ((N - y) % N) * N + (N - x) % N, o = (c * N * N + i) * 4; out[o] = a[i * 2]; out[o + 1] = a[i * 2 + 1]; out[o + 2] = a[j * 2]; out[o + 3] = -a[j * 2 + 1];
+      if (c < 2) { const m = Math.hypot(a[i * 2], a[i * 2 + 1]); if (m > .015) { const kx = (x < 128 ? x : x - 256) * dk, kz = (y < 128 ? y : y - 256) * dk; modes.push([m, a[i * 2], a[i * 2 + 1], kx, kz, Math.sqrt(g * Math.hypot(kx, kz))]); } }
+    }
+  }
+  modes.sort((p, q) => q[0] - p[0]); return { data: out, modes: modes.slice(0, 1600) };
+}
+function seaHeight(sp, x, z, t) { let h = 0; for (const m of sp.modes) { const p = m[3] * x + m[4] * z + m[5] * t; h += 2 * (m[1] * Math.cos(p) - m[2] * Math.sin(p)); } return h; }
+async function initEngine() {
+  const ad = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' }); if (!ad) throw new Error('no WebGPU adapter');
+  const dev = E.dev = await ad.requestDevice({ requiredLimits: { maxBufferSize: 1 << 28, maxStorageBufferBindingSize: 1 << 27 } });
+  dev.addEventListener('uncapturederror', e => { ERRS.push(e.error.message); if (ERRS.length < 5) console.log('GPUERR ' + e.error.message.slice(0, 1200)); });
+  const TU = GPUTextureUsage, BU = GPUBufferUsage, SS = GPUShaderStage;
+  const tex = (w, h, f, usage, o = {}) => dev.createTexture({ size: [w, h, o.d || 1], format: f, usage, mipLevelCount: o.m || 1, dimension: o.dim || '2d' });
+  const buf = (n, usage, data) => { const b = dev.createBuffer({ size: n, usage: usage | BU.COPY_DST }); if (data) dev.queue.writeBuffer(b, 0, data); return b; };
+  const mod = async (n, code) => { const m = dev.createShaderModule({ label: n, code }); const inf = await m.getCompilationInfo(); for (const x of inf.messages) if (x.type === 'error') { ERRS.push(n + ':' + x.lineNum + ' ' + x.message); console.log('WGSL ' + n + ':' + x.lineNum + ' ' + x.message + ' >> ' + (code.split('\n')[x.lineNum - 1] || '').slice(0, 220)); } return m; };
+  Object.assign(E, { tex, buf, W: RW, H: RH });
+  const HDR = 'rgba16float', ST = TU.STORAGE_BINDING | TU.TEXTURE_BINDING, RT = TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING;
+  E.sRep = dev.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
+  E.sClamp = dev.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' }); E.sCmp = dev.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
+  E.disp = tex(256, 256, HDR, ST, { d: 4, m: 9 }); E.deriv = tex(256, 256, HDR, ST, { d: 4, m: 9 }); E.domeT = tex(4096, 1024, HDR, ST, { m: 9 });
+  E.vol = tex(128, 128, 'rgba8unorm', ST, { d: 128, dim: '3d' }); E.foam = tex(1024, 1024, 'rgba8unorm', ST | TU.COPY_DST | TU.COPY_SRC);
+  E.lut = tex(PROF.NS, PROF.NA, 'rgba32float', TU.TEXTURE_BINDING | TU.COPY_DST); dev.queue.writeTexture({ texture: E.lut }, PROF.data, { bytesPerRow: PROF.NS * 16 }, [PROF.NS, PROF.NA]);
+  E.glyph = tex(GL.CW * GL.n, GL.CH, 'r8unorm', TU.TEXTURE_BINDING | TU.COPY_DST); dev.queue.writeTexture({ texture: E.glyph }, GL.data, { bytesPerRow: GL.CW * GL.n }, [GL.CW * GL.n, GL.CH]);
+  const SMW = E.SMW = 4096, SMH = E.SMH = 2560;
+  E.shD = tex(SMW, SMH, 'depth32float', RT); E.shC = tex(SMW, SMH, HDR, RT); E.hdr = tex(RW, RH, HDR, RT); E.dep = tex(RW, RH, 'depth32float', RT);
+  const rw = E.rw = Math.max(16, RW >> 1), rh = E.rh = Math.max(16, RH >> 1); E.refl = tex(rw, rh, HDR, RT); E.reflD = tex(rw, rh, 'depth32float', RT);
+  E.acc = tex(RW, RH, HDR, RT); E.out = tex(RW, RH, 'rgba8unorm', RT | TU.COPY_SRC);
+  E.bl = []; { let w = RW, h = RH; for (let i = 0; i < 7; i++) { w = Math.max(2, w >> 1); h = Math.max(2, h >> 1); E.bl.push({ t: tex(w, h, HDR, RT), w, h }); } }
+  E.dumC = tex(1, 1, HDR, RT); E.dumD = tex(1, 1, 'depth32float', RT);
+  E.sp = makeSpectrum(V_WIND, 42 * Math.PI / 180);
+  E.h0 = buf(E.sp.data.byteLength, BU.STORAGE, E.sp.data); E.fft = buf(4 * 65536 * 32, BU.STORAGE); E.fu = buf(16, BU.UNIFORM);
+  E.grid = buf((NXG + NZG) * 4, BU.STORAGE); { const B = E.birds, nf = B.data.length, cells = ROSE.NX * ROSE.NY, a = new Float32Array(nf + Math.ceil(cells / 4) * 4 + NBIRD * 4); a.set(B.data, 0); for (let c = 0; c < cells; c++) a[nf + c] = B.isBird[c]; const o2 = nf + Math.ceil(cells / 4) * 4; B.ids.forEach(([ix, iy], i) => { a[o2 + i * 4] = ix; a[o2 + i * 4 + 1] = iy; a[o2 + i * 4 + 2] = 1; }); E.birdB = buf(a.byteLength, BU.STORAGE, a); E.birdOff = [nf / 4, o2 / 4]; } E.tubeB = buf(TUBES.data.byteLength, BU.STORAGE, TUBES.data);
+  const idx = new Uint32Array((NXG - 1) * (NZG - 1) * 6); { let k = 0; for (let j = 0; j < NZG - 1; j++) for (let i = 0; i < NXG - 1; i++) { const a = j * NXG + i, b = a + 1, c = a + NXG, d = c + 1; idx[k++] = a; idx[k++] = b; idx[k++] = d; idx[k++] = a; idx[k++] = d; idx[k++] = c; } }
+  E.idxN = idx.length; E.idx = buf(idx.byteLength, BU.INDEX, idx);
+  E.ub = [0, 1, 2].map(() => buf(1024, BU.UNIFORM)); E.gl = buf(48 * 256, BU.STORAGE); E.su = []; for (let i = 0; i < 8; i++) E.su.push(buf(32, BU.UNIFORM));
+  // ---- compute
+  const cm = await mod('compute', WGSL.compute), mm = await mod('mips', WGSL.mips), nm = await mod('noise', WGSL.noise), sm = await mod('sky', WGSL.sky);
+  const cl = dev.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.COMPUTE, buffer: {} }, { binding: 1, visibility: SS.COMPUTE, buffer: { type: 'read-only-storage' } }, { binding: 2, visibility: SS.COMPUTE, buffer: { type: 'storage' } }, { binding: 3, visibility: SS.COMPUTE, storageTexture: { format: HDR, viewDimension: '2d-array' } }, { binding: 4, visibility: SS.COMPUTE, storageTexture: { format: HDR, viewDimension: '2d-array' } }] });
+  const v0 = t => t.createView({ dimension: '2d-array', baseMipLevel: 0, mipLevelCount: 1 });
+  E.fftBG = dev.createBindGroup({ layout: cl, entries: [{ binding: 0, resource: { buffer: E.fu } }, { binding: 1, resource: { buffer: E.h0 } }, { binding: 2, resource: { buffer: E.fft } }, { binding: 3, resource: v0(E.disp) }, { binding: 4, resource: v0(E.deriv) }] });
+  const cpl = dev.createPipelineLayout({ bindGroupLayouts: [cl] }); E.cp = {}; for (const e of ['spectrum', 'fftRow', 'fftCol', 'assemble']) E.cp[e] = dev.createComputePipeline({ layout: cpl, compute: { module: cm, entryPoint: e } });
+  const mp = E.mipP = dev.createComputePipeline({ layout: 'auto', compute: { module: mm, entryPoint: 'mip' } });
+  const mipSet = (t, n, layers, w, h) => { const o = []; for (let i = 0; i + 1 < n; i++) o.push({ bg: dev.createBindGroup({ layout: mp.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView({ dimension: '2d-array', baseMipLevel: i, mipLevelCount: 1 }) }, { binding: 1, resource: t.createView({ dimension: '2d-array', baseMipLevel: i + 1, mipLevelCount: 1 }) }] }), x: Math.ceil(Math.max(1, w >> (i + 1)) / 8), y: Math.ceil(Math.max(1, h >> (i + 1)) / 8), z: layers }); return o; };
+  E.mDisp = mipSet(E.disp, 9, 4, 256, 256); E.mDer = mipSet(E.deriv, 9, 4, 256, 256); E.mDome = mipSet(E.domeT, 9, 1, 4096, 1024);
+  { const pv = dev.createComputePipeline({ layout: 'auto', compute: { module: nm, entryPoint: 'vol' } }), pf = dev.createComputePipeline({ layout: 'auto', compute: { module: nm, entryPoint: 'foam' } });
+    const en = dev.createCommandEncoder(), c = en.beginComputePass(); c.setPipeline(pv); c.setBindGroup(0, dev.createBindGroup({ layout: pv.getBindGroupLayout(0), entries: [{ binding: 0, resource: E.vol.createView() }] })); c.dispatchWorkgroups(32, 32, 32);
+    c.setPipeline(pf); c.setBindGroup(0, dev.createBindGroup({ layout: pf.getBindGroupLayout(0), entries: [{ binding: 1, resource: E.foam.createView() }] })); c.dispatchWorkgroups(128, 128); c.end(); dev.queue.submit([en.finish()]); }
+  { const rb = dev.createBuffer({ size: 1024 * 1024 * 4, usage: BU.COPY_DST | BU.MAP_READ }), en = dev.createCommandEncoder(); en.copyTextureToBuffer({ texture: E.foam }, { buffer: rb, bytesPerRow: 4096 }, [1024, 1024]); dev.queue.submit([en.finish()]); await rb.mapAsync(1); let src = new Uint8Array(rb.getMappedRange().slice(0)); rb.unmap();
+    const ft = tex(1024, 1024, 'rgba8unorm', TU.TEXTURE_BINDING | TU.COPY_DST, { m: 11 }); let w = 1024; for (let m = 0; m < 11; m++) { dev.queue.writeTexture({ texture: ft, mipLevel: m }, src, { bytesPerRow: w * 4 }, [w, w]); const n = w >> 1; if (n < 1) break; const d = new Uint8Array(n * n * 4); for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) for (let q = 0; q < 4; q++) d[(y * n + x) * 4 + q] = (src[(y * 2 * w + x * 2) * 4 + q] + src[(y * 2 * w + x * 2 + 1) * 4 + q] + src[((y * 2 + 1) * w + x * 2) * 4 + q] + src[((y * 2 + 1) * w + x * 2 + 1) * 4 + q]) >> 2; src = d; w = n; } E.foamT = ft; }
+  E.skyP = dev.createComputePipeline({ layout: 'auto', compute: { module: sm, entryPoint: 'main' } });
+  E.skyBG = E.su.map(b => dev.createBindGroup({ layout: E.skyP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: b } }, { binding: 1, resource: E.vol.createView() }, { binding: 2, resource: E.sRep }, { binding: 3, resource: E.domeT.createView({ baseMipLevel: 0, mipLevelCount: 1 }) }] }));
+  // ---- scene bind groups
+  const VF = SS.VERTEX | SS.FRAGMENT, T = (b, o = {}) => ({ binding: b, visibility: VF, texture: o });
+  const sl = E.sl = dev.createBindGroupLayout({ entries: [{ binding: 0, visibility: VF, buffer: {} }, { binding: 1, visibility: VF, sampler: {} }, { binding: 2, visibility: VF, sampler: {} }, T(3, { viewDimension: '2d-array' }), T(4, { viewDimension: '2d-array' }), T(5, { sampleType: 'unfilterable-float' }), T(6), T(7), T(8, { sampleType: 'depth' }), T(9), T(10), { binding: 11, visibility: SS.VERTEX, buffer: { type: 'read-only-storage' } }, { binding: 12, visibility: VF, sampler: { type: 'comparison' } }, { binding: 13, visibility: SS.VERTEX, buffer: { type: 'read-only-storage' } }, T(14, { viewDimension: '3d' }), T(15, { sampleType: 'depth' }), { binding: 16, visibility: VF, buffer: { type: 'read-only-storage' } }] });
+  const mk = (ub, shD, shC, refl, dep) => dev.createBindGroup({ layout: sl, entries: [{ buffer: ub }, E.sRep, E.sClamp, E.disp.createView({ dimension: '2d-array' }), E.deriv.createView({ dimension: '2d-array' }), E.lut.createView(), E.domeT.createView(), E.foamT.createView(), shD.createView(), shC.createView(), refl.createView(), { buffer: E.grid }, E.sCmp, { buffer: E.tubeB }, E.vol.createView(), dep.createView(), { buffer: E.birdB }].map((resource, binding) => ({ binding, resource })) });
+  E.bgMain = mk(E.ub[0], E.shD, E.shC, E.refl, E.dumD); E.bgRefl = mk(E.ub[1], E.shD, E.shC, E.dumC, E.dumD); E.bgSh = mk(E.ub[2], E.dumD, E.dumC, E.dumC, E.dumD); E.bgVol = mk(E.ub[0], E.shD, E.shC, E.dumC, E.dep);
+  const consts = '\nconst BIRD_NF:u32=' + BIRD_NF + 'u; const NBIRDC:u32=' + NBIRD + 'u; const BIRD_OFF1:u32=' + E.birdOff[0] + 'u; const BIRD_OFF2:u32=' + E.birdOff[1] + 'u; const NLANT:u32=' + (CITYN * 160) + 'u; const T_CITY_C=' + T_CITY.toFixed(3) + '; const CITYNX_C:u32=' + CITYNX + 'u; const CITYNZ_C:i32=' + CITYNZ + '; const T_GRAV_C=' + T_GRAV.toFixed(3) + '; const T_FLY_C=' + T_FLY.toFixed(3) + '; const T_SEA_C=' + T_SEA.toFixed(3) + '; const T_TIME_C=' + T_TIME.toFixed(3) + ';\n';
+  WGSL.common = WGSL.common + WGSL.common2 + consts;
+  const pl = dev.createPipelineLayout({ bindGroupLayouts: [sl] }), surfM = await mod('surface', WGSL.common + WGSL.surface), tubeM = await mod('tubes', WGSL.common + WGSL.tubes), scrM = await mod('screen', WGSL.common + WGSL.screen.replace('/*SPOUTS*/', spoutWGSL()));
+  const tl = dev.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.VERTEX, buffer: { type: 'read-only-storage' } }, { binding: 1, visibility: SS.FRAGMENT, texture: {} }] }); E.bgText = dev.createBindGroup({ layout: tl, entries: [{ binding: 0, resource: { buffer: E.gl } }, { binding: 1, resource: E.glyph.createView() }] });
+  const rp = (m, vs, fs, o = {}) => dev.createRenderPipelineAsync({ layout: o.layout || pl, vertex: { module: m, entryPoint: vs, constants: o.k || {} }, fragment: fs ? { module: m, entryPoint: fs, targets: [{ format: o.fmt || HDR, blend: o.blend }] } : undefined, primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: o.nod ? undefined : { format: 'depth32float', depthWriteEnabled: o.dw ?? true, depthCompare: o.dc || 'greater', depthBias: o.bias || 0, depthBiasSlopeScale: o.bias ? 2 : 0 } });
+  const alpha = { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } }, volB = { color: { srcFactor: 'one', dstFactor: 'src-alpha' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } }, mul = { color: { srcFactor: 'zero', dstFactor: 'src' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } }, srcA = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } };
+  const addB = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } }; const wM = await mod('worlds', WGSL.common + WGSL.worlds);
+  const nL = TUBES.nL, nS = TUBES.nS, kL = { ALONG: 24, RING: 10, FIRST: 0, PER: nL }, kS = { ALONG: 3, RING: 8, FIRST: nL, PER: nS };
+  const P = E.P = {}; const jobs = {
+    surf: rp(surfM, 'vsMain', 'fsMain', { k: { NX: NXG, NZ: NZG } }), surfShC: rp(surfM, 'vsShadow', 'fsShadow', { k: { NX: NXG, NZ: NZG }, blend: mul, nod: true }),
+    tubeL: rp(tubeM, 'vsTube', 'fsTube', { k: kL }), tubeS: rp(tubeM, 'vsTube', 'fsTube', { k: kS }), tubeLSh: rp(tubeM, 'vsTubeSh', null, { k: kL, dc: 'less', bias: 2 }), tubeSSh: rp(tubeM, 'vsTubeSh', null, { k: kS, dc: 'less', bias: 2 }),
+    spike: rp(tubeM, 'vsSpike', 'fsTube', {}), roseSh: rp(tubeM, 'vsRoseSh', 'fsRoseSh', { blend: mul, nod: true }), rose: rp(tubeM, 'vsRose', 'fsRose', {}), spray: rp(tubeM, 'vsSpray', 'fsSpray', { blend: alpha, dw: false }), burst: rp(tubeM, 'vsBurst', 'fsSpray', { blend: alpha, dw: false }), drop: rp(tubeM, 'vsDrop', 'fsDrop', { blend: srcA, dw: false }),
+    sky: rp(scrM, 'vsFull', 'fsSky', { dw: false, dc: 'greater-equal' }), vol: rp(scrM, 'vsFull', 'fsVol', { nod: true, blend: volB }), spout: rp(scrM, 'vsFull', 'fsSpout', { nod: true, blend: volB }),
+    text: rp(scrM, 'vsText', 'fsText', { nod: true, blend: alpha, layout: dev.createPipelineLayout({ bindGroupLayouts: [sl, tl] }) }), textR: rp(scrM, 'vsText', 'fsText', { nod: true, blend: alpha, layout: dev.createPipelineLayout({ bindGroupLayouts: [sl, tl] }) }),
+    crown: rp(wM, 'vsCrown', 'fsCrown', {}), bird: rp(wM, 'vsBird', 'fsBird', {}), tower: rp(wM, 'vsTower', 'fsTower', {}), cascade: rp(wM, 'vsCascade', 'fsSpray2', { blend: alpha, dw: false }), lantern: rp(wM, 'vsLantern', 'fsGlow', { blend: addB, dw: false }), rainUp: rp(wM, 'vsRainUp', 'fsGlow', { blend: addB, dw: false }), star: rp(wM, 'vsStar', 'fsGlow', { blend: addB, dw: false }), dust: rp(wM, 'vsDust', 'fsDust', { blend: alpha, dw: false, dc: 'always' }),
+  };
+  for (const k in jobs) { try { P[k] = await jobs[k]; } catch (e) { ERRS.push(k + ' ' + e.message); console.log('PIPE ' + k + ' ' + e.message.slice(0, 900)); } }
+  // ---- post
+  const pm = await mod('post', WGSL.post); const ptl = dev.createBindGroupLayout({ entries: [{ binding: 0, visibility: VF, buffer: {} }, { binding: 1, visibility: VF, sampler: {} }, { binding: 2, visibility: VF, texture: {} }, { binding: 3, visibility: VF, texture: {} }] }), ppl = dev.createPipelineLayout({ bindGroupLayouts: [ptl] });
+  const pp = (fs, fmt, blend) => dev.createRenderPipeline({ layout: ppl, vertex: { module: pm, entryPoint: 'vsFull' }, fragment: { module: pm, entryPoint: fs, targets: [{ format: fmt, blend }] }, primitive: { topology: 'triangle-list' } }), add = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
+  P.acc = pp('fsAccum', HDR, add); P.down = pp('fsDown', HDR); P.up = pp('fsUp', HDR, add); P.fin = pp('fsFinal', 'rgba8unorm');
+  const pbuf = d => buf(48, BU.UNIFORM, new Float32Array(d)), pbg = (b, a, c) => dev.createBindGroup({ layout: ptl, entries: [{ binding: 0, resource: { buffer: b } }, { binding: 1, resource: E.sClamp }, { binding: 2, resource: a.createView() }, { binding: 3, resource: c.createView() }] });
+  E.accU = pbuf([1, 0, 0, 0, 0, 0, 0, 0]); E.accBG = pbg(E.accU, E.hdr, E.dumC); E.downs = []; E.ups = [];
+  for (let i = 0; i < 7; i++) { const s = i ? E.bl[i - 1] : { t: E.acc, w: RW, h: RH }; E.downs.push(pbg(pbuf([0, 0, 0, 0, 1 / s.w, 1 / s.h, i ? 0 : 1, 0]), s.t, E.dumC)); }
+  for (let i = 6; i > 0; i--) E.ups.push({ bg: pbg(pbuf([0, 0.85, 0, 0, 1 / E.bl[i].w, 1 / E.bl[i].h, 0, 0]), E.bl[i].t, E.dumC), dst: E.bl[i - 1].t });
+  E.finU = buf(48, BU.UNIFORM, new Float32Array(12)); E.finBG = pbg(E.finU, E.acc, E.bl[0].t);
+  const cv = document.getElementById('c'); cv.width = RW; cv.height = RH; E.ctx = cv.getContext('webgpu'); E.ctx.configure({ device: dev, format: 'rgba8unorm', usage: TU.RENDER_ATTACHMENT | TU.COPY_DST });
+  E.rb = dev.createBuffer({ size: Math.ceil(RW * 4 / 256) * 256 * RH, usage: BU.COPY_DST | BU.MAP_READ });
+  await dev.queue.onSubmittedWorkDone();
+}
+
+// ---- main.js
+// Timeline: everything is a pure function of t.
+const RAD = Math.PI / 180;
+const kSpeed = keys([[0, 3], [1, 6], [1.25, 38], [1.6, 50], [1.9, 36], [2.02, -42], [2.17, -66], [2.36, -30], [2.5, 40], [2.75, 102], [3.2, 116], [4.0, 112], [5.0, 110], [7.0, 104], [8.2, 96], [9.0, 88], [9.7, 60], [10.4, 62], [11, 54], [12.2, 58], [12.96, 125], [13.14, 22], [13.6, 14], [14.0, 14], [14.6, 30], [15.5, 36], [17, 38], [18.6, 42], [19.0, 48], [20, 58], [22, 62], [24, 58], [25.5, 46], [26.5, 24], [27, 14], [28, 7], [35, 5]]);
+const kHead = keys([[0, 36], [1, 36], [2.55, 34], [3.1, 16], [3.7, 8], [4.4, 3], [5.0, 4], [5.8, 3], [6.87, 0], [7.93, -3], [9.0, 1], [9.6, -7], [10.3, 8], [10.9, 7], [11.5, -9], [12.1, -5], [12.6, 2], [13, 0], [14, 0], [15, 6], [16, -8], [17, 7], [18, -3], [19, 0], [21, 0], [22, 2.5], [23, -2.5], [24, 2], [25, 0], [35, 0]]);
+const kY = keys([[0, 4.5], [1, 5], [1.6, 7], [2.0, 9], [2.5, 10], [2.72, 34], [3.1, 11], [3.6, 9], [4.2, 10], [5.0, 12], [6.07, 12], [7.13, 17], [8.07, 19], [9.0, 15], [9.6, 9], [10.2, 4.6], [10.7, 6.5], [11.4, 24], [12, 35], [12.5, 32], [13, 30], [13.35, 27], [14, 26], [15, 32], [16, 40], [17, 30], [18, 34], [19, 36], [19.6, 48], [20.5, 92], [21.5, 128], [22.5, 104], [23.5, 62], [24.5, 50], [25.5, 72], [26.5, 104], [27, 116]]);
+const kPitch = keys([[0, 2.5], [1, 2.5], [1.3, 5], [1.6, 4], [1.85, -4], [2.05, -12], [2.3, -14], [2.55, -12], [2.8, -9], [3.2, -3], [4, 3], [5, 4], [6.2, 11], [7.67, 5], [9.0, 4], [9.6, 5], [10.2, 10], [10.7, 17], [11.3, 10], [11.9, -5], [12.4, -2], [13, 0], [13.5, 2], [14.2, 5], [15, 3], [16, -2], [17, 4], [18, 0], [18.8, -6], [19.3, -14], [20, -16], [21, -12], [22, -6], [23, 0], [24, 6], [25.5, 14], [26.5, 24], [27, 30], [28, 45], [30, 58], [35, 62]]);
+const kRollX = keys([[0, 0], [1, 0], [1.9, -4], [2.15, 12], [2.4, -6], [2.7, 8], [3.2, 0], [9, 0], [9.5, -10], [10.1, 6], [10.8, 16], [11.5, -15], [12.1, -20], [12.5, 9], [12.95, 0], [13.3, 6], [14, -4], [15, 10], [16, -12], [17, 8], [18, -6], [19, 0], [20, 0], [21, -14], [22, 12], [23, -10], [24, 6], [25, 0], [35, 0]]);
+const kFov = keys([[0, 68], [1, 68], [1.35, 98], [2.0, 92], [2.4, 104], [2.8, 92], [4, 84], [5, 84], [6.87, 94], [9, 92], [10, 86], [11, 82], [12.4, 84], [13, 106], [14, 82], [15, 78], [17, 80], [19, 86], [20, 96], [23, 90], [26, 84], [27, 86], [30, 92], [35, 94]]);
+const kExpo = keys([[0, .34], [1.6, .34], [3, .36], [5, .38], [7.93, .46], [9.0, .46], [9.6, .72], [10.1, .95], [11, .98], [11.4, .62], [11.75, .42], [12.3, .80], [12.9, .95], [13.06, .62], [13.4, .50], [14, .55], [15.5, .62], [17, .8], [18.5, 1.25], [19.5, 1.8], [21, 1.9], [25, 2.0], [27, 2.1], [30, 2.6], [35, 3.0]]);
+const kWave = keys([[5, 0], [5.6, .10], [6.33, .36], [7, .68], [7.67, .92], [8.2, 1]]);
+const PATH = (() => { // integrated once at 1/480 s
+  const T1 = 36, dt = 1 / 480, n = Math.ceil(T1 / dt) + 4, X = new Float64Array(n), Z = new Float64Array(n); let x = 0, z = 0;
+  for (let i = 0; i < n; i++) { X[i] = x; Z[i] = z; const t = i * dt, h = kHead(t) * RAD, s = kSpeed(t); x += Math.sin(h) * s * dt; z += Math.cos(h) * s * dt; }
+  const at = (A, t) => { const f = clamp(t, 0, T1) / dt, i = Math.min(n - 2, Math.floor(f)); return A[i] + (A[i + 1] - A[i]) * (f - i); };
+  const x0 = at(X, 8.6); const xr = at(X, 12.95) - x0 - 1.5; return { x: t => at(X, t) - x0 - 1.5 - xr * sstep(9.2, 12.9, t), z: t => at(Z, t) };
+})();
+const BC = (() => { const s = sunAt(1), n = Math.hypot(s.d[0], s.d[2]); return [PATH.x(1) + s.d[0] / n * 420, PATH.z(1) + s.d[2] / n * 420]; })();
+function ringR(t) { const tau = t - T_SEA; if (tau < 0) return -5000; const R = 260 * (1 - Math.exp(-tau / .35)) + 110 * tau + 1400 * Math.max(0, tau - 1.6) ** 2; return R > 24000 ? 1e5 : R; }
+function ringS(t) { const tau = t - T_SEA; return tau < 0 ? 0 : sstep(0, .08, tau) * (1 - .45 * sstep(.4, 1.6, tau)) * .95; }
+// waterspouts stand where the flight path will shave past them: [path time, metres right of path, radius, seed, birth]
+const SPOUTS = [[3.45, 30, 7, .3, 2.3], [3.95, -28, 8, 2.1, 2.45], [4.55, 34, 7.5, 4.4, 2.6], [5.6, -150, 13, 1.2, 2.2], [6.3, 420, 19, 3.3, 2.3], [5.2, -420, 17, 5.1, 2.3], [8.0, 60, 22, 2.7, 2.2]];
+function spoutWGSL() { const P = SPOUTS.map(([t, r, R, s]) => { const h = kHead(t) * RAD; return 'vec4f(' + [PATH.x(t) + Math.cos(h) * r, PATH.z(t) - Math.sin(h) * r, R, s].map(v => v.toFixed(3)).join(',') + ')'; }); return 'const SP=array<vec4f,7>(' + P.join(',') + '); const SPT=array<f32,7>(' + SPOUTS.map(s => s[4].toFixed(3)).join(',') + '); fn s0(k:i32)->f32 { return SPT[k]; }'; }
+const Z_FREEZE = PATH.z(T_GLASS), Z_END = PATH.z(13.0);
+const CITY = { xb: 0, z0: 0 }; // filled after PATH exists
+let SEA_H = null; // smoothed swell height under the camera, so the stunt flying hugs real crests
+function bakeSea() { const n = Math.ceil(9 * 30) + 2, a = []; for (let i = 0; i < n; i++) { const t = i / 30; let m = -9; for (const la of [0, .12, .25]) m = Math.max(m, seaHeight(E.sp, PATH.x(t + la), PATH.z(t + la), oceanTime(t))); a.push(m); } const b = a.map((_, i) => { let s = 0, w = 0; for (let k = -10; k <= 10; k++) { const j = clamp(i + k, 0, n - 1), g = Math.exp(-k * k / 30); s += a[j] * g; w += g; } return s / w; }); SEA_H = t => { const f = clamp(t, 0, 9) * 30, i = Math.min(n - 2, Math.floor(f)); return lerp(b[i], b[i + 1], f - i); }; }
+function oceanTime(t) { const tf = T_GLASS + .10; return 40 + (t < tf ? t : tf + (1 - Math.exp(-(t - tf) * 7)) / 7) * 1.0 + Math.max(0, t - (T_SMASH - .04)) * .7; }
+function shake(t) { let a = 0; for (const [h, s, k] of [[T_SEA + .02, 1.1, 3.2], [2.02, 1.9, 3.5], [2.5, 1.0, 4], [T_WAVE, .5, 4], [T_GLASS, .55, 4], [T_SUN, .35, 5], [T_SMASH, 1.7, 4.5], [T_FLY, .4, 4], [T_CITY + .5, 1.0, 2.5], [T_GRAV, .9, 3], [T_TIME, .5, 3]]) if (t > h) a += s * Math.exp(-(t - h) * k); a += .10 * sstep(1.2, 2, t) * (1 - sstep(8.8, 9.2, t)) + .06 * sstep(19.5, 20, t) * (1 - sstep(26, 27, t)); const n = (f, p) => Math.sin(t * f + p) * .6 + Math.sin(t * f * 1.71 + p * 2.3) * .4; const fade = 1 - sstep(35, 36, t); return [a * n(41, .3) * .010 * fade, a * n(47, 2.1) * .010 * fade, a * n(37, 4.2) * .012 * fade]; }
+function sunAt(t) { // sky.hour drives both azimuth and elevation; after the day pass the sun keeps setting into night
+  const k0 = clamp((t - T_SUN) / 1.36), k = k0 * k0 * (3 - 2 * k0), h = lerp(V_HOUR0, V_HOUR1, k), day = (h - 6) / 12, az = lerp(42, 1.2, sstep(0, 1, day)) * RAD;
+  let el = lerp(7.2, 3.1, day) + 40 * Math.sin(Math.PI * day); if (t > T_SUN + 1.36) { const x = t - T_SUN - 1.36; el = 3.1 - 2.6 * sstep(1.8, 5.6, x) - Math.max(0, x - 4.2) * 2.6; el = Math.max(-16, el); }
+  el *= RAD; return { d: [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)], el, az, h };
+}
+function sunRad(el) { // E0 * transmittance, same medium as sky.wgsl
+  if (el < -.02) return [0, 0, 0];
+  const RG = 6360000, RT = 6420000, d = [0, Math.sin(el), Math.cos(el)], o = RG + 30, b = o * d[1], L = -b + Math.sqrt(b * b - o * o + RT * RT); let od = [0, 0, 0]; const n = 60;
+  for (let i = 0; i < n; i++) { const a = i / n, c = (i + 1) / n, t0 = L * a * a, t1 = L * c * c, m = (t0 + t1) / 2, h = Math.max(0, Math.hypot(o + d[1] * m, d[2] * m) - RG), r = Math.exp(-h / 8000), mi = Math.exp(-h / 1200), oz = Math.max(0, 1 - Math.abs(h - 25000) / 15000), B = [5.802e-6, 13.558e-6, 33.1e-6], O = [.65e-6, 1.881e-6, .085e-6]; for (let q = 0; q < 3; q++) od[q] += (B[q] * r + 4.4e-6 * TURB * mi + O[q] * oz) * (t1 - t0); }
+  const g = sstep(-.02, .01, el); return [20 * Math.exp(-od[0]) * g, 19.4 * Math.exp(-od[1]) * g, 18.6 * Math.exp(-od[2]) * g];
+}
+const TURB = 2.2;
+const smax = (a, b, k) => (a + b + Math.sqrt((a - b) ** 2 + k * k)) / 2;
+let CLR = null; // a cone envelope over the wall bound: the camera climbs at most 170 m/s and never touches the water
+function clearAt(t) { if (!CLR) { const dt = 1 / 240, n = Math.round(2.6 / dt) + 1, req = new Float64Array(n), env = new Float64Array(n); for (let i = 0; i < n; i++) { const tt = 1.0 + i * dt; let w = 0; for (const d of [-25, 0, 25]) { const h = kHead(tt) * RAD; w = Math.max(w, ringBoundJS(PATH.x(tt) + Math.sin(h) * d, PATH.z(tt) + Math.cos(h) * d, ringR(tt), ringS(tt))); } req[i] = w > .5 ? w + 16 : -50; } for (let i = 0; i < n; i++) { let e = -50; for (let j = 0; j < n; j++) e = Math.max(e, req[j] - 170 * Math.abs(i - j) * dt); env[i] = e; } const sg = .10 * 240, K = Math.ceil(3 * sg); CLR = env.map((_, i) => { let s = 0, ws = 0; for (let k = -K; k <= K; k++) { const g = Math.exp(-k * k / (2 * sg * sg)); s += env[clamp(i + k, 0, n - 1)] * g; ws += g; } return s / ws + 9; }); } const f = clamp((t - 1.0) * 240, 0, CLR.length - 1), i = Math.min(CLR.length - 2, Math.floor(f)); return lerp(CLR[i], CLR[i + 1], f - i); }
+function camY(t) {
+  const hug = sstep(2.9, 3.4, t) * (1 - sstep(5.3, 6.4, t)); let y = kY(t) + (SEA_H ? SEA_H(t) * 1.45 * hug : 0);
+  if (t > 1.0 && t < 3.6) y = smax(y, clearAt(t), 6 + 22 * sstep(1.05, 1.3, t) * (1 - sstep(3.3, 3.55, t)));
+  if (t > T_GRAV) y += .5 * -V_G1 * 1.05 * (t - T_GRAV) ** 2;
+  return y;
+}
+// the cosmic camera: eye and target relative to the galaxy centre
+const kCos = { ex: keys([[35, 0], [37, 0], [38.5, -1200], [40, -2600], [43, -5400], [45, -4800]]), ey: keys([[35, -2300], [36.5, -1300], [37.5, -200], [38.5, 1800], [40, 4200], [43, 6900], [45, 6000]]), ez: keys([[35, -900], [37, -700], [38.5, -2600], [40, -5600], [43, -6600], [45, -5700]]), tx: keys([[35, 0], [43, 0]]), ty: keys([[35, 600], [36.5, 300], [37.5, 0], [45, 0]]), tz: keys([[35, 300], [37, 0], [45, 0]]), fov: keys([[35, 94], [37, 100], [39, 74], [43, 64], [44.6, 56], [45, 56]]) };
+let GALC = [0, 0, 0];
+function camAt(t) {
+  const dt = 1 / 240, head = kHead(t), dh = (kHead(t + dt) - kHead(t - dt)) / (2 * dt); const sk = shake(t);
+  let y = camY(t); const vy = (camY(t + .18) - camY(t - .18)) / .36, sp = Math.max(Math.abs(kSpeed(t)), 8);
+  const vp = sstep(1.25, 1.6, t) * (1 - sstep(3.25, 3.6, t)) * Math.atan2(vy, sp) * .45 / RAD;
+  const roll = clamp(dh * .62, -34, 34) * .9 + kRollX(t), yaw = head * RAD + sk[0], pit = clamp(kPitch(t) + vp, -80, 80) * RAD + sk[1], ro = roll * RAD + sk[2];
+  let F = [Math.sin(yaw) * Math.cos(pit), Math.sin(pit), Math.cos(yaw) * Math.cos(pit)], p = [PATH.x(t), y, PATH.z(t)], fov = kFov(t) * RAD, rollA = ro;
+  if (t > T_TIME) { // hand over to the cosmic camera
+    const b = ease5(T_TIME, T_TIME + 1.4, t), eye = [GALC[0] + kCos.ex(t), GALC[1] + kCos.ey(t), GALC[2] + kCos.ez(t)], tg = [GALC[0] + kCos.tx(t), GALC[1] + kCos.ty(t), GALC[2] + kCos.tz(t)];
+    p = v3.add(v3.mul(p, 1 - b), v3.mul(eye, b)); const F2 = v3.norm(v3.sub(tg, p)); F = v3.norm(v3.add(v3.mul(F, 1 - b), v3.mul(F2, b))); fov = lerp(fov, kCos.fov(t) * RAD, b); rollA = ro * (1 - b) + b * .12 * Math.sin((t - 35) * .3);
+  }
+  const upH = Math.abs(F[1]) > .985 ? [0, 0, 1] : [0, 1, 0];
+  let R = v3.norm(v3.cross(upH, F)), U = v3.cross(F, R);
+  const c = Math.cos(rollA), s = Math.sin(rollA); const R2 = v3.add(v3.mul(R, c), v3.mul(U, -s)), U2 = v3.add(v3.mul(U, c), v3.mul(R, s));
+  return { p, F, R: R2, U: U2, fov };
+}
+function project(cam, d) { const z = v3.dot(d, cam.F), f = 1 / Math.tan(cam.fov / 2), asp = RW / RH; return [(v3.dot(d, cam.R) / z * f) * .5 + .5, .5 - (v3.dot(d, cam.U) / z * f * asp) * .5]; }
+
+function worldAt(t) {
+  const tau = t - T_SEA, s = sunAt(t), cam = camAt(t), w = { t, cam, sun: s, sunC: sunRad(s.el) };
+  w.R = ringR(t); w.ring = ringS(t);
+  w.reveal = tau < 0 ? 0 : 5.2 * (1 - Math.exp(-tau * 1.75)); w.warp = tau < 0 ? .05 : 1 - .9 * Math.exp(-tau * 2.6); if (tau > 2.4) w.warp = 1;
+  w.light = tau < 0 ? 0 : sstep(0, .16, tau) * (1 + .35 * Math.exp(-tau * 2.5)); w.flash = tau < 0 ? 0 : Math.exp(-tau * 5.0) * sstep(0, .03, tau);
+  w.stage = kWave(t); w.flow = 15 * Math.max(0, Math.min(t, T_GLASS + .15) - T_WAVE);
+  const g = t - T_GLASS; w.frOn = g >= 0 ? 1 : 0; w.frZ = g < 0 ? -1e5 : Z_FREEZE + 4 + 150 * g + 120 * Math.pow(Math.min(g, 6), 2.2); w.shat = t - 13.0;
+  w.inside = sstep(6.4, 7.8, t) * (1 - sstep(T_SMASH, T_SMASH + .25, t)); w.vol = lerp(.0012, .0040, sstep(9.2, 10.6, t)) * sstep(6.6, 8.2, t) * (1 - sstep(T_SMASH, T_SMASH + .4, t)); w.dust = sstep(9, 9.6, t) * (1 - sstep(T_SMASH, T_SMASH + .3, t));
+  w.otime = oceanTime(t); w.expo = t < T_TIME ? kExpo(t) : lerp(lerp(kExpo(T_TIME), .55, sstep(T_TIME, T_TIME + 1.2, t)), 1.0, sstep(T_TIME + 2.4, T_TIME + 4.5, t)); w.haze = lerp(lerp(.00004, .00002, sstep(14, 17, t)), .00045, sstep(18.5, 20.5, t) * (1 - sstep(33, 35, t)));
+  w.disp = lerp(1, .42, sstep(14.5, 19, t)) * (1 + .5 * sstep(T_GRAV, T_GRAV + 4, t)); w.night = sstep(-1 * RAD, -10 * RAD, -s.el) ; w.night = sstep(.5, 10, -s.el / RAD);
+  w.space = sstep(T_TIME + .7, T_TIME + 1.9, t); w.coll = t < T_COLL ? 0 : Math.pow(clamp((t - T_COLL) / 1.65), 2.2);
+  w.rg = lerp(1300, 5600, ease5(T_TIME, T_TIME + 4.2, t)); w.tg = Math.max(0, t - T_TIME) * V_TSCALE / 1e15; w.morph = ease5(T_TIME, T_TIME + 2.6, t); w.ign = sstep(T_TIME + 1.0, T_TIME + 3.4, t);
+  return w;
+}
+// The reflection pass runs while anything can show it: the birth mirror (until the ring is done), the barrel and nave, the city.
+function reflPass(w) { const tt = w.t, world = w.space < .999; return world && (w.inside > .001 || tt < T_SEA + 1.7 || w.R < 9e4 || (tt > T_CITY - .2)); }
+function shadowVP(w) { const L = w.sun.d, c = [0, 24, w.cam.p[2] + 110], R = v3.norm(v3.cross([0, 1, 0], L)), U = v3.cross(L, R), sa = Math.abs(Math.sin(w.sun.az)), hw = 42 + 150 * sa, hh = 78, eye = v3.add(c, v3.mul(L, 420)); return mmul(orthoM(hw, hh, 1, 900), viewM(eye, R, U, v3.mul(L, -1))); }
+function fillU(w, vp, ivp, svp, rvp, passId, camP, jit, sub, n) {
+  const f = new Float32Array(148); f.set(vp, 0); f.set(ivp, 16); f.set(svp, 32); f.set(rvp, 48); const c = w.cam;
+  const V = [[camP[0], camP[1], camP[2], w.t], [...w.sun.d, w.light], [...w.sunC.map(x => x * Math.min(1, w.light)), w.expo], [BC[0], BC[1], w.R, w.ring], [w.reveal, w.warp, w.haze, w.flash], [w.stage, w.cam.p[2], .50, Math.max(0, w.t - T_WAVE)], [w.frZ, w.frOn, Z_END, w.shat], [RW, RH, sub, n], jit, [PROF.W, PROF.HW, PROF.GR, PROF.GB], [w.flow, w.disp, 1.0, w.inside], [...c.F, c.fov], [...c.R, RW / RH], [...c.U, passId], [w.frOn, w.otime, w.vol, w.dust],
+    [w.t - T_FLY, w.t - T_CITY, w.t - T_GRAV, w.t - T_TIME], [w.coll, w.night, V_FLOORS, w.space], [...GALC, w.rg], [w.tg, w.morph, w.ign, w.t - T_SEA], [CITY.xb, CITY.z0, -V_G1, w.t - T_SMASH], [passId === 0 && w.reflOn ? 1 : 0, 0, 0, 0]];
+  V.forEach((v, i) => f.set(v, 64 + i * 4)); return f;
+}
+function gridFor(w) {
+  const g = new Float32Array(NXG + NZG), cs = w.cam.p[0], cz = w.cam.p[2], zone = w.stage > 0.01, hi = clamp((w.cam.p[1] - 40) / 400, 0, 6);
+  const fill = (off, n, c, rate, base, lim) => { const h = n >> 1; let a = 0; for (let i = h; i < n; i++) { g[off + i] = c + a; let d = base + rate * a; a += lim ? lim(c + a, d) : d; } a = 0; for (let i = h - 1; i >= 0; i--) { let d = base + rate * a; a += lim ? lim(c - a, d) : d; g[off + i] = c - a; } };
+  const b0 = .10 * (1 + hi * 4); fill(0, NXG, cs, .0118, b0, zone ? (s, d) => (s > -40 && s < 170) ? Math.min(d, .42) : (s >= 170 && s < 330) ? Math.max(Math.min(d, 2.2), .8) : d * 1.35 : null); fill(NXG, NZG, cz, .0118, b0, null); return g;
+}
+// ---- type
+function glyphsFor(w) {
+  const t = w.t, out = [], refl = [], E_ = Math.max(w.expo, .2), em0 = .058, asp = RH / RW;
+  const push = (arr, ch, penX, base, em, col, a, mode) => { const u = em / GL.EM, ua = Math.abs(u), idx = mode % 2 ? 0 : GL.idx[ch] ?? 0; const h = GL.CH * u, y = base - GL.BY * u; arr.push([(penX - GL.OX * ua * asp), y, GL.CW * ua * asp, h, ...col, a, mode, idx, GL.n, Math.max(.012, .9 / (Math.abs(em) * RH))]); };
+  for (let i = 0; i < PROGRAM.length; i++) {
+    const L = PROGRAM[i], t0 = i === 0 ? -1 : L.type[0] - .12; if (t < t0 || t > L.enter + .55) continue;
+    const str = L.from || L.code; let n = Math.floor(clamp((t - L.type[0]) / (L.type[1] - L.type[0])) * str.length + 1e-6), shown = str.slice(0, n), cur = shown.length;
+    if (L.steps) for (const [st, s, ci] of L.steps) if (t >= st) { shown = s; cur = ci ?? s.length; }
+    const full = L.code.length, em = em0, adv = GL.ADV * em * asp, post = t - L.enter; let x0, base, vp, hy = 0;
+    if (i === 0) { const c1 = camAt(Math.min(t, 1)); const sp = project(c1, sunAt(1).d); x0 = sp[0] - adv * (full + .42); base = sp[1] + em * .5; vp = sp; hy = project(c1, v3.norm([c1.F[0], 0, c1.F[2]]))[1]; }
+    else { x0 = .5 - adv * full / 2; base = .86; vp = project(w.cam, v3.norm(v3.add(w.cam.F, v3.mul(w.cam.U, -.12)))); }
+    let sc = 1, al = 1, boost = 1;
+    if (post > 0) { if (i === 0) { sc = 1 + 10 * post * post + 1.5 * post; al = 1 - sstep(.06, .30, post); boost = 1 + 3 * Math.exp(-post * 18); } else { sc = 1 / (1 + Math.pow(post * 8.5, 2.2)); al = 1 - sstep(.18, .5, post); boost = 1 + 2.2 * Math.exp(-post * 14); } } else if (i > 0) al = sstep(t0, t0 + .1, t);
+    if (al <= .002) continue; const C = 2.1 / E_ * boost; const eq = L.code.indexOf('='), op = L.code.indexOf('(');
+    const P = (x, y) => [vp[0] + (x - vp[0]) * sc, vp[1] + (y - vp[1]) * sc];
+    for (let k = 0; k < shown.length; k++) { const ch = shown[k]; if (ch === ' ') continue; const [px, py] = P(x0 + k * adv, base), num = eq > 0 ? k > eq : op > 0 && k >= op, col = num ? [C * 1.0, C * .62, C * .22] : [C * .86, C * .95, C]; push(out, ch, px, py, em * sc, col, al, 0); if (i === 0 && post < 0) push(refl, ch, px, 2 * hy - py, -em * sc, col, al, 0); }
+    if (!(i === 0 && post > .02)) { const [px, py] = P(x0 + cur * adv, base), bl = L.steps && t > L.steps[0][0] && t < L.enter ? 1 : 1; push(out, '', px, py, em * sc, [C * bl, C * bl, C * bl], al, 1); if (i === 0) push(refl, '', px, 2 * hy - py, -em * sc, [C, C, C], al, 1); }
+  }
+  // the finale: the point is the cursor
+  if (t > FINALE.cursorAt - .3) {
+    const em = .055, adv = GL.ADV * em * asp, C = 2.1 / E_, L0 = FINALE.lines[0], L1 = FINALE.lines[1], n0 = L0.length, n1 = L1.length;
+    const ty = FINALE.type, total = n0 + n1, k = clamp((t - ty[0]) / (ty[1] - ty[0])), nt = Math.floor(Math.pow(k, .92) * total + 1e-6);
+    const x0a = .5 - adv * n0 / 2, x0b = .5 - adv * n1 / 2, ya = .5 - em * .55, yb = ya + em * 2.45;
+    const shown0 = L0.slice(0, Math.min(nt, n0)), shown1 = L1.slice(0, Math.max(0, nt - n0));
+    for (let i = 0; i < shown0.length; i++) if (shown0[i] !== ' ') push(out, shown0[i], x0a + i * adv, ya, em, [C * .9, C * .95, C], 1, 0);
+    for (let i = 0; i < shown1.length; i++) if (shown1[i] !== ' ') push(out, shown1[i], x0b + i * adv, yb, em, [C * .9, C * .95, C], 1, 0);
+    let cx, cy; const sl = ease5(FINALE.slide[0], FINALE.slide[1], t);
+    if (nt <= n0) { cx = lerp(.5 - adv * .3, x0a, sl) + shown0.length * adv; cy = lerp(.5 + em * .5, ya, sl); } else { cx = x0b + shown1.length * adv; cy = yb; }
+    const typing = t > ty[0] && t < ty[1] + .05, blink = typing || t < FINALE.cursorAt + .5 ? 1 : (Math.floor((t - ty[1]) / .53) % 2 === 0 ? 1 : 0), app = sstep(FINALE.cursorAt - .25, FINALE.cursorAt + .05, t);
+    if (blink) push(out, '', cx, cy, em, [C, C, C], app, 1);
+  }
+  const all = out.concat(refl).slice(0, 256), f = new Float32Array(256 * 12); all.forEach((o, i) => f.set(o, i * 12)); return { f, n: Math.min(out.length, 256), nr: Math.max(0, all.length - out.length) };
+}
+const HAL = (() => { const h = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }; return Array.from({ length: 128 }, (_, i) => [h(i + 1, 2), h(i + 1, 3), h(i + 1, 5), h(i + 1, 7)]); })();
+let domeKey = '';
+function shutterAt(t) { return (t > 3.0 && t < 5.2 ? .30 : t > 13.1 && t < 19 ? .26 : t > T_TIME + 1 ? .4 : .5) / 60; }
+async function renderAt(tSec, opts = {}) {
+  const t = clamp(tSec, 0, DURATION - 1e-4), dev = E.dev, q = dev.queue, N = opts.n || NSUB0, P = E.P, shutter = shutterAt(t);
+  const w0 = worldAt(t), space = w0.space > .999;
+  // sky dome: once per frame, only when it changed
+  const key = w0.sun.d.map(x => x.toFixed(5)).join() + '|' + Math.floor(t * 12);
+  if (key !== domeKey && !space) { domeKey = key; for (let i = 0; i < 8; i++) { q.writeBuffer(E.su[i], 0, new Float32Array([...w0.sun.d, 0, t + (w0.sun.h - 6) * 90, 0.02, TURB, i])); const en = dev.createCommandEncoder(), c = en.beginComputePass(); c.setPipeline(E.skyP); c.setBindGroup(0, E.skyBG[i]); c.dispatchWorkgroups(512, 16); c.end(); q.submit([en.finish()]); } const en = dev.createCommandEncoder(), c = en.beginComputePass(); c.setPipeline(E.mipP); for (const m of E.mDome) { c.setBindGroup(0, m.bg); c.dispatchWorkgroups(m.x, m.y, m.z); } c.end(); q.submit([en.finish()]); await q.onSubmittedWorkDone(); }
+  // ocean FFT
+  q.writeBuffer(E.fu, 0, new Float32Array([w0.otime, 1.55, 1.12, 0])); { const en = dev.createCommandEncoder(), c = en.beginComputePass(); c.setBindGroup(0, E.fftBG); c.setPipeline(E.cp.spectrum); c.dispatchWorkgroups(32, 32, 1); c.setPipeline(E.cp.fftRow); c.dispatchWorkgroups(256, 4, 1); c.setPipeline(E.cp.fftCol); c.dispatchWorkgroups(256, 4, 1); c.setPipeline(E.cp.assemble); c.dispatchWorkgroups(32, 32, 1); c.setPipeline(E.mipP); for (const m of [...E.mDisp, ...E.mDer]) { c.setBindGroup(0, m.bg); c.dispatchWorkgroups(m.x, m.y, m.z); } c.end(); q.submit([en.finish()]); }
+  q.writeBuffer(E.grid, 0, gridFor(w0)); q.writeBuffer(E.accU, 0, new Float32Array([1 / N, 0, 0, 0, 0, 0, 0, 0]));
+  for (let s = 0; s < N; s++) {
+    const H = HAL[s % 128], ts = Math.min(t + shutter * ((s + .5) / N - .5), DURATION - 1e-5), w = worldAt(Math.max(0, ts)), c = w.cam, asp = RW / RH, jx = (H[0] - .5) * 2 / RW, jy = (H[1] - .5) * 2 / RH;
+    const proj = perspM(c.fov, asp, .12, jx, jy), view = viewM(c.p, c.R, c.U, c.F), vp = mmul(proj, view), ivp = minv(vp), mir = new Float64Array([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]), rvp = mmul(vp, mir), svp = shadowVP(w), jit = [H[2], H[3], H[0], H[1]];
+    w.reflOn = reflPass(w);
+    q.writeBuffer(E.ub[0], 0, fillU(w, vp, ivp, svp, rvp, 0, c.p, jit, s, N)); q.writeBuffer(E.ub[1], 0, fillU(w, rvp, ivp, svp, rvp, 1, [c.p[0], -c.p[1], c.p[2]], jit, s, N)); q.writeBuffer(E.ub[2], 0, fillU(w, svp, ivp, svp, rvp, 2, c.p, jit, s, N));
+    const gl = glyphsFor(w); if (gl.n + gl.nr) q.writeBuffer(E.gl, 0, gl.f, 0, (gl.n + gl.nr) * 12);
+    const tt = w.t, world = w.space < .999, en = dev.createCommandEncoder(), city = tt > T_CITY - .2 && world, birds = tt > T_FLY - .02 && tt < 21.6 && world;
+    const ins = w.reflOn, nave = w.frOn > .5 && w.shat < 1.6, NB = 30, vL = 24 * 10 * 6, vS = 3 * 8 * 6;
+    { const p = en.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: E.shD.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } }); if (nave) { p.setBindGroup(0, E.bgSh); p.setPipeline(P.tubeLSh); p.draw(vL, TUBES.nL * NB); p.setPipeline(P.tubeSSh); p.draw(vS, TUBES.nS * NB); } p.end(); }
+    { const p = en.beginRenderPass({ colorAttachments: [{ view: E.shC.createView(), clearValue: [1, 1, 1, 1], loadOp: 'clear', storeOp: 'store' }] }); if (w.stage > .25 && tt < T_FLY) { p.setBindGroup(0, E.bgSh); p.setIndexBuffer(E.idx, 'uint32'); p.setPipeline(P.surfShC); p.drawIndexed(E.idxN); if (nave) { p.setPipeline(P.roseSh); p.draw(144 * 216 * 6); } } p.end(); }
+    const scene = (p, bg, refl) => {
+      p.setBindGroup(0, bg);
+      if (world && !(window.DBG || {}).noSea) { p.setIndexBuffer(E.idx, 'uint32'); p.setPipeline(P.surf); p.drawIndexed(E.idxN); }
+      if (nave) { p.setPipeline(P.tubeL); p.draw(vL, TUBES.nL * NB); p.setPipeline(P.tubeS); p.draw(vS, TUBES.nS * (refl ? 12 : 22)); p.setPipeline(P.rose); p.draw(144 * 216 * 6); if (!refl && tt < T_GLASS + 2) { p.setPipeline(P.spike); p.draw(18, 36 * 76); } }
+      if (tt > T_SEA - .01 && tt < T_SEA + 3.2 && !(refl && tt > T_SEA + .42) && !(window.DBG || {}).noCrown) { p.setPipeline(P.crown); p.draw(480 * 96 * 6); }
+      if (birds) { p.setPipeline(P.bird); p.draw(BIRDV, NBIRD); }
+      if (city) { p.setPipeline(P.tower); p.draw(TOWERV, CITYN); }
+      p.setPipeline(P.sky); p.draw(3);
+    };
+    if (ins) { const p = en.beginRenderPass({ colorAttachments: [{ view: E.refl.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }], depthStencilAttachment: { view: E.reflD.createView(), depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } }); scene(p, E.bgRefl, true); p.end();
+      if (gl.nr) { const p2 = en.beginRenderPass({ colorAttachments: [{ view: E.refl.createView(), loadOp: 'load', storeOp: 'store' }] }); p2.setPipeline(P.textR); p2.setBindGroup(0, E.bgVol); p2.setBindGroup(1, E.bgText); p2.draw(6, gl.nr, 0, gl.n); p2.end(); } }
+    { const p = en.beginRenderPass({ colorAttachments: [{ view: E.hdr.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }], depthStencilAttachment: { view: E.dep.createView(), depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } }); scene(p, E.bgMain, false);
+      const D = window.DBG || {}; if (tt > T_SEA && tt < 9.6 && !D.noSpray) { p.setPipeline(P.spray); p.draw(6, 160000); } if (tt > T_SEA && tt < T_SEA + 2.6 && !D.noBurst) { p.setPipeline(P.burst); p.draw(6, 140000); }
+      if (w.dust > .01) { p.setPipeline(P.drop); p.draw(6, 2600); }
+      const DB = window.DBG || {}; if (city) { if (!DB.noCasc) { p.setPipeline(P.cascade); p.draw(6, CITYN * 192); } if (!DB.noLant) { p.setPipeline(P.lantern); p.draw(6, CITYN * 160); } if (tt > T_GRAV - .1 && !DB.noRain) { p.setPipeline(P.rainUp); p.draw(6, 120000); } }
+      if (tt > T_TIME - .1 && !(window.DBG || {}).noStar) { p.setPipeline(P.star); { const DB = window.DBG || {}; if (DB.starA) p.draw(6, CITYN * 160); else if (DB.starB) p.draw(6, NSTAR - CITYN * 160, 0, CITYN * 160); else p.draw(6, NSTAR); } p.setPipeline(P.dust); p.draw(6, NDUST); }
+      p.end(); }
+    if (tt > T_SEA + .5 && tt < 10.4 && !(window.DBG || {}).noSpout) { const p = en.beginRenderPass({ colorAttachments: [{ view: E.hdr.createView(), loadOp: 'load', storeOp: 'store' }] }); p.setPipeline(P.spout); p.setBindGroup(0, E.bgVol); p.draw(3); p.end(); }
+    if (w.vol > 1e-5) { const p = en.beginRenderPass({ colorAttachments: [{ view: E.hdr.createView(), loadOp: 'load', storeOp: 'store' }] }); p.setPipeline(P.vol); p.setBindGroup(0, E.bgVol); p.draw(3); p.end(); }
+    if (gl.n) { const p = en.beginRenderPass({ colorAttachments: [{ view: E.hdr.createView(), loadOp: 'load', storeOp: 'store' }] }); p.setPipeline(P.text); p.setBindGroup(0, E.bgVol); p.setBindGroup(1, E.bgText); p.draw(6, gl.n); p.end(); }
+    { const p = en.beginRenderPass({ colorAttachments: [{ view: E.acc.createView(), clearValue: [0, 0, 0, 0], loadOp: s ? 'load' : 'clear', storeOp: 'store' }] }); p.setPipeline(P.acc); p.setBindGroup(0, E.accBG); p.draw(3); p.end(); }
+    q.submit([en.finish()]); if (s % 4 === 3) await q.onSubmittedWorkDone();
+  }
+  // post: grade strength, lens water after the wall hits
+  const grade = lerp(.55, 1, sstep(2.6, 3.2, t) * (1 - sstep(5.2, 6, t))), lens = -1;
+  q.writeBuffer(E.finU, 0, new Float32Array([w0.expo, 0, t, 0, 0, 0, .075, .010, lens, grade, w0.coll, sstep(44.9, 45.1, t)])); const en = dev.createCommandEncoder(), fs = (pipe, bg, view, load) => { const p = en.beginRenderPass({ colorAttachments: [{ view, loadOp: load ? 'load' : 'clear', clearValue: [0, 0, 0, 1], storeOp: 'store' }] }); p.setPipeline(pipe); p.setBindGroup(0, bg); p.draw(3); p.end(); };
+  for (let i = 0; i < 7; i++) fs(P.down, E.downs[i], E.bl[i].t.createView()); for (const u of E.ups) fs(P.up, u.bg, u.dst.createView(), true);
+  fs(P.fin, E.finBG, E.out.createView()); en.copyTextureToTexture({ texture: E.out }, { texture: E.ctx.getCurrentTexture() }, [RW, RH]); q.submit([en.finish()]); await q.onSubmittedWorkDone();
+}
+async function readFrame() { const bpr = Math.ceil(RW * 4 / 256) * 256, en = E.dev.createCommandEncoder(); en.copyTextureToBuffer({ texture: E.out }, { buffer: E.rb, bytesPerRow: bpr }, [RW, RH]); E.dev.queue.submit([en.finish()]); await E.rb.mapAsync(1); const s = new Uint8Array(E.rb.getMappedRange()), o = new Uint8Array(RW * RH * 4); if (bpr === RW * 4) o.set(s.subarray(0, o.length)); else for (let y = 0; y < RH; y++) o.set(s.subarray(y * bpr, y * bpr + RW * 4), y * RW * 4); E.rb.unmap(); return o; }
+window.renderAt = renderAt; window.readFrame = readFrame; window.DURATION = DURATION; window.PROGRAM = PROGRAM; window.camAt = camAt; window.worldAt = worldAt;
+(async () => {
+  try {
+    CITY.xb = PATH.x(21.5); CITY.z0 = PATH.z(T_CITY) + 170; { const c = [PATH.x(T_TIME), 0, PATH.z(T_TIME)]; GALC = [c[0], camY(T_TIME) + 2600, c[2] + 900]; }
+    const tb = performance.now(); E.birds = bakeBirds(t => [PATH.x(t), camY(t), PATH.z(t)]); console.log('birds baked', E.birds.N, Math.round(performance.now() - tb) + 'ms');
+    await initEngine(); bakeSea(); await renderAt(0); window.READY = true;
+    if (!Q.get('capture')) { const t0 = performance.now(); for (;;) { const t = ((performance.now() - t0) / 1000) % DURATION; await renderAt(t, { n: 2 }); await new Promise(requestAnimationFrame); } }
+  }
+  catch (e) { console.log('INIT ' + (e.stack || e)); window.FAILED = String(e); document.body.style.color = '#fff'; document.body.append('This film needs WebGPU (Chrome or Edge on desktop). ' + e); }
+})();
+
+</script></body></html>
