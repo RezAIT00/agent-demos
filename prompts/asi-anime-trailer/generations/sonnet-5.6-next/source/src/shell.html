@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BETWEEN BLINKS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;background:#000;height:100%;overflow:hidden}
+  #view{position:fixed;inset:0;margin:auto;width:min(100vw,177.78vh);height:min(100vh,56.25vw);display:block}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:10px;align-items:center;padding:10px 16px;opacity:0;transition:opacity .25s}
+  body:hover #bar{opacity:1}
+  #bar button{width:44px;height:30px;background:#171a33;border:1px solid #4a5290;border-radius:6px;cursor:pointer;position:relative}
+  #bar button::after{content:'';position:absolute;left:17px;top:8px;border-style:solid;border-width:6px 0 6px 11px;border-color:transparent transparent transparent #dfe6ff}
+  #bar button.on::after{border-width:0 3px;width:5px;height:13px;border-style:solid;border-color:#dfe6ff}
+  #bar input{flex:1}
+  body.capture #bar{display:none}
+</style>
+</head>
+<body>
+<canvas id="view" width="1920" height="1080"></canvas>
+<div id="bar"><button id="play" aria-label="play"></button><input id="seek" type="range" min="0" max="1000" value="0"></div>
+<script>
+/*__SCRIPT__*/
+</script>
+</body>
+</html>

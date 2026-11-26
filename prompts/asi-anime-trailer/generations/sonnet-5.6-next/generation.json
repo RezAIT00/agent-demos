@@ -1,0 +1,25 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-26",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 88,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": null,
+  "renderer": "Canvas2D for characters, ink and lettering, plus a small WebGL2 painter and post pass, written by the agent, no libraries",
+  "film_title": "BETWEEN BLINKS (間)",
+  "video": {
+    "file": "asi_trailer.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 24,
+    "frames": 2100,
+    "duration_seconds": 87.5,
+    "codec": "h264 High, yuv420p, crf 16, about 7.7 Mbit/s, faststart",
+    "audio": "AAC 320k, 48 kHz stereo, -14.1 LUFS integrated, true peak -1.2 dBTP",
+    "size_bytes": 84257580,
+    "not_in_repo": "asi_trailer_x.mp4 (6.9 Mbit/s two-pass copy for X, 75643196 bytes) and soundtrack.wav (24-bit, 25200044 bytes); the master carries the same picture and audio"
+  },
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. Every run in the session reported claude-sonnet-5-5 as the executed model. Before the prompt, the same session answered one short no-tools question the repo owner uses to check which model is answering. The prompt was written by an orchestrating Claude Opus 5.5 session that only prompted; all code is the Sonnet session's own. It was sent as one message, with the output folder filled in and an opening line saying the check had passed. It also allowed the agent to read and adapt the capture plumbing (not the visuals) from an earlier project's cap.mjs and finish.sh, and said the RTX 5090 was shared with another agent session rendering at the same time. prompt.md leaves those out. There were no follow-up messages: the session's later turns were wake-ups from its own background renders finishing. Other agent sessions shared the GPU and CPU for the whole run."
+}
