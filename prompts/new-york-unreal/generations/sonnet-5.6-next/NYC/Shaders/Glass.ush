@@ -1,0 +1,267 @@
+// Window glass with interior-mapped rooms behind it.
+// UV0 = metres from the opening's lower-left corner (u to the viewer's right), UV1 = opening size (m).
+#pragma once
+#include "/NYC/Common.ush"
+
+float NycRect(float2 p, float2 c, float2 hsz, float soft)
+{
+	float2 d = abs(p - c) - hsz;
+	return 1.0 - smoothstep(-soft, soft, max(d.x, d.y));
+}
+
+float3 NycWallPalette(float h, float kind)
+{
+	if (kind > 1.5) // shops
+	{
+		if (h < 0.35) return float3(0.82, 0.80, 0.76);
+		if (h < 0.55) return float3(0.70, 0.55, 0.38);
+		if (h < 0.70) return float3(0.25, 0.27, 0.30);
+		if (h < 0.85) return float3(0.62, 0.16, 0.12);
+		return float3(0.86, 0.84, 0.80);
+	}
+	if (h < 0.34) return float3(0.74, 0.71, 0.64);
+	if (h < 0.50) return float3(0.62, 0.66, 0.68);
+	if (h < 0.64) return float3(0.70, 0.60, 0.46);
+	if (h < 0.74) return float3(0.42, 0.46, 0.38);
+	if (h < 0.82) return float3(0.55, 0.27, 0.20);
+	return float3(0.80, 0.79, 0.76);
+}
+
+// returns radiance of the room seen through the pane (nits)
+float3 NycRoom(float2 uv, float2 size, float3 d, float seed, float kind, float depthScale,
+	float litFrac, float dayNits, float simTime, float lod, float lampScale, out float litOut)
+{
+	float3 h0 = NycHash31(seed * 91.7 + 3.1);
+	float3 h1 = NycHash31(seed * 37.3 + 11.9);
+	float3 h2 = NycHash31(seed * 53.9 + 29.3);
+
+	float shop = step(1.5, kind);
+	float office = step(0.5, kind) * (1.0 - shop);
+	float side = lerp(lerp(0.55, 1.4, office), 0.35, shop) + h0.x * 0.5;
+	float sill = lerp(0.75, 0.2, shop);
+	float head = lerp(0.45, 0.4, shop);
+	float depth = (lerp(3.6, 6.5, max(office, shop)) + h0.y * 2.5) * depthScale;
+
+	float3 bmin = float3(-side, -sill, 0.0);
+	float3 bmax = float3(size.x + side, size.y + head, depth);
+	float3 p = float3(uv, 0.0);
+	d.z = max(d.z, 0.02);
+	float3 dd = float3(abs(d.x) < 1e-4 ? 1e-4 : d.x, abs(d.y) < 1e-4 ? 1e-4 : d.y, d.z);
+	float3 tm = (select(dd > 0.0, bmax, bmin) - p) / dd;
+	float t = min(tm.x, min(tm.y, tm.z));
+	float3 q = p + dd * t;
+
+	float lit = step(h1.x, litFrac);
+	litOut = lit;
+	float3 lampCol = float3(1.0, 0.64, 0.34);
+	float lampNits = 55.0 + 150.0 * h1.y * h1.y;
+	if (office > 0.5) { lampCol = h1.z < 0.7 ? float3(0.86, 0.95, 1.0) : float3(1.0, 0.84, 0.62); lampNits = 110.0 + 190.0 * h1.y; }
+	else if (shop > 0.5) { lampCol = h1.z < 0.6 ? float3(1.0, 0.82, 0.58) : float3(0.92, 0.95, 1.0); lampNits = 330.0 + 420.0 * h1.y; }
+	else if (h1.z > 0.9) { lampCol = float3(0.35, 0.5, 1.0); lampNits = 18.0 + 10.0 * sin(simTime * 3.1 + seed * 40.0) * (1.0 - lod); }
+	else if (h1.z > 0.7) lampCol = float3(1.0, 0.83, 0.62);
+
+	lampNits *= lampScale;
+	float3 wall = NycWallPalette(h0.z, kind);
+	float3 albedo = wall;
+	float emitCeil = 0.0;
+	float facing = 1.0;
+
+	if (t == tm.y && dd.y < 0)
+	{
+		// floor: planks or carpet tiles
+		float planks = frac(q.x * 6.0 + floor(q.z * 1.3) * 0.37);
+		float3 wood = lerp(float3(0.20, 0.11, 0.05), float3(0.34, 0.22, 0.12), NycHash11(floor(q.x * 6.0) + seed));
+		float3 carpet = lerp(float3(0.10, 0.10, 0.12), float3(0.30, 0.28, 0.24), h2.x);
+		albedo = (office > 0.5 || h2.y > 0.65) ? carpet : wood * (0.9 + 0.1 * step(0.05, planks));
+		if (shop > 0.5) albedo = lerp(float3(0.4, 0.36, 0.3), float3(0.14, 0.12, 0.1), step(0.5, frac((floor(q.x * 1.7) + floor(q.z * 1.7)) * 0.5)));
+		facing = 0.75;
+	}
+	else if (t == tm.y)
+	{
+		albedo = float3(0.78, 0.77, 0.74);
+		if (office > 0.5 || shop > 0.5)
+		{
+			float2 cell = frac(float2(q.x / 1.5, q.z / 1.2)) - 0.5;
+			float panel = step(abs(cell.x), office > 0.5 ? 0.36 : 0.09) * step(abs(cell.y), office > 0.5 ? 0.12 : 0.09);
+			emitCeil = lerp(panel, 0.2, lod);
+		}
+		else
+		{
+			emitCeil = (1.0 - smoothstep(0.12, 0.2, length(q.xz - float2(size.x * 0.5, depth * 0.5)))) * 0.8;
+		}
+		facing = 0.55;
+	}
+	else if (t == tm.z)
+	{
+		// back wall: pictures, doorway, shelving
+		float2 w = float2(q.x, q.y);
+		if (shop > 0.5 || (office > 0.5 && h2.z > 0.6))
+		{
+			float2 c = float2(floor(w.x / 0.26), floor((w.y + sill) / 0.42));
+			float shelf = step(frac((w.y + sill) / 0.42), 0.09) * step(w.y, size.y - 0.35);
+			float item = step(0.28, NycHash21(c + seed)) * step(0.12, frac(w.x / 0.26)) * step(frac((w.y + sill) / 0.42), 0.12 + 0.6 * NycHash21(c * 3.1 + seed)) * step(w.y, size.y - 0.35);
+			float3 ic = lerp(float3(0.12, 0.1, 0.09), NycHash31(NycHash21(c + seed * 7.0) * 61.0), shop > 0.5 ? 0.62 : 0.2);
+			albedo = lerp(albedo, ic, item * (1.0 - lod));
+			albedo = lerp(albedo, float3(0.16, 0.11, 0.07), shelf * (1.0 - lod));
+		}
+		else
+		{
+			float pic = NycRect(w, float2(size.x * (0.15 + 0.5 * h2.x), size.y * 0.55), float2(0.3 + 0.2 * h2.y, 0.26), 0.01);
+			albedo = lerp(albedo, lerp(float3(0.1, 0.09, 0.08), NycHash31(seed * 5.0), 0.35), pic * step(0.35, h2.z));
+			float door = NycRect(w, float2(size.x + side - 0.75 - h2.y, -sill + 1.05), float2(0.46, 1.05), 0.01);
+			albedo = lerp(albedo, float3(0.22, 0.15, 0.09), door * step(0.55, h2.x));
+		}
+	}
+	else
+	{
+		albedo = wall * 0.82;
+		float cab = step(q.y, -sill + 1.7) * step(depth * 0.35, q.z) * step(q.z, depth * 0.8) * step(0.45, h2.z);
+		albedo = lerp(albedo, float3(0.17, 0.12, 0.08), cab * (1.0 - lod));
+		facing = 0.8;
+	}
+
+	// furniture standing in the room, on two planes
+	float3 hit = q;
+	float tBest = t;
+	for (int k = 0; k < 2; k++)
+	{
+		float zf = depth * (k == 0 ? 0.34 : 0.68);
+		float tf = zf / dd.z;
+		if (tf >= tBest) continue;
+		float3 f = p + dd * tf;
+		float fy = f.y + sill;
+		float cellW = office > 0.5 ? 1.5 : (shop > 0.5 ? 1.15 : 1.35);
+		float cid = floor((f.x + k * 0.7) / cellW);
+		float2 r = NycHash22(float2(cid + k * 13.0, seed * 97.0));
+		if (r.x < 0.38) continue;
+		float lx = (frac((f.x + k * 0.7) / cellW) - 0.5) * cellW;
+		float hgt = office > 0.5 ? 0.78 : 0.45 + r.y * 0.75;
+		float wid = cellW * (0.28 + 0.18 * r.y);
+		float body = step(abs(lx), wid) * step(fy, hgt) * step(0.0, fy);
+		// monitor, lamp shade or display on top
+		float top = step(abs(lx - (r.y - 0.5) * 0.3), office > 0.5 ? 0.27 : 0.14) * step(hgt, fy) * step(fy, hgt + (office > 0.5 ? 0.42 : 0.55)) * step(0.55, r.y);
+		if (body + top > 0.5 && lod < 0.9)
+		{
+			float3 fc = lerp(float3(0.07, 0.05, 0.04), NycHash31(r.x * 31.0 + seed) * 0.5, shop > 0.5 ? 0.75 : 0.3);
+			albedo = lerp(albedo, top > 0.5 ? fc * 0.5 : fc, 1.0 - lod);
+			hit = f; tBest = tf; emitCeil = 0.0; facing = 0.8;
+		}
+	}
+
+	// room lighting: a ceiling source with falloff, plus daylight spilling in from the window
+	float3 lampP = float3(size.x * (0.2 + 0.6 * h2.x), size.y + head - 0.25, depth * (0.35 + 0.35 * h2.y));
+	float3 toL = lampP - hit;
+	float att = 2.4 / (1.0 + dot(toL, toL) * (shop > 0.5 || office > 0.5 ? 0.14 : 0.42));
+	att = shop > 0.5 || office > 0.5 ? lerp(att, 0.9, 0.5) : att;
+	float ao = saturate(0.45 + min(min(hit.y + sill, size.y + head - hit.y), min(hit.x + side, size.x + side - hit.x)) * 1.1);
+	float3 light = lampCol * lampNits * att * lit * ao * facing;
+	float3 day = dayNits * float3(0.9, 0.95, 1.05) * exp(-hit.z * 0.42) * ao * facing * (0.55 + 0.9 * h1.y);
+	float3 col = albedo * (light + day);
+	col += emitCeil * lampCol * lampNits * 5.0 * lit;
+
+	float3 avg = wall * 0.55 * (lampCol * lampNits * lit * 0.8 + dayNits * 0.25);
+	return lerp(col, avg, lod);
+}
+
+float3 NycGlassMain(
+	float3 WP, float3 VN, float3 CamPos, float2 UV, float2 Size, float RoomSeed, float4 VCol, float3 InstTint,
+	Texture2D NoiseTex, SamplerState NoiseS, Texture2D DropsTex, SamplerState DropsS,
+	Texture2D SnowNTex, SamplerState SnowNS,
+	float RoomKind, float DepthScale, float3 GlassTint, float Reflect, float Transmit, float InteriorOn,
+	float PaneW, float Warp, float BlindChance, float CurtainChance, float LitBias, float LampScale,
+	float Wetness, float Snow, float Rain, float SimTime, float LitHome, float LitOffice, float LitShop, float InteriorDay, float Flash,
+	out float Roughness, out float3 Normal, out float Metallic, out float Specular, out float3 Emissive)
+{
+	float3 N = normalize(VN);
+	float3 Right = normalize(cross(N, float3(0, 0, 1)) + float3(1e-5, 0, 0));
+	float3 Up = float3(0, 0, 1);
+	float3 D = normalize(WP - CamPos);
+	float3 dr = float3(dot(D, Right), D.z, -dot(D, N));
+	float fp = NycFootprint(WP, CamPos, N);
+	float lod = saturate((fp - 0.045) / 0.22);
+
+	Size = max(Size, float2(0.3, 0.3));
+	// one room per window; wide curtain-wall bays are split into rooms along the pane grid
+	float seed = frac(RoomSeed + VCol.a * 7.31);
+	float roomW = max(Size.x, 0.5);
+	float kind = RoomKind;
+	float litFrac = (kind > 1.5 ? LitShop : (kind > 0.5 ? LitOffice : LitHome)) * LitBias;
+	if (kind > 0.5 && kind < 1.5)
+	{
+		// whole floors of an office tend to be lit or dark together
+		float floorH = NycHash21(float2(floor(WP.z / 360.0), floor(RoomSeed * 11.0)));
+		litFrac = saturate(litFrac * (floorH < 0.35 ? 2.1 : 0.5));
+	}
+
+	float lit = 0.0;
+	float3 room = 0;
+	if (InteriorOn > 0.5 && dr.z > 0.0)
+	{
+		room = NycRoom(UV, Size, dr, seed, kind, DepthScale, litFrac, InteriorDay, SimTime, lod, LampScale, lit);
+	}
+
+	// blinds and curtains sit just behind the glass
+	float3 hb = NycHash31(seed * 211.0 + 5.0);
+	if (InteriorOn > 0.5 && hb.x < BlindChance)
+	{
+		float drop = 0.12 + 0.85 * hb.y * hb.y;
+		float below = step(Size.y * (1.0 - drop), UV.y);
+		float slat = lerp(0.78 + 0.22 * step(0.35, frac(UV.y / 0.055)), 0.92, saturate(fp * 25.0));
+		float3 bc = lerp(float3(0.62, 0.58, 0.5), float3(0.80, 0.79, 0.76), hb.z) * slat;
+		float3 glow = lit > 0.5 ? (kind > 0.5 ? float3(0.8, 0.9, 1.0) : float3(1.0, 0.66, 0.36)) * 38.0 : 0.0;
+		room = lerp(room, bc * (InteriorDay * 0.75 + glow), below);
+	}
+	if (InteriorOn > 0.5 && kind < 0.5 && hb.z < CurtainChance)
+	{
+		float cw = Size.x * (0.12 + 0.22 * hb.y);
+		float edge = max(1.0 - smoothstep(cw - 0.05, cw, UV.x), smoothstep(Size.x - cw, Size.x - cw + 0.05, UV.x));
+		float fold = 0.72 + 0.28 * sin(UV.x * 44.0 + sin(UV.y * 3.0) * 0.8) * (1.0 - saturate(fp * 20.0));
+		float3 cc = lerp(NycHash31(seed * 17.0) * 0.6 + 0.12, float3(0.72, 0.68, 0.6), 0.55);
+		float3 glow = lit > 0.5 ? float3(1.0, 0.62, 0.32) * 42.0 : 0.0;
+		room = lerp(room, cc * fold * (InteriorDay * 0.7 + glow), edge);
+	}
+
+	// imperfect panes: each is tilted and slightly bowed, so reflections break from pane to pane
+	float paneIdx = floor(UV.x / max(PaneW, 0.2));
+	float2 pid = float2(floor(RoomSeed * 977.0) + paneIdx, floor(WP.z / 170.0));
+	float2 tilt = (NycHash22(pid) - 0.5) * 0.016 * Warp;
+	float4 nz = NycSampleMip(NoiseTex, NoiseS, float2(UV.x * 0.31 + seed, WP.z * 0.0019), fp * 0.31);
+	float4 nz2 = NycSampleMip(NoiseTex, NoiseS, float2(WP.z * 0.0023 + seed * 3.0, UV.x * 0.37), fp * 0.37);
+	tilt += (float2(nz.r, nz2.r) - 0.5) * 0.011 * Warp;
+	float3 Nw = normalize(N + Right * tilt.x + Up * tilt.y);
+
+	float rough = 0.025;
+	if (Wetness > 0.01 && fp < 0.03)
+	{
+		float4 dr1 = NycSample(DropsTex, DropsS, float2(dot(WP, Right) * 0.01, -WP.z * 0.01) * 1.6, fp * 1.6);
+		float m = smoothstep(0.05, 0.4, dr1.b) * saturate(Wetness * Rain * 1.8) * (1.0 - lod);
+		float2 dn = (dr1.rg * 2.0 - 1.0);
+		Nw = normalize(Nw + (Right * dn.x - Up * dn.y) * m * 0.55);
+	}
+
+	float cosv = saturate(dot(-D, N));
+	float fres = 0.04 + 0.96 * pow(1.0 - cosv, 5.0);
+	float3 transmit = GlassTint * (1.0 - fres) * (1.0 - Reflect * 0.75) * Transmit;
+
+	// dusty, streaked glass keeps a little diffuse
+	float4 dirt = NycSampleMip(NoiseTex, NoiseS, float2(dot(WP, Right) * 0.0011, WP.z * 0.0004), fp * 0.11);
+	float3 base = lerp(float3(0.012, 0.014, 0.016), GlassTint * 0.62, saturate(Reflect * 1.35));
+	base += saturate(dirt.g - 0.5) * 0.035;
+
+	// real panes are never uniform: wiped-on smears, dust settled along the bottom edge, rain run-marks
+	float close = saturate(1.0 - fp / 0.03);
+	float smear = saturate(NycValueNoise(float2(UV.x * 2.7 + seed * 31.0, UV.y * 1.9)) * NycValueNoise(float2(UV.x * 7.3, UV.y * 5.1 + seed)) * 2.6 - 0.55);
+	float sill = exp(-max(UV.y, 0.0) / 0.16) * (0.5 + 0.8 * NycValueNoise(float2(UV.x * 9.0 + seed * 5.0, 0.3)));
+	float marks = saturate(NycValueNoise(float2(UV.x * 23.0 + seed * 3.0, UV.y * 0.8)) * 3.2 - 2.2) * NycValueNoise(float2(UV.x * 3.0, UV.y * 2.2 + 9.0));
+	float film = (smear * 0.5 + sill * 0.75 + marks) * close;
+	base += film * float3(0.03, 0.029, 0.026);
+	Emissive *= 1.0 - 0.22 * saturate(film);
+	Roughness = rough + saturate(dirt.g - 0.55) * 0.08 + film * 0.13 + saturate(dirt.b - 0.5) * 0.05;
+	Normal = Nw;
+	Metallic = saturate(Reflect);
+	Specular = 0.55;
+	Emissive = room * transmit;
+
+	if (Snow > 0.05 && N.z > 0.5) { base = lerp(base, float3(0.8, 0.82, 0.86), saturate(Snow * 2.0 - 0.4)); Roughness = 0.55; Metallic = 0; Emissive = 0; }
+	return base;
+}

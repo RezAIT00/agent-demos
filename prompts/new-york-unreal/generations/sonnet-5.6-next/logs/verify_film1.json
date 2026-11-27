@@ -1,0 +1,66 @@
+{
+ "nyc_film.mp4": {
+  "size_mb": 439.0,
+  "video": "h264 3840x2160 yuv420p 24/1 fps",
+  "video_mbit": 40.28,
+  "audio": "aac 48000 Hz 2 ch 314 kbit/s",
+  "frames": 2076,
+  "video_seconds": 86.5,
+  "audio_seconds": 86.5,
+  "decode_errors": "",
+  "faststart": true,
+  "lufs": -14.2,
+  "true_peak_dbtp": -1.3,
+  "clipped_samples": 0,
+  "pass": true
+ },
+ "nyc_film_x.mp4": {
+  "size_mb": 111.2,
+  "video": "h264 1920x1080 yuv420p 24/1 fps",
+  "video_mbit": 9.97,
+  "audio": "aac 48000 Hz 2 ch 314 kbit/s",
+  "frames": 2076,
+  "video_seconds": 86.5,
+  "audio_seconds": 86.5,
+  "decode_errors": "",
+  "faststart": true,
+  "lufs": -14.2,
+  "true_peak_dbtp": -1.3,
+  "clipped_samples": 0,
+  "pass": true
+ },
+ "flash_and_flicker": {
+  "frames": 2076,
+  "seconds": 86.5,
+  "whole_frame_flashes": 11,
+  "worst_flashes_in_one_second": 2,
+  "worst_window_frame": 994,
+  "worst_region": "frame",
+  "flash_limit_ok": true,
+  "single_frame_pops": [],
+  "unexplained_jumps": [],
+  "worst_local_flicker": [
+   [
+    1187,
+    1.74
+   ],
+   [
+    1188,
+    1.69
+   ],
+   [
+    1189,
+    1.49
+   ],
+   [
+    1186,
+    1.3
+   ],
+   [
+    1190,
+    1.18
+   ]
+  ]
+ },
+ "all_pass": true
+}

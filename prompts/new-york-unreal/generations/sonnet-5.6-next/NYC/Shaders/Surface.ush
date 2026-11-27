@@ -1,0 +1,206 @@
+// Walls, trim, metal and props: world-aligned texture set + grime + weather.
+#pragma once
+#include "/NYC/Common.ush"
+
+// nearest broken stone: x = distance to its centre, y = its own random number
+float2 NycStones(float2 p)
+{
+	float2 i = floor(p), f = frac(p);
+	float best = 8.0, id = 0.0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+	{
+		[unroll] for (int x = -1; x <= 1; ++x)
+		{
+			float2 g = float2(x, y);
+			float2 d = g + float2(NycHash21(i + g + 3.7), NycHash21(i + g + 17.3)) - f;
+			float dd = dot(d, d);
+			if (dd < best) { best = dd; id = NycHash21(i + g + 41.9); }
+		}
+	}
+	return float2(sqrt(best), id);
+}
+
+// Colour and relief of the inside of a wall.  kind 1: brick and lime mortar, 2: concrete, 3: old plaster.
+void NycBroken(float kind, float2 q, out float3 colour, out float height)
+{
+	float2 warp = float2(NycValueNoise(q * 9.0), NycValueNoise(q * 9.0 + 31.0)) - 0.5;
+	float grit = NycValueNoise(q * 62.0);
+	float lumps = NycValueNoise(q * 14.0 + warp * 2.0);
+	if (kind < 1.5)
+	{
+		float2 b = (q + warp * 0.045) / float2(0.215, 0.078);
+		b.x += frac(floor(b.y) * 0.5);
+		float2 f = frac(b);
+		float edge = min(min(f.x, 1.0 - f.x) * 2.75, min(f.y, 1.0 - f.y));
+		float joint = 1.0 - smoothstep(0.07, 0.17, edge + (grit - 0.5) * 0.09);
+		float one = NycHash21(floor(b) + 5.1);
+		float3 brick = lerp(float3(0.17, 0.055, 0.032), float3(0.36, 0.155, 0.07), one) * (0.72 + 0.56 * NycValueNoise(q * 33.0));
+		brick = lerp(brick, float3(0.09, 0.05, 0.045), step(0.86, NycHash21(floor(b) + 27.0)) * 0.7);
+		float3 mortar = float3(0.34, 0.30, 0.235) * (0.7 + 0.6 * grit);
+		float stuck = smoothstep(0.55, 0.74, NycValueNoise(q * 4.6 + 5.0) + (grit - 0.5) * 0.18);
+		float cover = saturate(joint + stuck * 0.9);
+		colour = lerp(brick, mortar, cover);
+		height = (1.0 - joint) * 0.45 * (0.5 + one) + stuck * 0.35 + lumps * 0.8 + grit * 0.18;
+	}
+	else if (kind < 2.5)
+	{
+		float2 big = NycStones(q * 26.0 + warp * 1.3);
+		float2 small_ = NycStones(q * 71.0 + warp * 2.0 + 13.0);
+		float stone = 1.0 - smoothstep(0.34, 0.47, big.x + (big.y - 0.5) * 0.22);
+		float chip = 1.0 - smoothstep(0.32, 0.46, small_.x + (small_.y - 0.5) * 0.2);
+		float3 paste = float3(0.30, 0.285, 0.26) * (0.78 + 0.44 * grit) * (0.86 + 0.28 * NycValueNoise(q * 3.1));
+		float3 rock = lerp(lerp(float3(0.13, 0.125, 0.12), float3(0.42, 0.36, 0.27), frac(big.y * 3.7)), float3(0.24, 0.19, 0.15), step(0.72, big.y));
+		colour = lerp(paste, lerp(float3(0.17, 0.165, 0.155), float3(0.38, 0.35, 0.29), small_.y), chip * 0.8);
+		colour = lerp(colour, rock * (0.85 + 0.3 * grit), stone);
+		height = stone * (0.6 - big.x) * 1.2 + chip * 0.18 + lumps * 0.75 + grit * 0.2;
+	}
+	else
+	{
+		float3 chalk = float3(0.56, 0.53, 0.46) * (0.86 + 0.28 * NycValueNoise(q * 2.2)) * (0.93 + 0.14 * grit);
+		float gone = smoothstep(0.6, 0.66, NycValueNoise(q * 1.5 + 11.0) * 0.72 + NycValueNoise(q * 6.4) * 0.28);
+		float3 under = lerp(float3(0.22, 0.09, 0.05), float3(0.3, 0.27, 0.22), step(0.45, NycValueNoise(q * 11.0)));
+		float2 c = q * 2.1 + warp * 1.1;
+		float split_ = (1.0 - smoothstep(0.006, 0.02, abs(NycValueNoise(c) - 0.5))) * step(0.5, NycValueNoise(q * 0.9 + 3.0));
+		colour = lerp(chalk, under, gone) * (1.0 - 0.5 * split_);
+		height = (1.0 - gone) * 0.55 + grit * 0.1 + lumps * 0.22 - split_ * 0.2;
+	}
+}
+
+float3 NycSurfaceMain(
+	float3 WP, float3 VN, float3 CamPos, float4 VCol, float3 InstTint, float2 Tag,
+	Texture2D AlbedoTex, SamplerState AlbedoS, Texture2D NormalTex, SamplerState NormalS,
+	Texture2D RhaTex, SamplerState RhaS, Texture2D GrimeTex, SamplerState GrimeS,
+	Texture2D NoiseTex, SamplerState NoiseS, Texture2D SnowNTex, SamplerState SnowNS,
+	Texture2D CoverTex, SamplerState CoverS,
+	float2 TileSize, float3 Tint, float AlbedoMix, float RoughMul, float RoughAdd, float MetalIn,
+	float NormalStrength, float GrimeAmt, float Porosity, float SpecIn, float EmissiveNits, float3 EmissiveColor, float NightOnly, float SnowScale, float Core,
+	float Wetness, float Snow, float SimTime, float Night,
+	out float Roughness, out float3 Normal, out float Metallic, out float Specular, out float3 Emissive, out float OutAO)
+{
+	float3 N = normalize(VN);
+	float2 uv_m; float3 T, B;
+	NycBoxFrame(WP, N, uv_m, T, B);
+	float fp = NycFootprint(WP, CamPos, N);
+	float2 uv = uv_m / max(TileSize, 0.01);
+	float fpuv = fp / max(TileSize.x, 0.01);
+
+	float3 albedo = NycSample(AlbedoTex, AlbedoS, uv, fpuv).rgb;
+	float4 rha = NycSample(RhaTex, RhaS, uv, fpuv);
+	float3 nts = NycUnpackNormal(NycSample(NormalTex, NormalS, uv, fpuv));
+	nts.xy *= NormalStrength;
+	// AlbedoMix < 1 flattens the texture toward the tint (painted metal, flat trim)
+	float3 base = lerp(float3(0.5, 0.5, 0.5), albedo, AlbedoMix) * Tint * InstTint * lerp(1.0, 2.0, 1.0 - AlbedoMix);
+
+	float4 grime = NycSample(GrimeTex, GrimeS, uv_m * float2(0.16, 0.11), fp * 0.16);
+	float4 big = NycSampleMip(NoiseTex, NoiseS, uv_m * 0.037, fp * 0.037);
+	float4 mid = NycSampleMip(NoiseTex, NoiseS, uv_m * 0.21, fp * 0.21);
+
+	float vertical = saturate(1.0 - abs(N.z));
+	float dirt = GrimeAmt * (grime.r * vertical * 0.55 + grime.g * 0.45 + saturate(big.r - 0.55) * 0.9);
+	// soot builds up near street level and under ledges
+	float low = saturate(1.0 - (WP.z - 15.0) / 420.0) * vertical;
+	dirt += GrimeAmt * low * (0.35 + 0.5 * mid.g);
+	dirt += (1.0 - VCol.r) * 0.7;
+	base *= lerp(float3(1, 1, 1), float3(0.52, 0.49, 0.45), saturate(dirt * 0.85));
+	base *= 0.9 + 0.2 * big.g;
+
+	[branch] if (Core > 0.5)
+	{
+		float3 colour; float h0, hx, hy; float3 spare;
+		float e = max(0.006, fp * 1.2);
+		NycBroken(Core, uv_m, colour, h0);
+		NycBroken(Core, uv_m + float2(e, 0.0), spare, hx);
+		NycBroken(Core, uv_m + float2(0.0, e), spare, hy);
+		float sharp = saturate(1.0 - fp / 0.045);
+		float3 flat_ = Core < 1.5 ? float3(0.25, 0.14, 0.095) : Core < 2.5 ? float3(0.27, 0.25, 0.22) : float3(0.47, 0.42, 0.35);
+		base = lerp(flat_, colour, sharp) * InstTint * (0.55 + 0.45 * lerp(1.0, saturate(0.45 + h0 * 0.62), sharp)) * lerp(float3(1, 1, 1), float3(0.6, 0.57, 0.52), saturate(dirt * 0.6));
+		nts.xy = clamp(float2(h0 - hx, h0 - hy) * (0.014 / e) * NormalStrength, -1.3, 1.3) * sharp;
+		rha.r = 0.93;
+	}
+
+	// ---- weathering --------------------------------------------------------------------------
+	// every building ages differently: its tint seeds a shift in tone and finish
+	float own = frac(dot(InstTint, float3(41.3, 17.9, 29.7)));
+	base *= 1.0 + (frac(own * 7.31) - 0.5) * 0.13;
+	float mineral = saturate(Porosity * 1.8) * (Core > 0.5 ? 0.0 : 1.0);   // stone, brick, concrete, stucco, wood
+	float along = dot(uv_m, float2(1.0, 0.0));
+	float runs = 0.0;
+	if (Tag.y > 0.5)
+	{
+		// the wall under a sill: drip tracks, darker run-off at the sill's two ends, a shadow line of dirt
+		float below = Tag.y - 1.0;
+		float thin = NycValueNoise(float2(along * 14.0, below * 0.7)) * NycValueNoise(float2(along * 37.0, below * 1.9 + 11.0));
+		float track = saturate(thin * 3.4 - 0.75) * exp(-below / 0.75);
+		float ends = smoothstep(0.36, 0.5, abs(Tag.x)) * exp(-below / 1.25) * (0.35 + 0.65 * NycValueNoise(float2(along * 9.0, below * 2.3)));
+		runs = saturate(track * 1.15 + ends * 0.75 + exp(-below / 0.055) * 0.4) * saturate(GrimeAmt * 1.6 + 0.2);
+	}
+	// long rain-wash and rust-water stains wandering down the face
+	float wander = NycValueNoise(float2(along * 1.9 + NycValueNoise(float2(along * 0.4, WP.z * 0.0011)) * 2.0, WP.z * 0.0016));
+	runs = saturate(runs + saturate(wander * 2.6 - 1.72) * vertical * GrimeAmt * (Core > 0.5 ? 0.0 : 1.0) * (0.45 + 0.55 * mid.r) * saturate(1.0 - fp * 9.0));
+	base *= lerp(float3(1, 1, 1), float3(0.5, 0.46, 0.4), runs * 0.8);
+	// splash and grime where the wall meets the pavement
+	float splash = saturate(1.0 - (WP.z - 15.0) / 95.0) * vertical * (0.45 + 0.8 * mid.b) * saturate(GrimeAmt * 1.8);
+	base *= lerp(float3(1, 1, 1), float3(0.46, 0.42, 0.36), saturate(splash * 0.75));
+	float rough = rha.r * RoughMul + RoughAdd + dirt * 0.06 + runs * 0.05 + splash * 0.08 + (frac(own * 13.7) - 0.5) * 0.12 * (1.0 - MetalIn);
+	if (Tag.y < -0.5)
+	{
+		// a chamfered edge: knocked about, paler and smoother than the face
+		base = lerp(base, base * 1.22 + 0.012, 0.55);
+		rough -= 0.07;
+	}
+	float near = saturate(1.0 - fp / 0.006) * mineral;
+	if (near > 0.001)
+	{
+		// hairline cracks where the stone has moved
+		float2 q = uv_m * 1.55 + float2(NycValueNoise(uv_m * 3.1), NycValueNoise(uv_m * 2.7 + 7.0)) * 0.55;
+		float line_ = abs(NycValueNoise(q) - 0.5);
+		float crack = (1.0 - smoothstep(0.004, 0.004 + fp * 2.2, line_)) * smoothstep(0.66, 0.8, NycValueNoise(uv_m * 0.37 + 3.3));
+		base *= 1.0 - 0.45 * crack * near;
+		// pores and grit that catch grazing light
+		float2 g = uv_m * 55.0;
+		float h0 = NycValueNoise(g), hx = NycValueNoise(g + float2(0.5, 0.0)), hy = NycValueNoise(g + float2(0.0, 0.5));
+		nts.xy += float2(h0 - hx, h0 - hy) * 0.55 * near;
+		base *= 1.0 - 0.14 * saturate(0.34 - h0) * 3.0 * near;
+	}
+	// patches where a section has been repaired
+	float2 cell = floor(uv_m / float2(2.3, 1.7));
+	float patched = step(NycHash21(cell + 19.7), 0.035) * mineral * vertical;
+	if (patched > 0.0)
+	{
+		float2 f = frac(uv_m / float2(2.3, 1.7)) - 0.5;
+		float inside = step(abs(f.x), 0.18 + 0.24 * NycHash21(cell + 3.1)) * step(abs(f.y), 0.16 + 0.22 * NycHash21(cell + 8.9));
+		base *= lerp(1.0, 0.84 + 0.34 * NycHash21(cell + 5.5), inside);
+		rough += 0.06 * inside;
+	}
+
+	FNycSurf S;
+	S.Base = base;
+	S.Rough = saturate(rough);
+	// thin metal (frames, rails, mullions) widens its highlight as it shrinks toward a pixel: it cannot sparkle
+	if (MetalIn > 0.2) S.Rough = max(S.Rough, saturate(NycPixelSize(WP, CamPos) / 0.045 - 0.15) * 0.52);
+	S.Spec = SpecIn;
+	S.Metal = MetalIn;
+	S.Normal = normalize(nts.x * T + nts.y * B + nts.z * N);
+
+	float sheltered = (Wetness > 0.001 || Snow > 0.001) ? NycSheltered(CoverTex, CoverS, WP) : 0.0;
+	float upness = saturate(N.z);
+	NycWetSurface(S, Wetness * (1.0 - sheltered), Porosity, upness, saturate(grime.r * 0.8 + mid.r * 0.5));
+
+	float sm = NycSnowMask(Snow * min(SnowScale, 1.0), float3(N.x, N.y, N.z + max(SnowScale - 1.0, 0.0) * 0.45), big.b, mid.a, sheltered);
+	// wind-packed snow clings faintly to rough vertical stone
+	sm = max(sm, saturate(Snow * min(SnowScale, 1.0) - 0.6) * vertical * smoothstep(0.62, 0.8, mid.b) * 0.35 * (1.0 - sheltered));
+	if (sm > 0.001)
+	{
+		float3 sn = NycUnpackNormal(NycSample(SnowNTex, SnowNS, WP.xy * 0.01 / 3.0, fp / 3.0));
+		NycSnowSurface(S, sm, mid.g, normalize(float3(sn.x, sn.y, sn.z)));
+	}
+
+	Roughness = S.Rough;
+	Normal = S.Normal;
+	Metallic = S.Metal;
+	Specular = S.Spec;
+	Emissive = EmissiveColor * EmissiveNits * lerp(1.0, smoothstep(0.4, 0.62, Night), NightOnly);
+	if (NightOnly > 0.5) S.Base *= lerp(1.0, 0.35, smoothstep(0.4, 0.62, Night));
+	OutAO = lerp(1.0, rha.g, 0.8) * VCol.r;
+	return S.Base;
+}

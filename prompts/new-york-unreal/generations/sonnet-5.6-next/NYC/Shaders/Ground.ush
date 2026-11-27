@@ -1,0 +1,289 @@
+// Roadway, road paint and sidewalk.
+// Vertex colour: R = extra darkening, G = closeness to a gutter, B = wheel track, A = paint wear bias.
+#pragma once
+#include "/NYC/Common.ush"
+
+// Puddle mask shared by every ground layer so water lines up across asphalt, paint and kerbs.
+float NycPuddleMask(Texture2D NoiseTex, SamplerState NoiseS, float2 p_m, float fp, float gutter, float puddles, float bias)
+{
+	if (puddles <= 0.001) return 0.0;
+	float a = NycSampleMip(NoiseTex, NoiseS, p_m * 0.021, fp * 0.021).r;
+	float b = NycSampleMip(NoiseTex, NoiseS, p_m * 0.087 + 0.37, fp * 0.087).g;
+	float c = NycSampleMip(NoiseTex, NoiseS, p_m * 0.31 + 0.71, fp * 0.31).b;
+	float h = a * 0.52 + b * 0.33 + c * 0.15 + gutter * gutter * 0.34 + bias;
+	float thr = lerp(0.96, 0.585, saturate(puddles));
+	return smoothstep(thr, thr + 0.028, h);
+}
+
+// dark spots of the first drops, before the surface is uniformly wet
+float NycDropSpots(float2 p_m, float amount, float fp)
+{
+	if (amount <= 0.0 || fp > 0.02) return amount * 0.6;
+	float2 g = floor(p_m / 0.035);
+	float2 h = NycHash22(g);
+	float2 c = (g + 0.2 + 0.6 * h) * 0.035;
+	float present = step(NycHash21(g * 1.37 + 9.0), saturate(amount * 1.25));
+	return present * (1.0 - smoothstep(0.006, 0.015, length(p_m - c)));
+}
+
+void NycGroundWeather(inout FNycSurf S, inout float3 Emis,
+	Texture2D NoiseTex, SamplerState NoiseS, Texture2D SnowNTex, SamplerState SnowNS, Texture2D CoverTex, SamplerState CoverS,
+	float3 WP, float fp, float gutter, float track, float porosity, float puddleBias, float puddleScale,
+	float Wetness, float Puddles, float Rain, float Snow, float SimTime, float trample)
+{
+	float2 p_m = WP.xy * 0.01;
+	float sheltered = (Wetness > 0.001 || Snow > 0.001) ? NycSheltered(CoverTex, CoverS, WP) : 0.0;
+	float open = 1.0 - sheltered;
+	float4 n1 = NycSampleMip(NoiseTex, NoiseS, p_m * 0.12, fp * 0.12);
+
+	float wet = Wetness * lerp(open, 1.0, 0.25 * saturate(Wetness * 2.0 - 1.0));
+	if (wet > 0.001)
+	{
+		float film = saturate(wet * 1.55 - 0.3 - (n1.r - 0.5) * 0.8);
+		float spots = NycDropSpots(p_m, saturate(wet * 2.4), fp) * open;
+		float dark = max(film, spots * 0.85);
+		S.Base *= lerp(1.0, lerp(0.8, 0.46, porosity), dark);
+		float wetRough = lerp(0.085, 0.3, saturate(n1.g * 1.8 - 0.55 + S.Rough * 0.35 - track * 0.35));
+		S.Rough = lerp(S.Rough, wetRough, film);
+		S.Rough = lerp(S.Rough, 0.12, spots * 0.7 * (1.0 - film));
+		S.Spec = lerp(S.Spec, 0.34, film);
+		S.Normal = normalize(lerp(S.Normal, float3(0, 0, 1), film * 0.45));
+
+		float pud = NycPuddleMask(NoiseTex, NoiseS, p_m, fp, gutter, Puddles * puddleScale, puddleBias) * open * saturate(wet * 3.0 - 1.2);
+		float3 flatN = float3(0, 0, 1);
+		float rippleFade = saturate(1.35 - fp / 0.012) * open;
+		if (Rain > 0.01 && rippleFade > 0.001)
+		{
+			float2 rn = NycRipples(p_m, SimTime, Rain) * saturate(Rain * 1.8) * rippleFade;
+			flatN = normalize(float3(-rn * 0.42, 1.0));
+			S.Normal = normalize(S.Normal + float3(-rn * 0.16 * film, 0.0));
+		}
+		else if (Rain > 0.01)
+		{
+			// too far to resolve rings: rain just roughens the water
+			S.Rough = saturate(S.Rough + 0.05 * Rain * film);
+		}
+		S.Base *= lerp(1.0, 0.62, pud);
+		S.Rough = lerp(S.Rough, 0.016 + 0.06 * Rain * (1.0 - rippleFade), pud);
+		S.Spec = lerp(S.Spec, 0.255, pud);
+		S.Normal = normalize(lerp(S.Normal, flatN, pud));
+	}
+
+	if (Snow > 0.001)
+	{
+		float4 n2 = NycSampleMip(NoiseTex, NoiseS, p_m * 0.55 + 0.2, fp * 0.55);
+		float4 n3 = NycSampleMip(NoiseTex, NoiseS, p_m * 0.045 + 0.6, fp * 0.045);
+		float cover = NycSnowMask(Snow, float3(0, 0, 1), saturate(n3.r * 0.6 + n2.g * 0.4 - gutter * 0.12), n2.b, sheltered);
+		// tyres and feet turn it to dark slush
+		float ragged = (n2.r - 0.5) * 0.55;
+		float4 wander = NycSampleMip(NoiseTex, NoiseS, p_m * float2(0.061, 0.047) + 0.31, fp * 0.061);
+		float wob = (wander.r - 0.5) * 1.15 + (wander.b - 0.5) * 0.55;
+		float rut = saturate(smoothstep(0.52, 1.02, track * saturate(0.7 + wob) + ragged * 0.8) * saturate(track * 3.0)
+			+ smoothstep(0.35, 0.8, trample + ragged * 0.7) * saturate(trample * 3.0) * 0.6);
+		float slush = rut * saturate(cover * 1.5);
+		float snowOnly = cover * (1.0 - rut);
+		if (cover > 0.001)
+		{
+			float3 sn = NycUnpackNormal(NycSample(SnowNTex, SnowNS, p_m / 3.0, fp / 3.0));
+			NycSnowSurface(S, snowOnly, n2.g, normalize(sn));
+			float3 slushCol = lerp(float3(0.17, 0.17, 0.175), float3(0.46, 0.47, 0.49), saturate(n2.a * 1.7 - 0.45));
+			S.Base = lerp(S.Base, slushCol, slush * 0.88);
+			S.Rough = lerp(S.Rough, 0.2 + 0.35 * n2.a, slush);
+			S.Spec = lerp(S.Spec, 0.36, slush);
+			S.Normal = normalize(lerp(S.Normal, normalize(float3((n2.rg - 0.5) * 0.5, 1.0)), slush * 0.7));
+		}
+	}
+}
+
+float3 NycRoadMain(
+	float3 WP, float3 VN, float3 CamPos, float4 VCol,
+	Texture2D AlbedoTex, SamplerState AlbedoS, Texture2D NormalTex, SamplerState NormalS,
+	Texture2D RhaTex, SamplerState RhaS, Texture2D GrimeTex, SamplerState GrimeS,
+	Texture2D NoiseTex, SamplerState NoiseS, Texture2D SnowNTex, SamplerState SnowNS,
+	Texture2D CoverTex, SamplerState CoverS,
+	float3 Tint, float PaintMix, float3 PaintColor, float PaintWear,
+	float Wetness, float Puddles, float Rain, float Snow, float SimTime,
+	out float Roughness, out float3 Normal, out float Specular, out float3 Emissive)
+{
+	float2 p_m = WP.xy * 0.01;
+	float fp = NycFootprint(WP, CamPos, float3(0, 0, 1));
+	float2 uv = p_m / 4.0;
+	float3 alb = NycSample(AlbedoTex, AlbedoS, uv, fp / 4.0).rgb;
+	float4 rha = NycSample(RhaTex, RhaS, uv, fp / 4.0);
+	float3 nts = NycUnpackNormal(NycSample(NormalTex, NormalS, uv, fp / 4.0));
+	// second scale hides the 4 m repeat
+	float2 uv2 = float2(p_m.y, -p_m.x) / 13.7;
+	float3 alb2 = NycSample(AlbedoTex, AlbedoS, uv2, fp / 13.7).rgb;
+	alb = lerp(alb, alb2, 0.32);
+
+	float4 big = NycSampleMip(NoiseTex, NoiseS, p_m * 0.0093, fp * 0.0093);
+	float4 mid = NycSampleMip(NoiseTex, NoiseS, p_m * 0.083, fp * 0.083);
+	float3 base = alb * Tint * (0.86 + 0.3 * big.r + 0.12 * (mid.g - 0.5));
+	float rough = rha.r;
+
+	// utility-cut patches: rectangles of newer or older asphalt with a tarred seam
+	float puddleBias = 0.0;
+	for (int k = 0; k < 2; k++)
+	{
+		float2 cellSize = k == 0 ? float2(7.3, 3.9) : float2(2.9, 4.7);
+		float2 q = p_m + float2(k * 3.1, k * 1.7);
+		float2 cell = floor(q / cellSize);
+		float2 f = q - cell * cellSize;
+		float h = NycHash21(cell + k * 57.0);
+		if (h > (k == 0 ? 0.62 : 0.8))
+		{
+			float2 hs = NycHash22(cell * 1.31 + 5.0);
+			float2 hsz = cellSize * (0.16 + 0.3 * hs);
+			float2 ctr = cellSize * 0.5 + (NycHash22(cell * 2.7) - 0.5) * (cellSize - hsz * 2.0);
+			float2 d = abs(f - ctr) - hsz + (mid.ba - 0.5) * 0.09;
+			float sd = max(d.x, d.y);
+			float inside = 1.0 - smoothstep(-0.012, 0.012, sd);
+			float tone = lerp(0.62, 1.28, NycHash21(cell * 3.3 + 1.0));
+			base = lerp(base, base * tone, inside);
+			rough = lerp(rough, rough * (tone < 1.0 ? 0.86 : 1.04), inside);
+			float seam = (1.0 - smoothstep(0.012, 0.035, abs(sd))) * saturate(1.2 - fp / 0.04);
+			base = lerp(base, float3(0.012, 0.012, 0.013), seam * 0.75);
+			rough = lerp(rough, 0.42, seam * 0.7);
+			puddleBias += inside * (tone - 0.95) * -0.05;
+		}
+	}
+
+	float4 gr = NycSample(GrimeTex, GrimeS, p_m / 6.3, fp / 6.3);
+	float4 gr2 = NycSample(GrimeTex, GrimeS, p_m.yx / 17.0 + 0.41, fp / 17.0);
+	float sealed = saturate(gr2.a * 1.3);
+	base = lerp(base, float3(0.011, 0.011, 0.012), sealed * 0.8);
+	rough = lerp(rough, 0.4, sealed * 0.8);
+	base = lerp(base, base * 0.55, gr.a * 0.6);
+
+	float track = VCol.b;
+	float polish = track * (0.55 + 0.6 * mid.r);
+	base *= 1.0 - 0.17 * polish;
+	rough -= 0.1 * polish;
+	// oil drips between the wheel tracks
+	float oil = saturate((gr.g - 0.62) * 3.0) * saturate(mid.b * 2.2 - 1.0);
+	base = lerp(base, base * 0.5, oil * 0.8);
+	rough = lerp(rough, 0.5, oil * 0.7);
+	// gutter grit and dirt
+	base = lerp(base, base * float3(1.12, 1.02, 0.9) * (0.8 + 0.5 * gr.b), VCol.g * VCol.g * 0.7);
+	base *= VCol.r;
+
+	FNycSurf S;
+	S.Spec = 0.5;
+	S.Metal = 0.0;
+	S.Rough = rough;
+	S.Base = base;
+	S.Normal = normalize(float3(nts.xy * 1.0, nts.z));
+
+	if (PaintMix > 0.5)
+	{
+		// thermoplastic paint: worn through first in the wheel tracks and along cracks
+		float4 w1 = NycSample(NoiseTex, NoiseS, p_m * 0.53 + 0.13, fp * 0.53);
+		float4 w2 = NycSample(NoiseTex, NoiseS, p_m * 2.9, fp * 2.9);
+		float wear = PaintWear + track * 0.34 + (1.0 - VCol.a) * 0.4 - 0.12;
+		float v = w1.g * 0.55 + w2.b * 0.3 + rha.b * 0.28 - gr.a * 0.3;
+		float coverage = smoothstep(wear - 0.07, wear + 0.07, v);
+		coverage = lerp(coverage, saturate(1.15 - wear * 1.15), saturate(fp / 0.12));
+		float3 pc = PaintColor * (0.82 + 0.3 * mid.a) * lerp(1.0, 0.68, saturate(gr.g * 1.2 - 0.35) + polish * 0.35);
+		S.Base = lerp(S.Base, pc, coverage);
+		S.Rough = lerp(S.Rough, 0.55, coverage);
+		S.Normal = normalize(lerp(S.Normal, float3(nts.xy * 0.4, 1.0), coverage));
+	}
+
+	Emissive = 0;
+	NycGroundWeather(S, Emissive, NoiseTex, NoiseS, SnowNTex, SnowNS, CoverTex, CoverS,
+		WP, fp, VCol.g, track, PaintMix > 0.5 ? 0.35 : 0.92, puddleBias, 1.0,
+		Wetness, Puddles, Rain, Snow, SimTime, 0.0);
+
+	Roughness = saturate(S.Rough);
+	Normal = S.Normal;
+	Specular = S.Spec;
+	return S.Base;
+}
+
+float3 NycSidewalkMain(
+	float3 WP, float3 VN, float3 CamPos, float4 VCol,
+	Texture2D AlbedoTex, SamplerState AlbedoS, Texture2D NormalTex, SamplerState NormalS,
+	Texture2D RhaTex, SamplerState RhaS, Texture2D GrimeTex, SamplerState GrimeS,
+	Texture2D NoiseTex, SamplerState NoiseS, Texture2D SnowNTex, SamplerState SnowNS,
+	Texture2D CoverTex, SamplerState CoverS, Texture2D GumTex, SamplerState GumS,
+	float3 Tint, float2 TileSize, float GumAmt,
+	float Wetness, float Puddles, float Rain, float Snow, float SimTime,
+	out float Roughness, out float3 Normal, out float Specular, out float3 Emissive)
+{
+	float2 p_m = WP.xy * 0.01;
+	float3 N = normalize(VN);
+	float fp = NycFootprint(WP, CamPos, N);
+	float2 uvw; float3 T, B;
+	NycBoxFrame(WP, N, uvw, T, B);
+	float2 uv = uvw / TileSize;
+	float3 alb = NycSample(AlbedoTex, AlbedoS, uv, fp / TileSize.x).rgb;
+	float4 rha = NycSample(RhaTex, RhaS, uv, fp / TileSize.x);
+	float3 nts = NycUnpackNormal(NycSample(NormalTex, NormalS, uv, fp / TileSize.x));
+
+	// every slab was poured at a different time
+	float2 slab = floor(uvw / 1.524);
+	float tone = 0.86 + 0.26 * NycHash21(slab);
+	float warm = (NycHash21(slab + 31.0) - 0.5) * 0.06;
+	float4 big = NycSampleMip(NoiseTex, NoiseS, p_m * 0.047, fp * 0.047);
+	float4 mid = NycSampleMip(NoiseTex, NoiseS, p_m * 0.39, fp * 0.39);
+	float3 base = alb * Tint * tone * float3(1.0 + warm, 1.0, 1.0 - warm) * (0.84 + 0.32 * big.g);
+
+	float4 gr = NycSample(GrimeTex, GrimeS, p_m / 4.1, fp / 4.1);
+	base = lerp(base, base * float3(0.5, 0.47, 0.43), saturate(gr.g * 1.1 - 0.35) * 0.7);
+	float2 gum1 = NycSample(GumTex, GumS, p_m / 5.1, fp / 5.1).rg;
+	float2 gum2 = NycSample(GumTex, GumS, p_m.yx / 7.7 + 0.33, fp / 7.7).rg;
+	float gumM = saturate(max(gum1.r, gum2.r * 0.8) * 1.35) * GumAmt * saturate(0.35 + big.r * 1.2);
+	base = lerp(base, float3(0.028, 0.026, 0.025), gumM * 0.82);
+	base = lerp(base, float3(0.5, 0.46, 0.36), gum2.g * 0.55 * GumAmt * step(0.55, mid.r));
+	// dirt collects along the kerb
+	base *= 1.0 - 0.3 * VCol.g * (0.4 + mid.g);
+	base *= VCol.r;
+
+	FNycSurf S;
+	S.Spec = 0.45;
+	S.Metal = 0.0;
+	S.Base = base;
+	S.Rough = saturate(rha.r + gumM * -0.2);
+	S.Normal = normalize(nts.x * T + nts.y * B + nts.z * N);
+	Emissive = 0;
+
+	if (N.z > 0.7)
+	{
+		float joint = 1.0 - rha.b;
+		NycGroundWeather(S, Emissive, NoiseTex, NoiseS, SnowNTex, SnowNS, CoverTex, CoverS,
+			WP, fp, VCol.g * 0.35, 0.0, 0.82, saturate(joint * 0.5 - 0.3) * 0.12 - 0.045, 0.82,
+			Wetness, Puddles, Rain, Snow, SimTime, VCol.b);
+		if (Snow > 0.2 && fp < 0.03)
+		{
+			// footprints, thickest along the paths people take
+			float onSnow = saturate((S.Base.g - 0.55) * 6.0);
+			float2 g = floor(p_m / 0.33);
+			float2 h = NycHash22(g);
+			float path = NycSampleMip(NoiseTex, NoiseS, p_m * float2(0.19, 0.13) + 0.57, fp * 0.19).g;
+			if (onSnow > 0.01 && NycHash21(g * 1.73 + 4.0) < saturate((path - 0.42) * 2.6))
+			{
+				float2 d = p_m - (g + 0.3 + 0.4 * h) * 0.33;
+				float ang = NycHash21(g + 11.0) * 0.9 - 0.45 + (NycHash21(floor(p_m / 6.0)) > 0.5 ? 1.5708 : 0.0);
+				float2 r = float2(cos(ang) * d.x + sin(ang) * d.y, -sin(ang) * d.x + cos(ang) * d.y);
+				float e = length(r / float2(0.13, 0.058));
+				float inside = (1.0 - smoothstep(0.78, 1.05, e)) * onSnow;
+				float rim = saturate(1.0 - abs(e - 1.05) * 5.0) * onSnow;
+				S.Base *= 1.0 - 0.24 * inside;
+				S.Base *= 1.0 + 0.04 * rim;
+				float2 slope = (r / float2(0.13, 0.058)) / max(e, 0.01) * rim * 0.35;
+				float2 back = float2(cos(ang) * slope.x - sin(ang) * slope.y, sin(ang) * slope.x + cos(ang) * slope.y);
+				S.Normal = normalize(S.Normal + float3(back, 0.0));
+			}
+		}
+	}
+	else
+	{
+		float sheltered = NycSheltered(CoverTex, CoverS, WP);
+		NycWetSurface(S, Wetness * (1.0 - sheltered), 0.6, 0.2, mid.r);
+	}
+
+	Roughness = saturate(S.Rough);
+	Normal = S.Normal;
+	Specular = S.Spec;
+	return S.Base;
+}

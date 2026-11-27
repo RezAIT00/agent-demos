@@ -1,0 +1,145 @@
+// Craters and floodwater.
+#pragma once
+#include "/NYC/Common.ush"
+
+float NycCraterFloor(Texture3D Vol, SamplerState S, float2 p, float edge, float Radius, float Depth, float Seed)
+{
+	float r = length(p) / (Radius * edge);
+	if (r >= 1.0) return 0.0;
+	float n = Vol.SampleLevel(S, float3(p * 0.0037 + Seed, Seed * 0.37), 0).r;
+	float n2 = Vol.SampleLevel(S, float3(p * 0.0129 - Seed, 0.5), 0).g;
+	float bowl = -Depth * pow(saturate(1.0 - r * r), 0.8);
+	return bowl + ((n - 0.55) * 0.55 + (n2 - 0.5) * 0.18) * Depth * saturate(1.6 - r * 1.5);
+}
+
+float NycCraterEdge(Texture3D Vol, SamplerState S, float2 p, float Seed)
+{
+	float2 d = normalize(p + 0.001);
+	float n = Vol.SampleLevel(S, float3(d * 0.9 + Seed * 0.13, Seed * 0.71), 0).r;
+	float n2 = Vol.SampleLevel(S, float3(d * 3.1 - Seed * 0.29, 0.21), 0).g;
+	return 0.86 + (n - 0.55) * 0.42 + (n2 - 0.5) * 0.16;
+}
+
+float3 NycCraterMain(float3 WP, float3 CamPos, float3 Centre, float Radius, float Depth, float Seed, float Heat, float SimTime,
+	float PixelDepth, Texture3D Vol, SamplerState VolS, float3 SunColor, float SunLux, float Wetness, float Snow,
+	out float Roughness, out float3 Normal, out float3 Emissive, out float Mask, out float Offset)
+{
+	float2 p = WP.xy - Centre.xy;
+	float dist = length(p);
+	float edge = NycCraterEdge(Vol, VolS, p, Seed);
+	float rn = dist / (Radius * edge);
+	float3 D = WP - CamPos;
+	float len = length(D);
+	float3 V = D / max(len, 1.0);
+
+	// cracks and spoil radiate over the paving outside the hole
+	float2 dir = p / max(dist, 1.0);
+	float crack = Vol.SampleLevel(VolS, float3(dir * 5.3 + Seed, dist / Radius * 0.34), 0).r;
+	float rays = saturate(1.0 - abs(crack - 0.55) * 22.0);
+	float spoil = Vol.SampleLevel(VolS, float3(p * 0.011 + Seed, 0.7), 0).g;
+	float outer = saturate((1.55 - rn) * 2.0);
+
+	float3 base;
+	float3 N = float3(0, 0, 1);
+	float t = 0.0;
+	float depthHit = 0.0;
+	if (rn < 1.0)
+	{
+		float vz = max(-V.z, 0.12);
+		float span = Depth * 1.5 / vz;
+		float dt = span / 40.0;
+		float2 q = p;
+		float z = 0.0;
+		bool hit = false;
+		for (int i = 1; i <= 40; i++)
+		{
+			t = dt * i;
+			q = p + V.xy * t;
+			z = V.z * t;
+			float fz = NycCraterFloor(Vol, VolS, q, edge, Radius, Depth, Seed);
+			if (z <= fz)
+			{
+				float lo = t - dt, hi = t;
+				for (int k = 0; k < 5; k++)
+				{
+					float mid = (lo + hi) * 0.5;
+					float2 qm = p + V.xy * mid;
+					if (V.z * mid <= NycCraterFloor(Vol, VolS, qm, edge, Radius, Depth, Seed)) hi = mid; else lo = mid;
+				}
+				t = hi;
+				q = p + V.xy * t;
+				hit = true;
+				break;
+			}
+		}
+		const float e = max(Radius * 0.012, 3.0);
+		float f0 = NycCraterFloor(Vol, VolS, q, edge, Radius, Depth, Seed);
+		float fx = NycCraterFloor(Vol, VolS, q + float2(e, 0), edge, Radius, Depth, Seed);
+		float fy = NycCraterFloor(Vol, VolS, q + float2(0, e), edge, Radius, Depth, Seed);
+		N = normalize(float3(f0 - fx, f0 - fy, e));
+		depthHit = saturate(-f0 / max(Depth, 1.0));
+		float stones = Vol.SampleLevel(VolS, float3(q * 0.021, Seed), 0).g;
+		float strata = frac((f0 + spoil * 20.0) / 31.0);
+		base = lerp(float3(0.078, 0.052, 0.033), float3(0.135, 0.105, 0.075), stones);
+		// the cut edge shows the layers of the road: asphalt, then concrete, then fill
+		if (-f0 < Depth * 0.1 + 9.0) base = float3(0.028, 0.027, 0.027);
+		else if (-f0 < Depth * 0.1 + 31.0) base = float3(0.22, 0.2, 0.17) * (0.7 + 0.5 * stones);
+		base *= 0.82 + 0.3 * strata;
+		base *= lerp(1.0, 0.45, depthHit * Heat);
+	}
+	else
+	{
+		float lip = saturate(1.0 - (rn - 1.0) * 5.0);
+		base = lerp(float3(0.05, 0.049, 0.048), float3(0.12, 0.095, 0.07), saturate(spoil * 1.7 - 0.55));
+		base = lerp(base, float3(0.012, 0.012, 0.012), rays * 0.85);
+		base *= 1.0 - 0.55 * Heat * saturate(1.5 - rn);
+		N = normalize(float3(-dir * lip * 0.45 + (spoil - 0.5) * 0.4, 1.0));
+	}
+	float scatter = saturate(spoil * 3.2 - 1.9 + (1.35 - rn) * 0.85);
+	Mask = rn < 1.04 ? 1.0 : step(0.5, max(scatter * outer, rays * saturate((1.9 - rn) * 1.3)));
+	Roughness = lerp(0.92, 0.35, Wetness);
+	Normal = N;
+	float ember = saturate(Vol.SampleLevel(VolS, float3(p * 0.0065, Seed + SimTime * 0.012), 0).r * 4.0 - 2.55) * depthHit;
+	Emissive = float3(1.0, 0.24, 0.02) * ember * Heat * 9000.0;
+	if (Snow > 0.2 && rn > 1.12) base = lerp(base, float3(0.7, 0.72, 0.76), saturate((rn - 1.12) * 3.0) * Snow);
+	Offset = rn < 1.0 ? t * PixelDepth / max(len, 1.0) : 0.0;
+	return base;
+}
+
+float3 NycFloodOffset(float3 WP, float3 VN, float SimTime, float Foam, Texture3D Vol, SamplerState S)
+{
+	float3 p = WP * 0.0016;
+	float n = Vol.SampleLevel(S, float3(p.xy * 0.6 + float2(SimTime * 0.31, 0.0), p.z * 0.4 - SimTime * 0.23), 0).r;
+	float n2 = Vol.SampleLevel(S, float3(p.yx * 1.7 - float2(0.0, SimTime * 0.47), p.z - SimTime * 0.4), 0).g;
+	// the broad sheet only ripples; the breaking wave heaves
+	float amp = 7.0 + 150.0 * saturate(Foam - 0.15);
+	return VN * ((n - 0.56) * amp + (n2 - 0.5) * amp * 0.45);
+}
+
+float3 NycFloodMain(float3 WP, float3 CamPos, float SimTime, float Foam, Texture3D Vol, SamplerState S,
+	out float Roughness, out float3 Normal, out float Specular)
+{
+	float2 p = WP.xy * 0.01;
+	float dist = length(WP - CamPos);
+	// filter the noise by distance, or it turns into a mosaic
+	float lod = clamp(log2(max(dist, 1.0) / 1400.0), 0.0, 4.0);
+	float e = 0.12 + dist * 0.00003;
+	float2 flow = float2(SimTime * 0.9, SimTime * 0.37);
+	#define NYC_H(q) (Vol.SampleLevel(S, float3((q) * 0.085 + flow * 0.085, WP.z * 0.0006), lod).r + 0.28 * Vol.SampleLevel(S, float3((q) * 0.29 - flow * 0.13, 0.3 + SimTime * 0.05), lod).g)
+	float h = NYC_H(p);
+	float hx = NYC_H(p + float2(e, 0));
+	float hy = NYC_H(p + float2(0, e));
+	// foam in drifting streaks drawn out along the flow
+	float2 sp = float2(p.x * 0.11 + p.y * 0.016, p.y * 0.027 - p.x * 0.012) + flow * 0.05;
+	float f1 = Vol.SampleLevel(S, float3(sp, 0.12 + SimTime * 0.03), lod).r;
+	float f2 = Vol.SampleLevel(S, float3(p * 0.23 - flow * 0.16, SimTime * 0.17), lod).g;
+	float foam = saturate((f1 * 1.5 + f2 * 0.7 - 1.45 + Foam * 0.95) * 1.5);
+	foam *= foam * 0.4 + 0.6;
+	Normal = normalize(float3((h - hx) * 1.5, (h - hy) * 1.5, 1.0));
+	Normal = normalize(lerp(Normal, float3(0, 0, 1), foam * 0.6));
+	Roughness = lerp(0.09 + saturate(dist / 30000.0) * 0.2, 0.75, foam);
+	Specular = lerp(0.4, 0.2, foam);
+	float silt = Vol.SampleLevel(S, float3(p * 0.05 + flow * 0.02, 0.6), lod).r;
+	float3 mud = lerp(float3(0.07, 0.052, 0.031), float3(0.115, 0.09, 0.056), saturate(silt * 2.0 - 0.6));
+	return lerp(mud, float3(0.52, 0.49, 0.42), foam);
+}

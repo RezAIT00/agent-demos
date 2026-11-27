@@ -1,0 +1,253 @@
+// Distant buildings, the far ground, rivers, signs and small emitters.
+#pragma once
+#include "/NYC/Common.ush"
+
+// box-filtered periodic pulse: fraction of [t - w/2, t + w/2] covered by [a, b] in every unit cell
+float NycPulse(float t, float a, float b, float w)
+{
+	w = max(w, 1e-4);
+	float t0 = t - w * 0.5, t1 = t + w * 0.5;
+	float i0 = floor(t0) * (b - a) + clamp(frac(t0) - a, 0.0, b - a);
+	float i1 = floor(t1) * (b - a) + clamp(frac(t1) - a, 0.0, b - a);
+	return saturate((i1 - i0) / w);
+}
+
+struct FNycFarStyle { float3 Wall; float2 Cell; float2 Win; float3 Glass; float Reflect; float Office; float WallRough; };
+
+FNycFarStyle NycFarStyle(float s)
+{
+	FNycFarStyle o;
+	o.Wall = float3(0.42, 0.37, 0.29); o.Cell = float2(2.4, 3.6); o.Win = float2(0.5, 0.56); o.Glass = float3(0.04, 0.05, 0.055); o.Reflect = 0.05; o.Office = 0.7; o.WallRough = 0.8;
+	if (s > 0.5 && s < 1.5) { o.Wall = float3(0.38, 0.27, 0.15); o.Cell = float2(2.2, 3.4); o.Win = float2(0.5, 0.55); o.Office = 0.5; }
+	else if (s > 1.5 && s < 2.5) { o.Wall = float3(0.22, 0.075, 0.048); o.Cell = float2(2.3, 3.15); o.Win = float2(0.46, 0.55); o.Office = 0.05; }
+	else if (s > 2.5 && s < 3.5) { o.Wall = float3(0.13, 0.073, 0.047); o.Cell = float2(2.1, 3.2); o.Win = float2(0.46, 0.56); o.Office = 0.05; }
+	else if (s > 3.5 && s < 4.5) { o.Wall = float3(0.5, 0.48, 0.43); o.Cell = float2(3.1, 3.1); o.Win = float2(0.7, 0.5); o.Office = 0.1; }
+	else if (s > 4.5 && s < 5.5) { o.Wall = float3(0.25, 0.28, 0.31); o.Cell = float2(1.5, 3.95); o.Win = float2(0.95, 0.74); o.Glass = float3(0.2, 0.34, 0.46); o.Reflect = 0.46; o.Office = 1.0; o.WallRough = 0.35; }
+	else if (s > 5.5 && s < 6.5) { o.Wall = float3(0.05, 0.055, 0.062); o.Cell = float2(1.5, 3.95); o.Win = float2(0.95, 0.76); o.Glass = float3(0.11, 0.135, 0.17); o.Reflect = 0.34; o.Office = 1.0; o.WallRough = 0.35; }
+	else if (s > 6.5 && s < 7.5) { o.Wall = float3(0.16, 0.2, 0.18); o.Cell = float2(1.6, 3.9); o.Win = float2(0.94, 0.72); o.Glass = float3(0.2, 0.38, 0.33); o.Reflect = 0.4; o.Office = 1.0; o.WallRough = 0.4; }
+	else if (s > 7.5 && s < 8.5) { o.Wall = float3(0.27, 0.26, 0.235); o.Cell = float2(3.0, 3.65); o.Win = float2(0.98, 0.48); o.Office = 0.8; }
+	else if (s > 8.5) { o.Wall = float3(0.025, 0.025, 0.028); o.Cell = float2(1.45, 3.9); o.Win = float2(0.8, 0.78); o.Glass = float3(0.06, 0.07, 0.085); o.Reflect = 0.3; o.Office = 1.0; o.WallRough = 0.3; }
+	return o;
+}
+
+float3 NycFarFacadeMain(
+	float3 WP, float3 VN, float3 CamPos, float PicStyle, float PicVar, float PicSeedA, float PicSeedB,
+	Texture2D NoiseTex, SamplerState NoiseS,
+	float UseInstance, float3 WallIn, float4 CellWin, float3 GlassIn, float ReflectIn, float OfficeIn, float WallRoughIn, float CrownZ, float CrownNits,
+	float Wetness, float Snow, float Night, float LitOffice, float LitHome, float InteriorDay,
+	out float Roughness, out float3 Normal, out float Metallic, out float Specular, out float3 Emissive)
+{
+	float3 N = normalize(VN);
+	FNycFarStyle st;
+	if (UseInstance > 0.5)
+	{
+		st = NycFarStyle(floor(PicStyle + 0.5));
+		st.Wall *= 0.78 + 0.46 * PicVar;
+		st.Cell *= float2(0.9 + 0.25 * PicSeedA, 0.95 + 0.1 * PicSeedB);
+	}
+	else
+	{
+		st.Wall = WallIn; st.Cell = CellWin.xy; st.Win = CellWin.zw; st.Glass = GlassIn; st.Reflect = ReflectIn; st.Office = OfficeIn; st.WallRough = WallRoughIn;
+	}
+	float3 P = WP * 0.01;
+	float fp = NycFootprint(WP, CamPos, N) * 1.35;
+	Normal = N;
+	Specular = 0.45;
+
+	if (abs(N.z) > 0.55)
+	{
+		float4 n = NycSampleMip(NoiseTex, NoiseS, P.xy * 0.06 + PicSeedA, fp * 0.06);
+		float3 roof = lerp(float3(0.045, 0.043, 0.042), float3(0.16, 0.15, 0.135), saturate(n.r * 1.8 - 0.5 + PicVar * 0.4 - 0.2));
+		roof *= 0.85 + 0.3 * n.b;
+		Roughness = 0.88 - 0.55 * Wetness * saturate(n.g * 2.0 - 0.6);
+		Metallic = 0;
+		Emissive = 0;
+		roof *= 1.0 - 0.35 * Wetness;
+		if (Snow > 0.001)
+		{
+			float m = saturate(Snow * 1.5 - (n.g - 0.35));
+			roof = lerp(roof, float3(0.78, 0.8, 0.84), m);
+			Roughness = lerp(Roughness, 0.62, m);
+		}
+		return roof;
+	}
+
+	// axis-aligned or tilted facade: u along the wall, v up
+	float2 tang = normalize(float2(-N.y, N.x) + float2(1e-5, 0));
+	float u = dot(P.xy, tang);
+	float v = P.z;
+	float2 cellUV = float2(u, v) / st.Cell;
+	float2 id = floor(cellUV);
+	// one pixel's footprint on the wall: an ellipse stretched by 1/cos along the view's tangential direction,
+	// so a wall seen almost edge-on is filtered over the many windows each pixel really covers
+	float3 D = normalize(WP - CamPos);
+	float cosN = max(abs(dot(D, N)), 0.012);
+	float2 tv = float2(dot(D.xy, tang), D.z);
+	float2 th = tv / max(length(tv), 1e-4);
+	float2 wm = NycPixelSize(WP, CamPos) * 1.15 * sqrt(th * th / (cosN * cosN) + th.yx * th.yx);
+	float2 w = wm / st.Cell;
+	float2 a = 0.5 - st.Win * 0.5, b = 0.5 + st.Win * 0.5;
+	float opening = NycPulse(cellUV.x, a.x, b.x, w.x) * NycPulse(cellUV.y, a.y, b.y, w.y);
+	// punched windows are set back: seen obliquely, the reveal hides the glass (curtain walls are nearly flush)
+	float recess = lerp(0.3, 0.025, saturate((st.Win.x - 0.6) / 0.32));
+	float2 winM = st.Win * st.Cell;
+	float visible = saturate(1.0 - recess * abs(tv.x) / cosN / winM.x) * saturate(1.0 - recess * 0.5 * abs(tv.y) / cosN / winM.y);
+	float cover = opening * visible;
+	float reveal = opening - cover;
+	// ground floors are brighter and glazed
+	float ground = 1.0 - smoothstep(4.0, 5.5, v);
+
+	float seed = PicSeedB * 57.0 + dot(float2(N.x, N.y), float2(3.1, 7.7));
+	float h1 = NycHash21(id + seed);
+	float h2 = NycHash21(id * 1.7 + seed * 2.3);
+	float hFloor = NycHash21(float2(id.y, seed));
+	float hRoom = NycHash21(floor(float2(id.x / 3.0, id.y)) + seed * 5.0);
+	float litFrac = lerp(LitHome * 0.75, LitOffice * 0.6, st.Office);
+	float floorGain = st.Office > 0.5 ? (hFloor < 0.3 ? 1.9 : 0.55) : 1.0;
+	float lit = step(lerp(h1, hRoom, st.Office * 0.75), saturate(litFrac * floorGain * (0.55 + 0.9 * PicSeedA)));
+	float3 warm = lerp(float3(1.0, 0.62, 0.3), float3(1.0, 0.82, 0.6), h2);
+	float3 cool = lerp(float3(0.88, 0.94, 0.95), float3(1.0, 0.82, 0.56), step(0.52, h2));
+	float3 lamp = lerp(warm, cool, step(0.5, st.Office));
+	float variety = NycHash21(id * 3.9 + seed);
+	float nits = (st.Office > 0.5 ? 27.0 : 21.0) * (0.1 + 2.1 * variety * variety);
+	// fade per-window variation into its average once windows approach a pixel
+	float far = saturate(max(w.x, w.y) * 1.7 - 0.55);
+	float3 litCol = lamp * nits * lit;
+	float3 avgLit = lerp(float3(1.0, 0.7, 0.4), float3(1.0, 0.84, 0.64), step(0.5, st.Office)) * (st.Office > 0.5 ? 21.0 : 17.0) * saturate(litFrac * floorGain * (0.55 + 0.9 * PicSeedA)) ;
+	float3 room = lerp(litCol, avgLit, far);
+	// blinds and furniture suggestion inside each pane
+	float2 f = frac(cellUV);
+	float blind = step(b.y - (b.y - a.y) * h2 * 0.65, f.y);
+	room *= lerp(lerp(1.0, 0.55 + 0.45 * step(0.35, f.y), 1.0 - far), 0.7, blind * (1.0 - far));
+	room += InteriorDay * 0.16 * float3(0.8, 0.88, 1.0) * lerp(0.5 + h1, 1.0, far);
+
+	float cosv = saturate(dot(-D, N));
+	float fres = 0.04 + 0.96 * pow(1.0 - cosv, 5.0);
+
+	float4 grime = NycSampleMip(NoiseTex, NoiseS, float2(u * 0.021, v * 0.013), fp * 0.021);
+	float3 wall = st.Wall * (0.8 + 0.4 * grime.r);
+	wall *= 1.0 - 0.25 * saturate((30.0 - v) / 30.0);
+	// a belt course or crown every so often gives distant walls some relief
+	wall *= 1.0 + 0.25 * NycPulse(v / (st.Cell.y * 9.0), 0.0, 0.035, fp / (st.Cell.y * 9.0)) * (1.0 - st.Reflect);
+
+	float3 glassBase = lerp(float3(0.015, 0.018, 0.022), st.Glass * 0.62, saturate(st.Reflect * 1.35));
+	// every pane reflects a little differently
+	float3 tint = glassBase * lerp(0.8 + 0.4 * h2, 1.0, far);
+	float3 wallWet = wall * (1.0 - 0.3 * Wetness);
+	float3 base = wallWet * (1.0 - opening) + wallWet * 0.62 * reveal + tint * cover;
+	// what glass is still seen almost edge-on is also rougher: no mirror slivers a pixel wide
+	float paneRough = max(0.07 + 0.1 * far, 0.34 * saturate(1.0 - cosN / 0.24));
+	Roughness = lerp(st.WallRough - 0.3 * Wetness, paneRough, cover);
+	Metallic = cover * st.Reflect;
+	float2 tilt = (NycHash22(id + seed * 3.0) - 0.5) * 0.018 * (1.0 - far) * cover;
+	Normal = normalize(N + float3(tang * tilt.x, tilt.y));
+	Emissive = cover * room * (1.0 - fres) * (1.0 - st.Reflect * 0.6) * lerp(1.0, 0.75, st.Reflect);
+	Emissive += ground * cover * float3(1.0, 0.8, 0.55) * 140.0 * smoothstep(0.35, 0.7, Night);
+	if (CrownNits > 0.0 && v > CrownZ)
+	{
+		Emissive += float3(0.85, 0.92, 1.0) * CrownNits * smoothstep(0.4, 0.65, Night) * (1.0 - cover * 0.5);
+	}
+	if (Snow > 0.5)
+	{
+		base = lerp(base, float3(0.7, 0.73, 0.78), saturate(Snow - 0.7) * 0.25 * (1.0 - cover) * smoothstep(0.55, 0.75, grime.g));
+	}
+	return base;
+}
+
+// ------------------------------------------------------------------ ground far from the camera
+float3 NycFarGroundMain(float3 WP, float3 CamPos, Texture2D NoiseTex, SamplerState NoiseS, float Grid,
+	float Wetness, float Snow, float Night, out float Roughness, out float3 Emissive)
+{
+	float2 p = WP.xy * 0.01;
+	float fp = NycFootprint(WP, CamPos, float3(0, 0, 1)) * 1.5;
+	float4 n = NycSampleMip(NoiseTex, NoiseS, p * 0.004, fp * 0.004);
+	float4 n2 = NycSampleMip(NoiseTex, NoiseS, p * 0.031, fp * 0.031);
+	float2 g = p;
+	float2 pitch = float2(80.4, 156.0);
+	if (Grid < 0.5)
+	{
+		float c = cos(0.34), s = sin(0.34);
+		g = float2(p.x * c - p.y * s, p.x * s + p.y * c);
+		pitch = float2(92.0, 188.0);
+	}
+	float roadX = NycPulse(g.x / pitch.x + 0.5, 0.5 - 7.0 / pitch.x, 0.5 + 7.0 / pitch.x, fp / pitch.x);
+	float roadY = NycPulse(g.y / pitch.y + 0.5, 0.5 - 11.0 / pitch.y, 0.5 + 11.0 / pitch.y, fp / pitch.y);
+	float road = saturate(roadX + roadY);
+	float3 lots = lerp(float3(0.05, 0.048, 0.045), float3(0.11, 0.1, 0.085), n2.g) * (0.8 + 0.4 * n.b);
+	float3 base = lerp(lots, float3(0.035, 0.036, 0.038), road);
+	Roughness = lerp(0.9, lerp(0.8, 0.22, Wetness), road);
+	if (Snow > 0.001)
+	{
+		float m = saturate(Snow * 1.4 - (n2.r - 0.4));
+		base = lerp(base, lerp(float3(0.74, 0.76, 0.8), float3(0.2, 0.2, 0.21), road * 0.75), m);
+	}
+	float night = smoothstep(0.4, 0.65, Night);
+	// strings of street lamps and shopfront spill, box-filtered so they never sparkle
+	float lampsX = roadX * NycPulse(g.y / 28.0, 0.42, 0.58, fp / 28.0);
+	float lampsY = roadY * NycPulse(g.x / 28.0, 0.42, 0.58, fp / 28.0);
+	float3 lampCol = lerp(float3(1.0, 0.66, 0.32), float3(1.0, 0.84, 0.62), step(0.5, n2.a));
+	float4 n3 = NycSampleMip(NoiseTex, NoiseS, p * 0.0017 + 0.4, fp * 0.0017);
+	float patchy = saturate(n3.r * 2.6 - 0.75) + 0.15;
+	Emissive = night * lampCol * (saturate(lampsX + lampsY) * 26.0 + road * 2.2 + (1.0 - road) * saturate(n2.r * 3.0 - 1.9) * 7.0) * (0.2 + 1.5 * n2.b) * patchy;
+	return base;
+}
+
+float3 NycWaterMain(float3 WP, float3 CamPos, Texture2D WaveTex, SamplerState WaveS, float SimTime, float Wind, float Rain, out float Roughness, out float3 Normal, out float Specular)
+{
+	float2 p = WP.xy * 0.01;
+	float fp = NycFootprint(WP, CamPos, float3(0, 0, 1));
+	float3 n1 = NycUnpackNormal(NycSample(WaveTex, WaveS, p / 38.0 + float2(0.011, 0.006) * SimTime, fp / 38.0));
+	float3 n2 = NycUnpackNormal(NycSample(WaveTex, WaveS, p.yx / 11.0 - float2(0.027, 0.014) * SimTime, fp / 11.0));
+	float fade = saturate(1.0 - fp / 6.0);
+	float2 slope = (n1.xy * 0.55 + n2.xy * 0.3) * (0.28 + Wind) * (0.25 + 0.75 * fade);
+	Normal = normalize(float3(slope, 1.0));
+	Roughness = saturate(0.09 + 0.12 * Wind + 0.22 * (1.0 - fade) + 0.1 * Rain);
+	Specular = 0.255;
+	return float3(0.012, 0.019, 0.022);
+}
+
+// ------------------------------------------------------------------ signs and small emitters
+float3 NycSignMain(float2 UV, float Cell, float Glow, float2 Grid, Texture2D Atlas, SamplerState AtlasS, float3 WP, float3 CamPos, float3 VN,
+	float DayNits, float NightNits, float Night, float Wetness, float Snow, out float3 Emissive, out float Roughness)
+{
+	float cols = max(Grid.x, 1.0), rows = max(Grid.y, 1.0);
+	float idx = floor(Cell + 0.5);
+	float2 cell = float2(fmod(idx, cols), fmod(floor(idx / cols), rows));
+	float2 uv = (cell + clamp(UV, 0.004, 0.996)) / float2(cols, rows);
+	float fp = NycFootprint(WP, CamPos, normalize(VN));
+	float3 c = NycSample(Atlas, AtlasS, uv, fp / (cols * 2.0)).rgb;
+	float n = smoothstep(0.3, 0.62, Night);
+	Emissive = c * lerp(DayNits, NightNits * max(Glow, 0.05), n);
+	Roughness = lerp(0.42, 0.12, Wetness);
+	return c * 0.82;
+}
+
+float3 NycGhostMain(float2 UV, float Cell, float3 WP, float3 CamPos, float3 VN,
+	Texture2D Atlas, SamplerState AtlasS, Texture2D BrickTex, SamplerState BrickS, Texture2D NoiseTex, SamplerState NoiseS,
+	float Wetness, out float Roughness)
+{
+	float idx = floor(Cell + 0.5);
+	float2 cell = float2(fmod(idx, 2.0), floor(idx / 2.0));
+	float2 uv = (cell + clamp(UV, 0.003, 0.997)) / float2(2.0, 4.0);
+	float2 uvm; float3 T, B;
+	float3 N = normalize(VN);
+	NycBoxFrame(WP, N, uvm, T, B);
+	float fp = NycFootprint(WP, CamPos, N);
+	float3 brick = NycSample(BrickTex, BrickS, uvm / float2(2.13, 2.16), fp / 2.13).rgb;
+	float4 paint = NycSample(Atlas, AtlasS, uv, fp * 0.2);
+	float4 g = NycSampleMip(NoiseTex, NoiseS, uvm * 0.17, fp * 0.17);
+	float cover = saturate(paint.a * (0.75 + 0.5 * g.g));
+	Roughness = 0.86 - 0.4 * Wetness;
+	return lerp(brick * 0.9, paint.rgb * (0.65 + 0.5 * brick.r), cover * 0.88) * (1.0 - 0.3 * Wetness);
+}
+
+float3 NycPedSignalMain(float2 UV, float State, float Count, Texture2D Atlas, SamplerState AtlasS, out float3 Emissive)
+{
+	// State: 0 steady hand, 1 walking figure, 2 flashing hand with countdown
+	float idx = State < 0.5 ? 0.0 : (State < 1.5 ? 1.0 : clamp(floor(Count + 0.5), 0.0, 13.0) + 2.0);
+	float2 cell = float2(fmod(idx, 4.0), floor(idx / 4.0));
+	float2 uv = (cell + clamp(UV, 0.01, 0.99)) / 4.0;
+	float3 c = Atlas.SampleLevel(AtlasS, uv, 0.5).rgb;
+	Emissive = c * 900.0;
+	return float3(0.012, 0.012, 0.012);
+}

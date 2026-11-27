@@ -1,0 +1,89 @@
+// Car paint, glass, lamps and the walking animation for distant pedestrians.
+#pragma once
+#include "/NYC/Common.ush"
+
+// droplet normals in the vehicle's own space so they travel with the car
+float3 NycBeadNormal(float3 LP, float3 LN, float3 WN, Texture2D Drops, SamplerState DropsS, float amount, float scale)
+{
+	float3 a = abs(LN);
+	float2 uv = a.z > a.x && a.z > a.y ? LP.xy : (a.x > a.y ? LP.yz : LP.xz);
+	float4 d = Drops.SampleLevel(DropsS, uv * 0.01 * scale, 1.0);
+	float m = smoothstep(0.05, 0.4, d.b) * amount;
+	float2 n = (d.rg * 2.0 - 1.0) * m * 0.6;
+	float3 t = normalize(cross(WN, float3(0, 0, 1)) + float3(1e-4, 0, 0));
+	float3 bt = cross(WN, t);
+	return normalize(WN + t * n.x + bt * n.y);
+}
+
+float3 NycCarPaintMain(
+	float3 WP, float3 VN, float3 CamPos, float3 LP, float3 LN, float3 Color, float SnowScale,
+	Texture2D Drops, SamplerState DropsS, Texture2D NoiseTex, SamplerState NoiseS,
+	float Wetness, float Rain, float Snow, float Metal, float BaseRough,
+	out float Roughness, out float3 Normal, out float Metallic, out float Specular)
+{
+	float3 N = normalize(VN);
+	float fp = NycFootprint(WP, CamPos, N);
+	float4 n = NycSampleMip(NoiseTex, NoiseS, (LP.xz + LP.y) * 0.006, fp * 0.6);
+	float dirt = saturate((70.0 - WP.z) / 55.0) * (0.3 + 0.7 * n.g) * (1.0 + Wetness * 0.6);
+	dirt += saturate(n.b - 0.62) * 0.25;
+	// thrown-up road film: streaks swept back along the lower body
+	float swept = NycValueNoise(float2(LP.x * 0.045 + LP.y * 0.02, LP.z * 0.21)) * NycValueNoise(float2(LP.x * 0.13, LP.z * 0.55 + 5.0));
+	dirt += saturate((115.0 - WP.z) / 90.0) * saturate(swept * 3.0 - 0.7) * 0.55;
+	// the clear coat is not one even mirror: polish haze, fine swirls and dust
+	float haze = NycValueNoise(LP.xy * 0.06 + LP.z * 0.047) * 0.65 + NycValueNoise(LP.xz * 0.31) * 0.35;
+	float lum = dot(Color, float3(0.3, 0.59, 0.11));
+	float3 base = lerp(Color, float3(0.07, 0.062, 0.052), saturate(dirt) * 0.62);
+	// metallic finishes sparkle only on greys and deep colours; fleet yellow is solid
+	float metal = Metal * saturate(1.2 - abs(Color.r - Color.b) * 2.2);
+	Metallic = metal * (1.0 - saturate(dirt));
+	Roughness = lerp(BaseRough * (0.72 + 0.75 * haze) + saturate(haze - 0.68) * 0.25, 0.62, saturate(dirt));
+	Specular = 0.55;
+	Normal = N;
+	if (Wetness > 0.01)
+	{
+		Roughness = lerp(Roughness, 0.06, Wetness * 0.8);
+		base *= lerp(1.0, 0.86, Wetness * (1.0 - metal));
+		float beads = Wetness * saturate(Rain * 2.5 + 0.25) * saturate(1.2 - fp / 0.012);
+		if (beads > 0.01) Normal = NycBeadNormal(LP, normalize(LN), N, Drops, DropsS, beads, 2.6);
+	}
+	float s = Snow * SnowScale;
+	if (s > 0.01)
+	{
+		float mask = smoothstep(0.55, 0.82, LN.z + (n.a - 0.5) * 0.35) * saturate(s * 2.2 - (n.r - 0.35));
+		base = lerp(base, float3(0.8, 0.83, 0.87), mask);
+		Roughness = lerp(Roughness, 0.6, mask);
+		Metallic *= 1.0 - mask;
+		Specular = lerp(Specular, 0.3, mask);
+		Normal = normalize(lerp(Normal, normalize(N + float3((n.gb - 0.5) * 0.35, 0.0)), mask));
+	}
+	return base;
+}
+
+// parked cars keep a soft cap of snow with some thickness to it
+float3 NycCarSnowOffset(float3 LN, float3 WN, float3 WP, float Snow, float SnowScale)
+{
+	float s = Snow * SnowScale;
+	if (s <= 0.05 || LN.z < 0.55) return 0;
+	float bump = NycValueNoise(WP.xy * 0.09) * 0.7 + NycValueNoise(WP.xy * 0.23) * 0.3;
+	return float3(0, 0, 1) * smoothstep(0.55, 0.9, LN.z) * saturate(s * 1.5 - 0.3) * (3.0 + 4.5 * bump);
+}
+
+float3 NycWalkOffset(float4 VCol, float2 UV1, float Phase, float Speed, float SimTime)
+{
+	// VCol.r: 0 body, 0.2 left leg, 0.4 right leg, 0.6 left arm, 0.8 right arm
+	float code = floor(VCol.r * 5.0 + 0.5);
+	float moving = saturate(Speed * 2.0);
+	float w = (SimTime * Speed / 1.45 + Phase) * 6.2831853;
+	float3 off = float3(0, 0, abs(cos(w)) * 3.2 * moving);
+	if (code < 0.5) return off;
+	float sgn = (code == 1.0 || code == 4.0) ? 1.0 : -1.0;
+	float amp = code < 2.5 ? 0.46 : 0.34;
+	float ang = sin(w) * amp * sgn * moving;
+	float x = UV1.x, z = UV1.y;
+	// knees: the trailing lower leg folds a little further back
+	if (code < 2.5 && z < -0.42) ang += -max(0.0, -cos(w) * sgn) * 0.55 * saturate((-0.42 - z) * 3.0) * moving;
+	float c = cos(ang), s = sin(ang);
+	off.x += (x * c - z * s - x) * 100.0;
+	off.z += (x * s + z * c - z) * 100.0;
+	return off;
+}

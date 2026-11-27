@@ -1,0 +1,71 @@
+{
+ "nyc_destruction.mp4": {
+  "size_mb": 525.5,
+  "video": "h264 3840x2160 yuv420p 24/1 fps",
+  "video_mbit": 49.9,
+  "audio": "aac 48000 Hz 2 ch 310 kbit/s",
+  "frames": 2009,
+  "video_seconds": 83.708,
+  "audio_seconds": 83.708,
+  "decode_errors": "",
+  "faststart": true,
+  "lufs": -14.2,
+  "true_peak_dbtp": -1.7,
+  "clipped_samples": 0,
+  "pass": true
+ },
+ "nyc_destruction_x.mp4": {
+  "size_mb": 108.5,
+  "video": "h264 1920x1080 yuv420p 24/1 fps",
+  "video_mbit": 10.05,
+  "audio": "aac 48000 Hz 2 ch 310 kbit/s",
+  "frames": 2009,
+  "video_seconds": 83.708,
+  "audio_seconds": 83.708,
+  "decode_errors": "",
+  "faststart": true,
+  "lufs": -14.2,
+  "true_peak_dbtp": -1.7,
+  "clipped_samples": 0,
+  "pass": true
+ },
+ "flash_and_flicker": {
+  "frames": 2009,
+  "seconds": 83.71,
+  "whole_frame_flashes": 0,
+  "worst_flashes_in_one_second": 1,
+  "worst_window_frame": 297,
+  "worst_region": "r00",
+  "flash_limit_ok": true,
+  "single_frame_pops": [],
+  "unexplained_jumps": [
+   [
+    173,
+    0.0202
+   ]
+  ],
+  "worst_local_flicker": [
+   [
+    304,
+    10.6
+   ],
+   [
+    305,
+    10.33
+   ],
+   [
+    306,
+    9.56
+   ],
+   [
+    303,
+    7.73
+   ],
+   [
+    492,
+    7.11
+   ]
+  ]
+ },
+ "all_pass": true
+}

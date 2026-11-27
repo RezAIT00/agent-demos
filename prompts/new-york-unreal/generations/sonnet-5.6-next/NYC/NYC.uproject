@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "Midtown Manhattan, 5th Avenue and 42nd Street, generated entirely from code.",
+	"Modules": [
+		{ "Name": "NYC", "Type": "Runtime", "LoadingPhase": "PostConfigInit" }
+	],
+	"Plugins": [
+		{ "Name": "PythonScriptPlugin", "Enabled": true },
+		{ "Name": "EditorScriptingUtilities", "Enabled": true },
+		{ "Name": "SequencerScripting", "Enabled": true },
+		{ "Name": "MovieRenderPipeline", "Enabled": true },
+		{ "Name": "ProceduralMeshComponent", "Enabled": true },
+		{ "Name": "ChaosCaching", "Enabled": true },
+		{ "Name": "Niagara", "Enabled": true },
+		{ "Name": "ModelingToolsEditorMode", "Enabled": false }
+	]
+}

@@ -1,0 +1,170 @@
+// Shared HLSL for the NYC materials.  World positions are centimetres, "metres" suffixed _m.
+// No screen-space derivatives are used outside pixel shaders: these materials are also evaluated
+// at ray hits by Lumen.
+#pragma once
+
+// ------------------------------------------------------------------ hashing / noise
+float NycHash11(float n) { n = frac(n * 0.1031); n *= n + 33.33; n *= n + n; return frac(n); }
+float NycHash21(float2 p) { float3 q = frac(float3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return frac((q.x + q.y) * q.z); }
+float2 NycHash22(float2 p) { float3 q = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973)); q += dot(q, q.yzx + 33.33); return frac((q.xx + q.yz) * q.zy); }
+float3 NycHash31(float n) { float3 q = frac(n * float3(0.1031, 0.1030, 0.0973)); q += dot(q, q.yzx + 33.33); return frac((q.xxy + q.yzz) * q.zyx); }
+
+float NycValueNoise(float2 p)
+{
+	float2 i = floor(p), f = frac(p);
+	f = f * f * (3.0 - 2.0 * f);
+	return lerp(lerp(NycHash21(i), NycHash21(i + float2(1, 0)), f.x),
+	            lerp(NycHash21(i + float2(0, 1)), NycHash21(i + float2(1, 1)), f.x), f.y);
+}
+
+// Approximate size of one 4K pixel on a surface, in metres (analytic, so it also works at ray hits).
+// metres covered by one pixel at this distance, for the resolution actually being rendered
+float NycPixelSize(float3 WP, float3 CamPos)
+{
+	float angle = 2.0 / max(View.ViewSizeAndInvSize.x * View.ViewToClip[0][0], 1.0);
+	return length(WP - CamPos) * 0.01 * clamp(angle, 0.0001, 0.004);
+}
+
+float NycFootprint(float3 WP, float3 CamPos, float3 N)
+{
+	float3 D = WP - CamPos;
+	float dist = length(D) * 0.01;
+	float c = max(abs(dot(D / max(length(D), 1.0), N)), 0.12);
+	return dist * 0.00042 / c;
+}
+
+float4 NycSample(Texture2D Tex, SamplerState S, float2 uv, float footprintUV)
+{
+#if PIXELSHADER
+	return Tex.Sample(S, uv);
+#else
+	float w, h;
+	Tex.GetDimensions(w, h);
+	return Tex.SampleLevel(S, uv, max(0.0, log2(footprintUV * w)));
+#endif
+}
+
+float4 NycSampleMip(Texture2D Tex, SamplerState S, float2 uv, float footprintUV)
+{
+	float w, h;
+	Tex.GetDimensions(w, h);
+	return Tex.SampleLevel(S, uv, max(0.0, log2(max(footprintUV * w, 1.0))));
+}
+
+float3 NycUnpackNormal(float4 s)
+{
+	float2 xy = s.rg * 2.0 - 1.0;
+	return float3(xy, sqrt(saturate(1.0 - dot(xy, xy))));
+}
+
+// ------------------------------------------------------------------ box mapping
+// UVs in metres plus the matching tangent frame, chosen from the face normal.
+void NycBoxFrame(float3 WP, float3 N, out float2 uv_m, out float3 T, out float3 B)
+{
+	float3 P = WP * 0.01;
+	float3 a = abs(N);
+	if (a.z >= a.x && a.z >= a.y)
+	{
+		uv_m = P.xy; T = float3(1, 0, 0); B = float3(0, 1, 0);
+	}
+	else if (a.x >= a.y)
+	{
+		float s = N.x > 0 ? 1.0 : -1.0;
+		uv_m = float2(P.y * s, -P.z); T = float3(0, s, 0); B = float3(0, 0, -1);
+	}
+	else
+	{
+		float s = N.y > 0 ? -1.0 : 1.0;
+		uv_m = float2(P.x * s, -P.z); T = float3(s, 0, 0); B = float3(0, 0, -1);
+	}
+	T = normalize(T - N * dot(T, N));
+	B = normalize(B - N * dot(B, N));
+}
+
+// ------------------------------------------------------------------ shelter map
+// R = height (m / 64) of whatever covers a spot: sheds, awnings, overpasses.
+#define NYC_COVER_ORIGIN float2(-72000.0, -52000.0)
+#define NYC_COVER_SIZE 128000.0
+float NycSheltered(Texture2D Cover, SamplerState S, float3 WP)
+{
+	float2 uv = (WP.yx - NYC_COVER_ORIGIN.yx) / NYC_COVER_SIZE;
+	if (any(uv < 0.0) || any(uv > 1.0)) return 0.0;
+	float h = Cover.SampleLevel(S, uv, 0).r * 6400.0;
+	return saturate((h - WP.z - 12.0) / 25.0);
+}
+
+// ------------------------------------------------------------------ rain ripples
+float2 NycRippleLayer(float2 p, float t, float cell, float seed)
+{
+	float2 g = floor(p / cell);
+	float2 n = 0;
+	for (int j = -1; j <= 1; j++)
+	for (int i = -1; i <= 1; i++)
+	{
+		float2 c = g + float2(i, j);
+		float2 h = NycHash22(c + seed);
+		float rate = 1.1 + 0.9 * NycHash21(c * 1.7 + seed);
+		float tt = t * rate + h.x * 7.0;
+		float cyc = floor(tt);
+		float ph = frac(tt);
+		float2 ctr = (c + NycHash22(c + cyc * 0.37 + seed)) * cell;
+		float2 d = p - ctr;
+		float r = length(d);
+		float R = ph * cell * 0.95;
+		float x = (r - R) / (cell * 0.07);
+		if (abs(x) < 3.0)
+		{
+			float amp = (1.0 - ph) * (1.0 - ph) * exp(-x * x * 0.7);
+			n += (d / max(r, 0.001)) * sin(x * 3.1) * amp;
+		}
+	}
+	return n;
+}
+
+float2 NycRipples(float2 p_m, float t, float rain)
+{
+	float2 n = NycRippleLayer(p_m, t, 0.23, 3.1);
+	n += NycRippleLayer(p_m + 11.7, t * 1.13, 0.31, 17.3) * saturate(rain * 2.0 - 0.3);
+	n += NycRippleLayer(p_m * 1.07 + 5.3, t * 0.93, 0.17, 41.9) * saturate(rain * 2.0 - 0.9);
+	return n;
+}
+
+// ------------------------------------------------------------------ weather on ordinary surfaces
+struct FNycSurf
+{
+	float3 Base;
+	float3 Normal;
+	float Rough;
+	float Spec;
+	float Metal;
+};
+
+void NycWetSurface(inout FNycSurf S, float wet, float porosity, float upness, float streak)
+{
+	if (wet <= 0.001) return;
+	// walls only catch part of the rain, and unevenly
+	float w = wet * saturate(lerp(0.35 + 0.65 * streak, 1.15, saturate(upness * 2.0)));
+	w = saturate(w);
+	S.Base *= lerp(1.0, lerp(0.86, 0.42, porosity), w);
+	S.Rough = lerp(S.Rough, lerp(0.2, 0.34, porosity) * (0.7 + 0.5 * (1.0 - upness)), w * 0.85);
+	S.Spec = lerp(S.Spec, 0.35, w);
+}
+
+float NycSnowMask(float snow, float3 N, float noiseA, float noiseB, float sheltered)
+{
+	if (snow <= 0.001) return 0.0;
+	float up = smoothstep(0.45, 0.86, N.z + (noiseB - 0.5) * 0.35);
+	float grow = saturate(snow * 1.75 - (noiseA - 0.3) * 0.75 - (noiseB - 0.5) * 0.18);
+	return smoothstep(0.0, 0.92, grow) * up * (1.0 - sheltered);
+}
+
+void NycSnowSurface(inout FNycSurf S, float mask, float noiseB, float3 snowN)
+{
+	if (mask <= 0.001) return;
+	float3 col = lerp(float3(0.74, 0.77, 0.82), float3(0.86, 0.87, 0.89), noiseB);
+	S.Base = lerp(S.Base, col, mask);
+	S.Rough = lerp(S.Rough, 0.58, mask);
+	S.Spec = lerp(S.Spec, 0.3, mask);
+	S.Metal *= 1.0 - mask;
+	S.Normal = normalize(lerp(S.Normal, snowN, mask));
+}

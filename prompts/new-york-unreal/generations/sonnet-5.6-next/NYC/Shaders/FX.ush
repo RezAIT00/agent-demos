@@ -1,0 +1,272 @@
+// GPU-driven precipitation, splashes, drips, steam and spray.  Everything is a function of the
+// shot clock and the camera position, so Movie Render Queue sub-frames agree with each other.
+#pragma once
+#include "/NYC/Common.ush"
+
+#define NYC_FX_ARGS float4 P0, float4 C0, float4 D0, float4 P1, float4 C1, float4 D1, float4 P2, float4 C2, float4 D2, float4 P3, float4 C3, float4 D3, \
+	float4 P4, float4 C4, float4 D4, float4 P5, float4 C5, float4 D5, float4 P6, float4 C6, float4 D6, float4 P7, float4 C7, float4 D7, \
+	float4 P8, float4 C8, float4 D8, float4 P9, float4 C9, float4 D9, float4 P10, float4 C10, float4 D10, float4 P11, float4 C11, float4 D11, \
+	float4 P12, float4 C12, float4 D12, float4 P13, float4 C13, float4 D13, float4 P14, float4 C14, float4 D14, float4 P15, float4 C15, float4 D15
+#define NYC_FX_PASS P0, C0, D0, P1, C1, D1, P2, C2, D2, P3, C3, D3, P4, C4, D4, P5, C5, D5, P6, C6, D6, P7, C7, D7, P8, C8, D8, P9, C9, D9, \
+	P10, C10, D10, P11, C11, D11, P12, C12, D12, P13, C13, D13, P14, C14, D14, P15, C15, D15
+
+float NycHG(float c, float g) { return (1.0 - g * g) / (12.566 * pow(max(1.0 + g * g - 2.0 * g * c, 1e-3), 1.5)); }
+
+// light scattered toward the camera by a small particle at P (cm); result in cd/m2 per unit albedo
+float3 NycFxScatterOne(float3 P, float3 V, float4 LP, float4 LC, float4 LD, float g)
+{
+	if (LP.w <= 0.0) return 0;
+	float3 d = P - LP.xyz;
+	float r2 = dot(d, d) * 1e-4;
+	float rad = max(LC.w * 0.01, 1.0);
+	float win = saturate(1.0 - r2 / (rad * rad));
+	if (win <= 0.0) return 0;
+	float3 dir = d / max(length(d), 1.0);
+	float spot = 1.0;
+	if (LD.w > -0.5) spot = smoothstep(LD.w - 0.04, lerp(LD.w, 1.0, 0.45), dot(dir, LD.xyz));
+	float irr = LP.w / (r2 + 0.45) * win * win * spot;
+	float ph = NycHG(dot(dir, V), g) * 0.82 + 0.018;
+	return LC.rgb * irr * ph;
+}
+
+float3 NycFxScatter(float3 P, float3 V, float g, NYC_FX_ARGS)
+{
+	float3 L = 0;
+	L += NycFxScatterOne(P, V, P0, C0, D0, g); L += NycFxScatterOne(P, V, P1, C1, D1, g);
+	L += NycFxScatterOne(P, V, P2, C2, D2, g); L += NycFxScatterOne(P, V, P3, C3, D3, g);
+	L += NycFxScatterOne(P, V, P4, C4, D4, g); L += NycFxScatterOne(P, V, P5, C5, D5, g);
+	L += NycFxScatterOne(P, V, P6, C6, D6, g); L += NycFxScatterOne(P, V, P7, C7, D7, g);
+	L += NycFxScatterOne(P, V, P8, C8, D8, g); L += NycFxScatterOne(P, V, P9, C9, D9, g);
+	L += NycFxScatterOne(P, V, P10, C10, D10, g); L += NycFxScatterOne(P, V, P11, C11, D11, g);
+	L += NycFxScatterOne(P, V, P12, C12, D12, g); L += NycFxScatterOne(P, V, P13, C13, D13, g);
+	L += NycFxScatterOne(P, V, P14, C14, D14, g); L += NycFxScatterOne(P, V, P15, C15, D15, g);
+	return L;
+}
+
+float NycGroundZ(Texture2D Mask, SamplerState S, float3 WP)
+{
+	float2 uv = (WP.yx - NYC_COVER_ORIGIN.yx) / NYC_COVER_SIZE;
+	if (any(uv < 0.0) || any(uv > 1.0)) return 0.0;
+	return Mask.SampleLevel(S, uv, 0).r > 0.5 ? 15.5 : 0.5;
+}
+
+// wrap a particle into the box that travels with the camera while staying fixed in the world
+float3 NycWrap(float3 seed01, float3 box, float3 cam, float3 drift)
+{
+	float3 lo = cam - box * 0.5;
+	float3 p = seed01 * box + drift;
+	return lo + frac((p - lo) / box) * box;
+}
+
+// ------------------------------------------------------------------ rain
+// UV0: quad corner.  UV1.x: random, VCol.rgb: seed position, VCol.a: layer (1 = lens layer)
+float3 NycRainOffset(float3 WP, float3 CamPos, float2 UV, float2 Rnd, float4 Seed, float Rain, float NearRain, float Wind, float SimTime,
+	Texture2D Cover, SamplerState CoverS, float3 Seed3)
+{
+	float lens = step(0.5, Rnd.y);
+	float amount = lens > 0.5 ? Rain * NearRain : Rain;
+	if (Rnd.x > saturate(amount)) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 box = lens > 0.5 ? float3(1100, 1100, 700) : float3(4200, 4200, 2600);
+	float speed = 880.0 + 240.0 * frac(Rnd.x * 17.3);
+	float gust = 0.65 + 0.35 * sin(SimTime * 0.9 + Seed3.x * 3.0) + 0.2 * sin(SimTime * 2.3 + Seed3.y * 11.0);
+	float3 vel = float3(0.35 * Wind * 640.0 * gust, 0.94 * Wind * 640.0 * gust, -speed);
+	float3 p = NycWrap(Seed3, box, CamPos, vel * SimTime);
+	float3 axis = normalize(vel);
+	float3 toCam = CamPos - p;
+	float dist = length(toCam);
+	float3 side = normalize(cross(axis, toCam / max(dist, 1.0)));
+	// streak length is what a 1/100 s exposure would record; temporal samples add the rest
+	float len = (lens > 0.5 ? 5.0 : 11.0) * (0.45 + 1.3 * frac(Rnd.x * 31.7) * frac(Rnd.x * 57.3) + 0.35 * frac(Rnd.x * 13.1));
+	float width = max(lens > 0.5 ? 0.12 : 0.2, dist * 0.0005);
+	float fade = saturate((dist - (lens > 0.5 ? 130.0 : 45.0)) / 90.0);
+	// drops under cover never reach there
+	float sheltered = NycSheltered(Cover, CoverS, p);
+	if (sheltered > 0.5 || fade <= 0.0 || p.z < 2.0) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 target = p + axis * (UV.y - 0.5) * len + side * (UV.x - 0.5) * width;
+	return target - WP;
+}
+
+float4 NycRainColor(float3 WP, float3 CamPos, float2 UV, float3 FogColor, float Flash, float3 FlashPos, NYC_FX_ARGS)
+{
+	float3 V = normalize(CamPos - WP);
+	float3 L = NycFxScatter(WP, V, 0.8, NYC_FX_PASS) * 4.2;
+	float3 ambient = FogColor * 0.9 + 0.12;
+	float3 flashDir = normalize(FlashPos - WP);
+	float fl = Flash * (4.0 + 26.0 * pow(saturate(dot(-V, flashDir)), 4.0));
+	float3 col = ambient + L + float3(0.75, 0.8, 1.0) * fl;
+	float across = 1.0 - abs(UV.x - 0.5) * 2.0;
+	float along = saturate(UV.y * 3.0) * saturate((1.0 - UV.y) * 1.6);
+	float dist = length(CamPos - WP);
+	float vary = 0.35 + 0.9 * NycHash21(floor(WP.xy * 0.07) + floor(WP.z * 0.013));
+	float alpha = across * along * 0.3 * vary * saturate(1.1 - dist / 2600.0);
+	return float4(col, alpha);
+}
+
+// ------------------------------------------------------------------ snow
+float3 NycSnowOffset(float3 WP, float3 CamPos, float2 UV, float2 Rnd, float SnowFall, float Wind, float SimTime, Texture2D Cover, SamplerState CoverS, float3 Seed3)
+{
+	float lens = step(0.5, Rnd.y);
+	if (Rnd.x > saturate(SnowFall * (lens > 0.5 ? 0.8 : 1.0))) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 box = lens > 0.5 ? float3(1200, 1200, 800) : float3(4600, 4600, 2600);
+	float speed = 72.0 + 60.0 * frac(Rnd.x * 17.3);
+	float3 vel = float3(0.35 * Wind * 150.0, 0.94 * Wind * 150.0, -speed);
+	float3 p = NycWrap(Seed3, box, CamPos, vel * SimTime);
+	float a = Seed3.x * 40.0, b = Seed3.y * 53.0;
+	p.xy += float2(sin(SimTime * (0.7 + frac(a)) + a) + 0.5 * sin(SimTime * 1.9 + b), cos(SimTime * (0.6 + frac(b)) + b) + 0.5 * cos(SimTime * 2.3 + a)) * 16.0;
+	if (NycSheltered(Cover, CoverS, p) > 0.5 || p.z < 3.0) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 toCam = CamPos - p;
+	float dist = length(toCam);
+	if (dist < 55.0) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 f = toCam / dist;
+	float3 right = normalize(cross(float3(0, 0, 1), f));
+	float3 up = cross(f, right);
+	float size = max(1.5 + 2.9 * frac(Rnd.x * 7.7) * frac(Rnd.x * 3.1), dist * 0.0021);
+	return p + right * (UV.x - 0.5) * size + up * (UV.y - 0.5) * size - WP;
+}
+
+float4 NycSnowColor(float3 WP, float3 CamPos, float2 UV, float3 FogColor, float Flash, NYC_FX_ARGS)
+{
+	float3 V = normalize(CamPos - WP);
+	float3 L = NycFxScatter(WP, V, 0.35, NYC_FX_PASS) * 4.2;
+	float3 col = FogColor * 1.6 + 0.9 + L + Flash * 40.0;
+	float r = length(UV - 0.5) * 2.0;
+	float alpha = saturate(1.15 - r * r) * 0.92 * saturate(1.15 - length(CamPos - WP) / 3000.0);
+	return float4(col, alpha);
+}
+
+// ------------------------------------------------------------------ splashes: a crown ring and a few thrown droplets
+// Seed3.xy: cell index in a square grid around the camera, UV1.x: 0 ring, 1 droplet column
+float3 NycSplashOffset(float3 WP, float3 CamPos, float2 UV, float2 Kind, float3 Seed3, float Rain, float SimTime,
+	Texture2D Cover, SamplerState CoverS, Texture2D Mask, SamplerState MaskS, out float Age)
+{
+	const float cell = 34.0;
+	const float cells = 84.0;
+	float2 idx = floor(Seed3.xy * cells);
+	float2 span = float2(cell, cell) * cells;
+	float2 lo = floor((CamPos.xy - span * 0.5) / cell);
+	float2 worldCell = lo + frac((idx - lo) / cells) * cells;
+	worldCell = floor(worldCell + 0.5);
+	float h0 = NycHash21(worldCell);
+	float rate = 2.2 + 1.4 * h0;
+	float tt = SimTime * rate + h0 * 13.0;
+	float cyc = floor(tt);
+	Age = frac(tt) * 2.4;
+	float2 jitter = NycHash22(worldCell + cyc * 0.173);
+	float3 p = float3((worldCell + jitter) * cell, 0);
+	bool alive = Age < 1.0 && NycHash21(worldCell * 1.7 + cyc) < Rain * 0.85;
+	p.z = NycGroundZ(Mask, MaskS, p) + 0.6;
+	if (!alive || NycSheltered(Cover, CoverS, p) > 0.4 || length(p - CamPos) > 1700.0) { Age = 1.0; return -WP + CamPos - float3(0, 0, 100000.0); }
+	float3 target;
+	if (Kind.x < 0.5)
+	{
+		float rad = 0.5 + 3.4 * sqrt(Age);
+		target = p + float3((UV - 0.5) * rad * 2.0, 0.2);
+	}
+	else
+	{
+		float3 toCam = normalize(CamPos - p);
+		float3 right = normalize(cross(float3(0, 0, 1), toCam));
+		float hgt = 6.5 * sin(Age * 3.14159) * (0.6 + 0.8 * jitter.x);
+		float w = 1.6 + 4.0 * Age;
+		target = p + right * (UV.x - 0.5) * w + float3(0, 0, (1.0 - UV.y) * hgt);
+	}
+	return target - WP;
+}
+
+float4 NycSplashColor(float3 WP, float3 CamPos, float2 UV, float2 Kind, float Age, float3 FogColor, float Flash, NYC_FX_ARGS)
+{
+	float3 V = normalize(CamPos - WP);
+	float3 col = FogColor * 1.1 + NycFxScatter(WP, V, 0.62, NYC_FX_PASS) * 3.0 + Flash * 26.0;
+	float alpha;
+	if (Kind.x < 0.5)
+	{
+		float r = length(UV - 0.5) * 2.0;
+		alpha = smoothstep(0.55, 0.82, r) * (1.0 - smoothstep(0.86, 1.0, r)) * (1.0 - Age) * 0.5;
+	}
+	else
+	{
+		// a handful of droplets on their own little arcs
+		alpha = 0.0;
+		float2 seed = floor(WP.xy / 34.0);
+		for (int k = 0; k < 4; k++)
+		{
+			float2 h = NycHash22(seed + k * 7.31);
+			float side = (h.x - 0.5) * 1.5 * sqrt(Age);
+			float rise = 4.0 * Age * (1.0 - Age) * (0.25 + 0.7 * h.y);
+			float2 d = (UV - float2(0.5 + side * 0.6, 0.96 - rise)) * float2(1.0, 1.6);
+			alpha = max(alpha, 1.0 - smoothstep(0.025, 0.075, length(d)));
+		}
+		alpha *= (1.0 - Age) * 0.55;
+	}
+	return float4(col, alpha);
+}
+
+// ------------------------------------------------------------------ drips from awnings and sheds
+// the mesh vertex sits at the ledge; UV1 = (random, ledge height cm)
+float3 NycDripOffset(float3 WP, float3 CamPos, float2 UV, float2 Rnd, float Wetness, float SimTime, Texture2D Mask, SamplerState MaskS, out float Fall)
+{
+	float3 base = WP - float3((UV.x - 0.5) * 2.0, 0.0, (UV.y - 0.5) * 2.0);
+	float period = 0.8 + 1.9 * frac(Rnd.x * 7.13);
+	float t = frac(SimTime / period + Rnd.x * 11.0) * period;
+	float ground = NycGroundZ(Mask, MaskS, base);
+	float drop = 490.0 * t * t;
+	Fall = t;
+	float z = base.z - drop;
+	if (z < ground || Rnd.x > Wetness * 1.1 || length(base - CamPos) > 3500.0) return -WP + CamPos - float3(0, 0, 100000.0);
+	float3 p = float3(base.xy, z);
+	float3 toCam = normalize(CamPos - p);
+	float3 right = normalize(cross(float3(0, 0, 1), toCam));
+	float stretch = 1.2 + min(980.0 * t, 600.0) * 0.012;
+	float w = max(0.55, length(CamPos - p) * 0.0006);
+	return p + right * (UV.x - 0.5) * w + float3(0, 0, (0.5 - UV.y) * stretch) - WP;
+}
+
+// ------------------------------------------------------------------ steam
+// vertex at the source; UV1 = (puff index 0..1, strength), VCol = random
+float3 NycSteamOffset(float3 WP, float3 CamPos, float2 UV, float2 Puff, float4 Rnd, float Wind, float SimTime, float Temp, out float Age, out float Spin)
+{
+	float life = 3.6 + Rnd.r * 1.8;
+	Age = frac(SimTime / life + Puff.x + Rnd.g * 0.07);
+	float strength = Puff.y;
+	float3 p = WP;
+	float rise = (240.0 * strength + 60.0) * Age * (1.45 - 0.45 * Age);
+	p.z += rise;
+	float lean = Wind * 260.0 * Age * Age + 18.0 * Age;
+	p.xy += float2(0.35, 0.94) * lean;
+	p.xy += float2(sin(Age * 7.0 + Rnd.b * 20.0), cos(Age * 6.0 + Rnd.a * 20.0)) * (8.0 + 34.0 * Age) * strength;
+	p.xy += (Rnd.gb - 0.5) * (14.0 + 60.0 * Age);
+	float size = (16.0 + 118.0 * pow(Age, 0.75)) * (0.55 + 0.55 * strength) * (0.75 + 0.5 * Rnd.a);
+	float3 f = normalize(CamPos - p);
+	float3 right = normalize(cross(float3(0, 0, 1), f));
+	float3 up = cross(f, right);
+	Spin = Rnd.r * 6.28 + Age * (Rnd.g - 0.5) * 2.4;
+	float c = cos(Spin), s = sin(Spin);
+	float2 q = UV - 0.5;
+	q = float2(q.x * c - q.y * s, q.x * s + q.y * c);
+	return p + (right * q.x + up * q.y) * size - WP;
+}
+
+float4 NycSteamColor(float3 WP, float3 CamPos, float2 UV, float Age, float2 Puff, float4 Rnd, Texture2D NoiseTex, SamplerState NoiseS,
+	float3 FogColor, float SunLux, float3 SunColor, float Flash, NYC_FX_ARGS)
+{
+	float2 q = (UV - 0.5) * 2.0;
+	float4 n = NoiseTex.SampleLevel(NoiseS, UV * 0.55 + Rnd.rg * 7.0 + float2(0.0, -Age * 0.22), 1.0);
+	float4 n2 = NoiseTex.SampleLevel(NoiseS, UV * 1.3 + Rnd.ba * 5.0 + Age * 0.3, 1.0);
+	float r = length(q) + (n.g - 0.5) * 0.75 + (n2.b - 0.5) * 0.35;
+	float body = saturate(1.0 - smoothstep(0.25, 0.98, r));
+	float alpha = body * saturate((n.r - 0.28) * 2.1) * saturate(Age * 9.0) * pow(1.0 - Age, 1.5) * 0.5 * saturate(0.55 + Puff.y * 0.5);
+	float3 V = normalize(CamPos - WP);
+	float3 col = FogColor * 1.1 + SunColor * SunLux * 0.045 + NycFxScatter(WP, V, 0.5, NYC_FX_PASS) * 2.1 + Flash * 34.0;
+	col *= 0.82 + 0.36 * n2.r;
+	return float4(col, alpha);
+}
+
+// ------------------------------------------------------------------ tyre spray, in the vehicle's space
+float3 NycSprayOffset(float3 LocalBase, float2 UV, float2 Rnd, float Amount, float Speed, float SimTime, float3 Right, float3 Up, out float Age)
+{
+	float life = 0.55 + 0.3 * Rnd.x;
+	Age = frac(SimTime / life + Rnd.y);
+	float size = (14.0 + 100.0 * Age) * (0.6 + 0.6 * Rnd.x) * saturate(Amount * 2.2);
+	float2 q = UV - 0.5;
+	return (Right * q.x + Up * q.y) * size;
+}

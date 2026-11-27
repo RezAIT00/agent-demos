@@ -1,0 +1,331 @@
+// Ray-marched volumes for the destruction system: dust, smoke, flame, fireballs, mist, the mushroom
+// cloud, the tornado funnel and energy blobs.  Drawn on the inside of a sphere with the depth test off;
+// the march is cut off at the scene depth, so a cloud can swallow a building or hug a street.
+// Everything is a function of the age passed in, so a frame renders the same every time.
+#pragma once
+#include "/NYC/Common.ush"
+#include "/NYC/FX.ush"
+
+struct FNycVol
+{
+	int Type;
+	float Seed, Age, Life, NoiseM, Squash;
+	float3 Wind;
+};
+
+float NycN3(Texture3D V, SamplerState S, float3 p, float lod) { return V.SampleLevel(S, p, lod).r; }
+float NycN3g(Texture3D V, SamplerState S, float3 p, float lod) { return V.SampleLevel(S, p, lod).g; }
+
+float2 NycRot(float2 p, float a) { float s, c; sincos(a, s, c); return float2(c * p.x - s * p.y, s * p.x + c * p.y); }
+
+// density 0..~1 at unit-space position q (world position wm in metres).  heat: 0..1 glow
+float NycVolDensity(Texture3D Vol, SamplerState VolS, FNycVol V, float3 q, float3 wm, float lod, out float heat)
+{
+	heat = 0.0;
+	float r = length(q);
+	if (r >= 1.0) return 0.0;
+	float3 s3 = float3(V.Seed * 0.137, V.Seed * 0.291, V.Seed * 0.453);
+	float ns = max(V.NoiseM, 0.5);
+
+	if (V.Type == 5)
+	{
+		// A fireball that rolls itself into a mushroom: a turning vortex ring for the cap, a stem of dust drawn
+		// up under it, and the surge running out along the ground.
+		float rise = saturate(V.Life);
+		float zc = lerp(-0.44, 0.45, rise);
+		float R0 = lerp(0.05, 0.47, rise), r0 = lerp(0.43, 0.225, rise);
+		float rad = length(q.xy);
+		float2 dir = q.xy / max(rad, 1e-4);
+		float2 tube = float2(rad - R0, (q.z - zc) * 1.22);
+		float torus = r0 - length(tube);
+		float domeR = lerp(0.47, 0.29, rise);
+		float dome = domeR - length(float3(q.xy * lerp(1.0, 0.78, rise), (q.z - zc - 0.075 * rise) * lerp(1.0, 1.75, rise)));
+		float capS = max(torus, dome);
+		float neck = smoothstep(zc - 0.34, zc - 0.04, q.z);
+		float stemR = lerp(0.215, 0.092, smoothstep(-0.95, -0.55, q.z)) + 0.085 * neck;
+		float stemS = (q.z < zc && q.z > -0.99) ? (stemR - rad) : -1.0;
+		stemS -= 0.25 * (1.0 - saturate(rise * 3.0));
+		float skirtR = lerp(0.16, 0.9, sqrt(saturate(V.Life * 1.15)));
+		float skirt = 0.115 - length(float2((rad - skirtR) * 0.72, (q.z + 0.905) * 1.55));
+		// well outside all three: no need to look at the noise
+		if (capS < -0.17 && stemS < -0.12 && skirt < -0.13) return 0.0;
+
+		float d = 0.0;
+		if (capS >= -0.17)
+		{
+			// the ring turns over: outward on top, down the outside, in below and up through the middle
+			float turn = V.Age * 0.62 / (1.0 + V.Age * 0.018);
+			float2 rolled = NycRot(float2(rad - R0, q.z - zc), turn);
+			// the way round the ring is kept at one radius: turned points that crossed the axis would otherwise
+			// squeeze the whole circle into one sample and band the cloud like a planet
+			float3 cp = float3(dir * (0.5 + rolled.x * 0.5), zc + rolled.y);
+			cp.xy = NycRot(cp.xy, V.Age * 0.035);
+			float3 swirl = float3(NycN3(Vol, VolS, cp * 0.9 + s3, lod), NycN3g(Vol, VolS, cp * 0.9 - s3, lod), NycN3(Vol, VolS, cp * 0.9 + 0.43, lod)) - 0.5;
+			float n1 = NycN3(Vol, VolS, cp * 1.35 + swirl * 0.35 + s3, lod);
+			float n2 = NycN3g(Vol, VolS, cp * 3.1 + swirl * 0.8 - s3, lod + 0.3);
+			float n3 = NycN3g(Vol, VolS, cp * 7.3 + swirl * 1.6, lod + 0.6);
+			// cauliflower: round heads with narrow creases between them
+			float edge = capS + (n1 - 0.55) * 0.27 + ((1.0 - abs(n2 * 2.0 - 1.0)) - 0.62) * 0.115 + (n3 - 0.5) * 0.045;
+			d = saturate(edge * 24.0);
+			float young = saturate(1.0 - V.Age / 1.7);
+			float veins = saturate((n1 - 0.5) * 2.6 + (n2 - 0.5) * 1.4 + 0.34 - saturate(capS * 5.0 - 0.5) * 0.2);
+			heat = max(young * 1.3, veins * saturate(1.25 - edge * 4.0) * exp(-V.Age / 3.9) * 1.45);
+			heat = min(heat, 1.3) * step(0.001, d);
+		}
+		if (stemS >= -0.12)
+		{
+			float3 sp = float3(NycRot(q.xy, q.z * 1.7 + V.Age * 0.16) * 3.3, (q.z - V.Age * 0.095) * 2.1);
+			float n4 = NycN3(Vol, VolS, sp * 0.55 + s3 * 2.0, lod);
+			float n5 = NycN3g(Vol, VolS, sp * 1.5 - s3, lod + 0.4);
+			float ds = saturate((stemS + (n4 - 0.55) * 0.15 + (n5 - 0.5) * 0.065) * 22.0);
+			if (ds > d)
+			{
+				d = ds;
+				heat = saturate(stemS * 11.0) * saturate(n4 * 2.2 - 1.15) * exp(-V.Age / 3.2);
+			}
+		}
+		if (skirt >= -0.13 && V.Life > 0.1)
+		{
+			float3 kp = wm / (ns * 1.35) + s3 - float3(dir * V.Age * 0.35, V.Age * 0.12);
+			float n6 = NycN3(Vol, VolS, kp * 0.6, lod);
+			float n7 = NycN3g(Vol, VolS, kp * 1.7, lod + 0.4);
+			float dk = saturate((skirt + (n6 - 0.55) * 0.17 + (n7 - 0.5) * 0.08) * 13.0) * 0.8 * saturate((V.Life - 0.1) * 3.0);
+			if (dk > d) { d = dk; heat = 0.0; }
+		}
+		return d * saturate((1.0 - r) * 9.0);
+	}
+	if (V.Type == 8)
+	{
+		// the air flashing to cloud behind the pressure front: a thin broken ring on the dome of the wave
+		float shell = saturate(1.0 - abs(r - 0.86) / 0.085);
+		float band = smoothstep(-0.02, 0.07, q.z) * smoothstep(0.62, 0.3, q.z);
+		if (shell * band <= 0.0) return 0.0;
+		float n = NycN3(Vol, VolS, q * 2.6 + s3, lod);
+		float m = NycN3g(Vol, VolS, q * 6.1 - s3, lod + 0.3);
+		return shell * shell * band * saturate(n * 1.9 + (m - 0.5) * 0.8 - 0.45);
+	}
+	if (V.Type == 6)
+	{
+		// tornado: a twisting column, tight at the ground and spreading into the cloud base
+		float h = saturate(q.z * 0.5 + 0.5);
+		float2 wob = float2(sin(h * 4.2 + V.Age * 1.1 + V.Seed), cos(h * 3.1 + V.Age * 0.83)) * (0.05 + 0.16 * h);
+		float2 p = q.xy - wob;
+		float rad = length(p);
+		// a short fat funnel (a wedge) stands on a broad foot
+		float fat = saturate((3.6 - V.Squash) / 1.4);
+		float rr = lerp(0.17, 0.58, fat) + lerp(0.5, 0.22, fat) * pow(h, 2.1);
+		// less shear than before: the fine noise was being drawn out into black smears
+		float ang = V.Age * 1.5 - h * 2.4;
+		float3 sp = float3(NycRot(p, ang) * 3.1, h * 11.0 - V.Age * 1.25);
+		float n1 = NycN3(Vol, VolS, sp * 0.42 + s3, lod);
+		float n2 = NycN3g(Vol, VolS, sp * 1.35 - s3, lod);
+		float wall = 1.0 - abs(rad - rr * 0.8) / (0.13 + 0.2 * h);
+		float core = saturate(1.0 - rad / (rr + 0.02)) * 0.8;
+		float skirt = saturate(1.0 - length(float2(rad * 1.45, (h - 0.05) * 7.0))) * 1.25;
+		float n3 = NycN3g(Vol, VolS, sp * 2.9 + s3 * 1.7, lod + 0.5);
+		float d = saturate(max(max(wall, core), skirt) * 1.3 + (n1 - 0.63) * 2.3 + (n2 - 0.5) * 1.05 + (n3 - 0.5) * 0.5);
+		return d * saturate((1.0 - r) * 6.0) * saturate((1.0 - h) * 5.0);
+	}
+
+	// billowing puffs
+	float3 drift = V.Type == 1 ? float3(0, 0, -1.6) : V.Type == 2 ? float3(0, 0, -5.5) : V.Type == 3 ? float3(0, 0, -2.4) : float3(0, 0, -0.5);
+	float3 wp = wm + (drift - V.Wind) * V.Age;
+	float3 p = wp / ns + s3;
+	if (V.Type == 3)
+	{
+		// a fireball churns outward from its middle
+		p = q * 1.35 * (1.0 - 0.25 * saturate(V.Life)) + s3 + float3(0, 0, -V.Age * 0.16);
+	}
+	bool heavy = V.Type == 0 || V.Type == 1 || V.Type == 4;
+	float3 warp = float3(0, 0, 0);
+	if (heavy)
+	{
+		// slow eddies, drifting against each other, fold the cloud through itself as it ages
+		float turn = V.Age * (0.045 + 0.075 * exp(-V.Age / 7.0));
+		warp = float3(NycN3(Vol, VolS, p * 0.29 + float3(0, 0, turn), lod),
+			NycN3g(Vol, VolS, p * 0.29 + float3(0.37, turn * 0.8, 0.0), lod),
+			NycN3(Vol, VolS, p * 0.29 + float3(0.71 - turn * 0.9, 0.0, 0.19), lod)) - 0.5;
+		p += warp.zxy * 0.38;
+	}
+	float n1 = NycN3(Vol, VolS, p * 0.5 + warp * 0.3, lod);
+	float n2 = NycN3g(Vol, VolS, p * 1.45 + 0.31 + warp * 0.45, lod);
+	float n3 = NycN3g(Vol, VolS, p * 3.5 - 0.17 + warp * 0.6, lod + 0.4);
+	float fall = 1.0 - r;
+	float shape = fall * 2.3 - (1.0 - n1) * 1.55 - (1.0 - n2) * 0.62 - (1.0 - n3) * 0.34 + 0.68;
+	float d = saturate(shape * 1.9) * saturate(fall * 5.0);
+	if (heavy)
+	{
+		// dust and smoke: knotted lumps with hard shoulders, never a soft ball
+		// round heads divided by sharp creases, at two sizes: the folds of a heavy, boiling cloud
+		float heads = abs(n2 * 2.0 - 1.0) - 0.34;
+		float knobs = abs(n3 * 2.0 - 1.0) - 0.34;
+		// the noise, not the ball, decides the outline: big lobes and deep bites
+		float form = fall * 1.85 - (1.0 - n1) * 2.05 - (1.0 - n2) * 0.3 + 0.9 + heads * 0.8 + knobs * 0.34;
+		d = saturate(form * 4.2) * saturate(fall * 5.0) * saturate(0.8 + (n2 - 0.5) * 0.55 + knobs * 0.3);
+		if (V.Type == 0) d *= lerp(1.3, 0.62, saturate(q.z * 0.85 + 0.5));
+		if (V.Type == 4) d *= 0.8;
+	}
+	if (V.Type == 2)
+	{
+		// flame: tongues that thin toward the top
+		float up = saturate(q.z * 0.5 + 0.5);
+		d = saturate(shape * 1.7 - up * 0.75) * saturate(fall * 4.0);
+		heat = saturate(d * 1.1 + (n2 - 0.55) * 1.2 - up * 0.45) * saturate(1.15 - V.Life);
+		return d;
+	}
+	if (V.Type == 3)
+	{
+		float burn = saturate(1.2 - V.Life * 2.3);
+		heat = saturate((n1 - 0.42) * 2.3 + fall * 0.75 - 0.2 + (n3 - 0.5) * 0.5) * burn;
+		return d;
+	}
+	return d;
+}
+
+// black-body-like ramp for glowing gas
+float3 NycFireColour(float h)
+{
+	float3 c = lerp(float3(0.0, 0.0, 0.0), float3(0.55, 0.035, 0.004), saturate(h * 3.2));
+	c = lerp(c, float3(1.0, 0.27, 0.018), saturate(h * 2.4 - 0.45));
+	c = lerp(c, float3(1.0, 0.62, 0.17), saturate(h * 2.2 - 1.05));
+	c = lerp(c, float3(1.0, 0.9, 0.62), saturate(h * 3.0 - 2.15));
+	return c * (h * h * 1.45 + 0.012);
+}
+
+float4 NycVolumeMain(
+	float3 WP, float3 CamPos, float3 Centre, float SceneDepth, float PixelDepth, float2 PixelPos, float Frame,
+	Texture3D Vol, SamplerState VolS,
+	float Type, float Density, float Seed, float Age, float3 Albedo, float Glow, float NoiseM, float Life, float Radius, float Squash,
+	float3 SunDir, float3 SunColor, float SunLux, float3 SkyColor, float SkyNits, float3 FogColor, float CityGlow, float Flash,
+	float SunVis, float SkyVis, float Quality, NYC_FX_ARGS)
+{
+	float3 D = WP - CamPos;
+	float dist = length(D);
+	float3 Dir = D / max(dist, 1.0);
+	float3 inv = float3(1.0 / Radius, 1.0 / Radius, 1.0 / (Radius * max(Squash, 0.05)));
+	float3 ro = (CamPos - Centre) * inv;
+	float3 rd = Dir * inv;
+	float a = dot(rd, rd), b = dot(ro, rd), c = dot(ro, ro) - 1.0;
+	float disc = b * b - a * c;
+	if (disc <= 0.0) return 0;
+	float sq = sqrt(disc);
+	float t0 = max((-b - sq) / a, 0.0);
+	float t1 = (-b + sq) / a;
+	float scene = SceneDepth * dist / max(PixelDepth, 1.0);
+	t1 = min(t1, scene);
+	if (t1 <= t0) return 0;
+
+	FNycVol V;
+	V.Type = (int)(Type + 0.5);
+	V.Seed = Seed;
+	V.Age = Age;
+	V.Life = Life;
+	V.NoiseM = NoiseM;
+	V.Squash = Squash;
+	V.Wind = float3(0, 0, 0);
+
+	// Quality 1 for the film's renders, lower while playing
+	int Steps = (int)((V.Type == 5 ? 112.0 : V.Type == 6 ? 56.0 : V.Type == 8 ? 52.0 : V.Type == 3 ? 32.0 : 28.0) * clamp(Quality, 0.4, 1.0));
+	int Taps = Quality > 0.8 ? 4 : 3;
+	float dt = (t1 - t0) / Steps;
+	// white noise reseeded every sample: it averages out in the film's temporal samples and never forms bands
+	float2 cell = PixelPos + frac(float2(Frame * 61.803, Frame * 41.421)) * 1024.0;
+	float3 h3 = frac(float3(cell.xyx) * 0.1031);
+	h3 += dot(h3, h3.yzx + 33.33);
+	float jitter = frac((h3.x + h3.y) * h3.z);
+	// mip level from the spacing of samples against the noise tile
+	float tileCm = (V.Type == 5 || V.Type == 6 || V.Type == 3 || V.Type == 8) ? Radius * 1.2 : max(NoiseM, 0.5) * 200.0;
+	float lod = clamp(log2(max(dt / tileCm * 128.0 * 0.45, 1.0)), 0.0, 3.0);
+	// the buildings round about decide how much sun and sky reach this cloud
+	float3 sun = SunColor * SunLux * 0.31831 * SunVis * 0.72;
+	// the shadow march leans toward the sky: three taps straight at a low sun drew bands along its direction
+	float3 sunStep = normalize(lerp(normalize(SunDir), float3(0.0, 0.0, 1.0), V.Type == 5 ? 0.45 : 0.3)) * Radius * (V.Type == 5 ? 0.05 : 0.13) * (Taps == 4 ? 1.0 : 1.45);
+	float cosSun = dot(Dir, normalize(SunDir));
+	// thin edges glow when looking into the sun
+	float phase = 0.62 + 0.85 * pow(saturate(cosSun), 6.0);
+	// SkyColor and FogColor are already luminances (cd/m2)
+	// between buildings only a slice of the sky reaches a cloud
+	float3 amb = SkyColor * (V.Type == 5 ? 1.05 : 0.6) * SkyVis * SkyVis + float3(1.0, 0.62, 0.36) * CityGlow * 1.4 + float3(0.75, 0.8, 1.0) * Flash * 900.0 + 0.04;
+	bool Heavy = V.Type == 0 || V.Type == 1 || V.Type == 4;
+	float ext = Density * (V.Type == 5 ? 30.0 : V.Type == 6 ? 9.0 : V.Type == 8 ? 7.0 : Heavy ? 17.5 : 8.5) / max(Radius, 1.0);
+
+	float3 lamps = NycFxScatter(CamPos + Dir * (t0 + (t1 - t0) * 0.45), -Dir, 0.25, NYC_FX_PASS) * 0.8;
+
+	// dust down in the street is lit from below and beside by the sunlit pavement and walls as well as the sky
+	if (Heavy) amb = SkyColor * 0.6 * max(SkyVis * SkyVis, 0.42) + SunColor * SunLux * 0.31831 * 0.05 + float3(1.0, 0.62, 0.36) * CityGlow * 1.4 + float3(0.75, 0.8, 1.0) * Flash * 900.0 + 0.04;
+
+	float T = 1.0;
+	float3 C = 0;
+	float t = t0 + dt * jitter;
+	for (int i = 0; i < Steps; i++, t += dt)
+	{
+		float3 wp = CamPos + Dir * t;
+		float3 q = (wp - Centre) * inv;
+		float heat;
+		float d = NycVolDensity(Vol, VolS, V, q, wp * 0.01, lod, heat);
+		if (d <= 0.004) continue;
+		float sum = 0.0;
+		float h2;
+		for (int k = 1; k <= Taps; k++)
+		{
+			float3 wk = wp + sunStep * (k * k * 0.55 * (0.55 + 0.9 * frac(jitter + k * 0.381966)));
+			sum += NycVolDensity(Vol, VolS, V, (wk - Centre) * inv, wk * 0.01, lod + (V.Type == 5 ? 1.5 : 1.1), h2) * k;
+		}
+		sum *= Taps == 4 ? 0.6 : 1.0;
+		float depth = sum * Density * (V.Type == 5 ? 1.5 : V.Type == 6 ? 1.1 : Heavy ? 1.2 : V.Type == 8 ? 0.2 : 0.75);
+		// direct light plus a weaker, further-reaching share that has bounced about inside the cloud
+		float lit = V.Type == 5 ? max(exp(-depth), 0.34 * exp(-depth * 0.18)) : Heavy ? max(exp(-depth * 1.35), 0.15 * exp(-depth * 0.3)) : exp(-depth);
+		float skyward = 0.5 + 0.5 * saturate(q.z * 0.9 + 0.55);
+		float3 L;
+		if (V.Type == 7)
+		{
+			L = Albedo * Glow * (0.4 + 1.6 * d);
+		}
+		else
+		{
+			// the upper parts of a tall cloud climb out of the street's shadow
+			float rise = saturate((wp.z - Centre.z) / max(Radius * Squash, 1.0));
+			float3 s = sun * lerp(1.0, saturate(1.0 / max(SunVis, 0.12)), rise * rise * 0.5);
+			// deep inside a dense cloud the sky cannot get in either; undersides stay dark
+			float shaded = V.Type == 5 ? (0.3 + 0.7 * saturate(exp(-depth * 0.55))) * (0.62 + 0.38 * skyward)
+				: Heavy ? (0.2 + 0.8 * saturate(exp(-depth * 0.75))) * (0.45 + 0.55 * skyward) : 0.5 + 0.5 * lit;
+			L = Albedo * (s * (lit * phase * 1.08 + 0.035) + amb * skyward * shaded + lamps);
+			if (heat > 0.001) L += NycFireColour(heat) * Glow;
+		}
+		float st = exp(-d * ext * dt);
+		C += T * (1.0 - st) * L;
+		T *= st;
+		if (T < 0.015) { T = 0.0; break; }
+	}
+	return float4(C, 1.0 - T);
+}
+
+// ------------------------------------------------------------------ shock front: a thin shell, bright at its edge
+float4 NycShockMain(float3 WP, float3 N, float3 CamPos, float SceneDepth, float PixelDepth, float Strength, float3 Colour, float Age,
+	Texture3D Vol, SamplerState VolS, float3 SkyColor, float SkyNits, float3 SunColor, float SunLux)
+{
+	float3 V = normalize(CamPos - WP);
+	float limb = abs(dot(V, normalize(N)));
+	float rim = pow(saturate(1.0 - limb), 2.6) + 0.9 * pow(saturate(1.0 - limb * 2.6), 3.0);
+	float soft = saturate((SceneDepth - PixelDepth) / 400.0);
+	float n = Vol.SampleLevel(VolS, WP * 0.00011 + Age * 0.2, 0).r;
+	float m = Vol.SampleLevel(VolS, WP * 0.00047 - Age * 0.31, 0).g;
+	float foot = exp(-max(WP.z - 200.0, 0.0) / 2600.0) * saturate(0.25 + 1.5 * m - 0.25);
+	float a = saturate(rim * (0.35 + 1.1 * n) + foot * 0.55 + 0.012) * Strength * soft * saturate(WP.z / 250.0 + 0.35);
+	float3 L = Colour * (SkyColor * 1.9 + SunColor * SunLux * 0.17 + 2.0);
+	return float4(L * a, a * 0.8);
+}
+
+// ------------------------------------------------------------------ beams: a hot core in a soft glow
+float4 NycBeamMain(float3 WP, float3 N, float3 CamPos, float3 Colour, float Nits, float Age, float Opacity, Texture3D Vol, SamplerState VolS)
+{
+	float3 V = normalize(CamPos - WP);
+	float3 n = normalize(float3(N.xy, 0.001));
+	float3 v = normalize(float3(V.xy, 0.001));
+	float facing = saturate(abs(dot(v, n)));
+	float core = pow(facing, 9.0);
+	float glow = pow(facing, 1.6) * 0.34;
+	float flow = 0.75 + 0.5 * Vol.SampleLevel(VolS, float3(WP.xy * 0.002, WP.z * 0.0006 - Age * 3.1), 0).r;
+	float3 col = lerp(Colour, float3(1, 1, 1), core * 0.7) * (core * 1.6 + glow) * flow * Nits;
+	return float4(col * Opacity, saturate(core * 0.7 + glow * 0.5) * Opacity);
+}
