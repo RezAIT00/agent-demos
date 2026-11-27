@@ -1,0 +1,6 @@
+COLOUR-RULE AUDIT (measured on the rendered pixels during capture)
+pixels checked per frame: SUMI mask coverage >= 98% and no effect drawn over them; spread = max(R,G,B)-min(R,G,B)
+frames captured: 1200, frames with SUMI visible: 866, SUMI pixels checked: 136236918
+mean channel spread: 0.000 / 255    worst single pixel: 6 / 255    pixels with spread > 8: 0 (0.000000%)
+note: film grain and the vignette are neutral, so any spread above ~2 would be colour leaking onto him
+RESULT: PASS

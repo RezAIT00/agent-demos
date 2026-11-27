@@ -1,0 +1,37 @@
+SYNC AUDIT  soundtrack.wav delayed by exactly 2 frames
+onset = sharpest level jump in the 1.5 kHz-high-passed mix within +-3 frames of the contact; pass = within +-1 frame (41.7 ms)
+id   frame contact s onset s    error ms  err fr   jump dB  result hit
+--- MAJOR
+H1   18    0.7500    0.8333     +83.31    +2.000   50.8     FAIL   Paint drop lands
+H2   54    2.2500    2.3333     +83.31    +2.000   41.9     FAIL   SUMI's stomp
+H3   204   8.5000    8.5833     +83.31    +2.000   51.9     FAIL   First clash: heel against fist
+H4   284   11.8333   11.9166    +83.31    +2.000   45.3     FAIL   Spinning heel through the guard
+H5   334   13.9167   14.0000    +83.31    +2.000   33.6     FAIL   Ink palm
+H6   404   16.8333   16.9166    +83.31    +2.000   33.7     FAIL   Rising heel under the chin
+H7   474   19.7500   19.8333    +83.31    +2.000   34.0     FAIL   Two-fist hammer
+H8   544   22.6667   22.7500    +83.31    +2.000   34.2     FAIL   Wheel kick
+H9   624   26.0000   26.0833    +83.31    +2.000   35.3     FAIL   Hurled through the tower
+H10  704   29.3333   29.4166    +83.31    +2.000   39.5     FAIL   Mid-air clash above the clouds
+H11  764   31.8333   31.9166    +83.31    +2.000   35.5     FAIL   Meteor axe heel
+H12  794   33.0833   33.1666    +83.31    +2.000   49.1     FAIL   SUMI hits the ground
+H13  1084  45.1667   45.2500    +83.31    +2.000   57.5     FAIL   ONE STROKE against PRISM COMET
+--- minor
+m1   244   10.1667   10.2501    +83.42    +2.002   11.6     FAIL   flurry: knee into guard
+m2   254   10.5833   10.6666    +83.31    +2.000   18.8     FAIL   flurry: palm into guard
+m3   264   11.0000   11.0833    +83.31    +2.000   21.2     FAIL   flurry: spinning elbow
+m4   274   11.4167   11.5000    +83.31    +2.000   21.9     FAIL   flurry: backhand sweep
+s1   292   12.1667   12.2500    +83.31    +2.000   19.5     FAIL   back through the obelisk
+s2   342   14.2500   14.3336    +83.58    +2.006   14.8     FAIL   through the brick wall
+s3   414   17.2500   17.3333    +83.31    +2.000   15.9     FAIL   through the storefront
+s4   424   17.6667   17.7500    +83.31    +2.000   12.5     FAIL   through the second wall
+s5   550   22.9167   23.0000    +83.31    +2.000   19.3     FAIL   through a car
+s6   556   23.1667   23.2500    +83.31    +2.000   17.9     FAIL   through lamp posts
+s7   564   23.5000   23.5833    +83.31    +2.000   15.4     FAIL   into the tower base
+c1   598   24.9167   25.0000    +83.31    +2.000   20.7     FAIL   he catches her ankle
+s8   636   26.5000   26.5833    +83.31    +2.000   10.3     FAIL   out of the far side
+x1   652   27.1667   27.2501    +83.44    +2.002   15.3     FAIL   one stroke across the tower
+x2   692   28.8333   28.9166    +83.31    +2.000   20.9     FAIL   the sliding tower top breaks apart
+x3   832   34.6667   34.7500    +83.31    +2.000   13.3     FAIL   the first toppled tower lands
+p1   946   39.4167   39.5001    +83.40    +2.002   29.3     FAIL   one drop of paint on his ink
+MAJOR: 0/13 within +-1 frame; worst 83.31 ms
+minor: 0/17 within +-1 frame; worst 83.58 ms

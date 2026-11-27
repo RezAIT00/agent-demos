@@ -1,0 +1,8 @@
+MEDIA AUDIT
+  fight.mp4        integrated -14.2 LUFS, true peak -1.6 dBTP, LRA 17.1 LU, sample peak -1.78 dBFS, samples at full scale 0
+  soundtrack.wav   integrated -14.1 LUFS, true peak -2.2 dBTP, LRA 17.1 LU, sample peak -2.30 dBFS, samples at full scale 0
+  full decode with -v error: clean (no output, exit 0)
+  video: h264 yuv420p 1920x1080 24/1 fps, frames decoded 1200, duration 50.000000 s, bitrate 41.40 Mbit/s
+  audio: aac 48000 Hz 2 ch, duration 50.000000 s, bitrate 319 kbit/s
+  container duration 50.000000 s, size 260.8 MB
+  faststart (moov atom ahead of mdat): yes

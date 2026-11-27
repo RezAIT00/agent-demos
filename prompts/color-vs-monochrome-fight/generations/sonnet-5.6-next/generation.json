@@ -1,0 +1,32 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-27",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 140,
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": null,
+  "renderer": "custom WebGL2 cel-shaded 3D renderer: a 3D skeleton with two-bone IK, lofted meshes rebuilt per drawing, 3-tone cel shading with rim light, tapering inverted-hull ink lines, length-preserving hair and cloth chains, 6,450 pre-simulated rigid debris pieces; Canvas2D vector close-ups and stroke lettering; written by the agent, no libraries",
+  "film_title": "IRO × SUMI",
+  "colour_rule": "The world starts grey; whatever IRO touches becomes her paint, whatever SUMI touches becomes his ink, and debris and shockwaves take the colour of whoever caused them",
+  "hits": {
+    "major": 13,
+    "minor": 17,
+    "biggest": "H13, ONE STROKE against PRISM COMET, contact at frame 1084 (45.167 s)",
+    "sync_audit": "13/13 major hits at 0.00 ms and 17/17 minor hits within 0.27 ms; a 2-frame-delayed negative control fails 0/30"
+  },
+  "video": {
+    "file": "fight_x.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 24,
+    "frames": 1200,
+    "duration_seconds": 50.0,
+    "codec": "h264, yuv420p, two-pass about 7.93 Mbit/s",
+    "audio": "AAC 320k, -14.2 LUFS integrated, true peak -1.6 dBTP",
+    "size_bytes": 51599103,
+    "not_in_repo": "fight.mp4 (crf 16, AAC 320k, 260770585 bytes), soundtrack.wav (24-bit, 48 kHz) and checks/clips/; the X copy carries the same picture and mix"
+  },
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. Every run reported claude-sonnet-5-5 as the executed model, and the agent started no subagents. Before the prompt, the same session answered one short no-tools question the repo owner uses to check which model is answering. The prompt was written by an orchestrating Claude Opus 5.5 session that only prompted; all code is the Sonnet session's own. It was sent as one message, with the output folder filled in, an opening line saying the check had passed, and a setup line (Windows 11, Python 3 with a venv in the output folder, ffmpeg, Edge for headless capture, an RTX 5090 with 32 GB, about 200 GB free, no other agents on the GPU at the start). prompt.md leaves those out. Other agent sessions (research agents, a Blender build and another video) shared the machine during the run. There were no follow-up instructions: afterwards the repo owner asked two questions in the thread (whether every pixel and sound is code, and for a title suggestion), which the agent answered without changing the film."
+}

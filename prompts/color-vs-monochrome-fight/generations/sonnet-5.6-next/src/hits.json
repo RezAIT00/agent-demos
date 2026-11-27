@@ -1,0 +1,40 @@
+{
+  "fps": 24,
+  "frames": 1200,
+  "bpm": 144,
+  "gridOrigin": 204,
+  "hits": [
+    {"id": "H1",  "f": 18,   "scale": 1.0, "owner": "iro",  "hold": 0, "impact": 0, "hero": 0, "name": "Paint drop lands",                      "breaks": "a floor tile cracks",                          "sound": "drop"},
+    {"id": "H2",  "f": 54,   "scale": 2.0, "owner": "sumi", "hold": 3, "impact": 0, "hero": 0, "name": "SUMI's stomp",                          "breaks": "floor tiles shatter, paint drained",            "sound": "stomp"},
+    {"id": "H3",  "f": 204,  "scale": 5.0, "owner": "both", "hold": 8, "impact": 3, "hero": 1, "name": "First clash: heel against fist",         "breaks": "every plaza window and a ring of paving",      "sound": "clash"},
+    {"id": "H4",  "f": 284,  "scale": 5.0, "owner": "iro",  "hold": 4, "impact": 0, "hero": 0, "name": "Spinning heel through the guard",        "breaks": "a stone obelisk",                              "sound": "stone"},
+    {"id": "H5",  "f": 334,  "scale": 5.5, "owner": "sumi", "hold": 4, "impact": 1, "hero": 0, "name": "Ink palm",                              "breaks": "a brick wall",                                 "sound": "palm"},
+    {"id": "H6",  "f": 404,  "scale": 6.0, "owner": "iro",  "hold": 5, "impact": 2, "hero": 0, "name": "Rising heel under the chin",             "breaks": "a storefront, its glass and a second wall",    "sound": "glass"},
+    {"id": "H7",  "f": 474,  "scale": 6.5, "owner": "sumi", "hold": 5, "impact": 0, "hero": 0, "name": "Two-fist hammer",                        "breaks": "the street splits end to end",                 "sound": "quake"},
+    {"id": "H8",  "f": 544,  "scale": 7.0, "owner": "iro",  "hold": 5, "impact": 1, "hero": 0, "name": "Wheel kick",                            "breaks": "cars, lamp posts, the base of the tower",      "sound": "metal"},
+    {"id": "H9",  "f": 624,  "scale": 7.5, "owner": "sumi", "hold": 6, "impact": 1, "hero": 0, "name": "Hurled through the tower",               "breaks": "the tower, then it is cut and falls",          "sound": "tower"},
+    {"id": "H10", "f": 704,  "scale": 8.0, "owner": "both", "hold": 6, "impact": 2, "hero": 0, "name": "Mid-air clash above the clouds",         "breaks": "the cloud layer and the sky",                  "sound": "air"},
+    {"id": "H11", "f": 764,  "scale": 8.0, "owner": "iro",  "hold": 5, "impact": 1, "hero": 0, "name": "Meteor axe heel",                        "breaks": "the air; SUMI is spiked to earth",             "sound": "axe"},
+    {"id": "H12", "f": 794,  "scale": 9.0, "owner": "iro",  "hold": 8, "impact": 3, "hero": 2, "name": "SUMI hits the ground",                   "breaks": "a city block: crater, towers topple",          "sound": "crater"},
+    {"id": "H13", "f": 1084, "scale": 10.0,"owner": "both", "hold": 8, "impact": 3, "hero": 3, "name": "ONE STROKE against PRISM COMET",         "breaks": "the skyline and the ground itself",            "sound": "final"}
+  ],
+  "minor": [
+    {"id": "m1",  "f": 244,  "scale": 3.0, "owner": "iro",  "sound": "jab",     "name": "flurry: knee into guard"},
+    {"id": "m2",  "f": 254,  "scale": 3.2, "owner": "sumi", "sound": "jabHeavy","name": "flurry: palm into guard"},
+    {"id": "m3",  "f": 264,  "scale": 3.4, "owner": "iro",  "sound": "jab",     "name": "flurry: spinning elbow"},
+    {"id": "m4",  "f": 274,  "scale": 3.6, "owner": "sumi", "sound": "jabHeavy","name": "flurry: backhand sweep"},
+    {"id": "s1",  "f": 292,  "scale": 4.0, "owner": "iro",  "sound": "smashStone", "name": "back through the obelisk"},
+    {"id": "s2",  "f": 342,  "scale": 5.0, "owner": "sumi", "sound": "smashBrick", "name": "through the brick wall"},
+    {"id": "s3",  "f": 414,  "scale": 4.8, "owner": "iro",  "sound": "smashGlass", "name": "through the storefront"},
+    {"id": "s4",  "f": 424,  "scale": 4.6, "owner": "iro",  "sound": "smashBrick", "name": "through the second wall"},
+    {"id": "s5",  "f": 550,  "scale": 4.4, "owner": "iro",  "sound": "smashCar",   "name": "through a car"},
+    {"id": "s6",  "f": 556,  "scale": 3.6, "owner": "iro",  "sound": "smashPole",  "name": "through lamp posts"},
+    {"id": "s7",  "f": 564,  "scale": 5.8, "owner": "iro",  "sound": "smashTower", "name": "into the tower base"},
+    {"id": "c1",  "f": 598,  "scale": 3.0, "owner": "sumi", "sound": "catch",      "name": "he catches her ankle"},
+    {"id": "s8",  "f": 636,  "scale": 4.6, "owner": "sumi", "sound": "smashGlass", "name": "out of the far side"},
+    {"id": "x1",  "f": 652,  "scale": 2.0, "owner": "sumi", "sound": "slice",      "name": "one stroke across the tower"},
+    {"id": "x2",  "f": 692,  "scale": 5.0, "owner": "sumi", "sound": "collapse",   "name": "the sliding tower top breaks apart"},
+    {"id": "x3",  "f": 832,  "scale": 5.0, "owner": "iro",  "sound": "collapse",   "name": "the first toppled tower lands"},
+    {"id": "p1",  "f": 946,  "scale": 0.3, "owner": "iro",  "sound": "plink",      "name": "one drop of paint on his ink"}
+  ]
+}

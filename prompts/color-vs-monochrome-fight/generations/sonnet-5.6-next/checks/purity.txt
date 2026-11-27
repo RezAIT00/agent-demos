@@ -1,0 +1,16 @@
+PURITY AUDIT: frames re-rendered out of order in a new browser, compared with the lossless master
+  frame   31  max channel difference   0   pixels differing 0
+  frame  138  max channel difference   0   pixels differing 0
+  frame  155  max channel difference   0   pixels differing 0
+  frame  204  max channel difference   0   pixels differing 0
+  frame  342  max channel difference   0   pixels differing 0
+  frame  384  max channel difference   0   pixels differing 0
+  frame  652  max channel difference   0   pixels differing 0
+  frame  706  max channel difference   0   pixels differing 0
+  frame  767  max channel difference   0   pixels differing 0
+  frame  794  max channel difference   0   pixels differing 0
+  frame  858  max channel difference   0   pixels differing 0
+  frame 1091  max channel difference   0   pixels differing 0
+  frame 1104  max channel difference   0   pixels differing 0
+  frame 1176  max channel difference   0   pixels differing 0
+RESULT: PASS, bit-exact (worst difference 0 / 255)

@@ -13,6 +13,7 @@ Fixed prompts for coding agents, and what different models built from them. Ever
 | [Pelican Anime Trailer](prompts/pelican-anime-trailer/) | A 60–75 second action-anime trailer starring the pelican from the "pelican riding a bicycle" benchmark, with believable riding and a synthesized score, all in code | 1 |
 | [Humanity in 80 Seconds](prompts/humanity-in-80-seconds/) | An 80-second animated history from the first humans to the year 2100, in which every second is a stated number of years, with a synthesized score, all in code | 1 |
 | [New York in Unreal](prompts/new-york-unreal/) | An ultra-realistic Midtown Manhattan in Unreal Engine 5.8, built entirely in code, with real weather, about 2,000 walking pedestrians and at least 80 destruction tools from tiny to world-ending, plus a 4K city film and a 4K destruction film | 1 |
+| [Color vs. Monochrome Fight](prompts/color-vs-monochrome-fight/) | A 50-second anime fight between a full-colour fighter and a pure black-and-white one, built around making every hit feel insanely heavy and destructive, with a synthesized score, all in code | 1 |
 
 ## Layout
 
