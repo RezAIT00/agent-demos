@@ -14,6 +14,7 @@ Fixed prompts for coding agents, and what different models built from them. Ever
 | [Humanity in 80 Seconds](prompts/humanity-in-80-seconds/) | An 80-second animated history from the first humans to the year 2100, in which every second is a stated number of years, with a synthesized score, all in code | 1 |
 | [New York in Unreal](prompts/new-york-unreal/) | An ultra-realistic Midtown Manhattan in Unreal Engine 5.8, built entirely in code, with real weather, about 2,000 walking pedestrians and at least 80 destruction tools from tiny to world-ending, plus a 4K city film and a 4K destruction film | 1 |
 | [Color vs. Monochrome Fight](prompts/color-vs-monochrome-fight/) | A 50-second anime fight between a full-colour fighter and a pure black-and-white one, built around making every hit feel insanely heavy and destructive, with a synthesized score, all in code | 1 |
+| [Voice-Noise Music Video](prompts/voice-noise-music-video/) | A popular song recreated, sung lines included, using only a 7.7-second recording of six voice noises, plus a 100% original anime-style music video that opens with the raw recording | 1 |
 
 ## Layout
 

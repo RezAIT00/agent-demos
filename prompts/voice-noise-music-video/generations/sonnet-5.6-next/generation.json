@@ -1,0 +1,27 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-27",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 47,
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "three_js": null,
+  "renderer": "Canvas2D for characters, scenes and lettering, plus small WebGL passes for the world and post-processing, written by the agent, no libraries; frames captured in headless Edge through puppeteer-core",
+  "song": "\"Take On Me\" by a-ha, chosen by the agent",
+  "video": {
+    "file": "music_video.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 24,
+    "frames": 1977,
+    "duration_seconds": 82.375,
+    "codec": "h264 High, yuv420p, two-pass 8.5 Mbit/s, faststart",
+    "audio": "AAC 315k, 48 kHz stereo, -13.6 LUFS integrated, peak -2.3 dBFS",
+    "size_bytes": 90810850,
+    "not_in_repo": "the agent's 135.6 MB crf 20 master (12.8 Mbit/s); music_video.mp4 is a two-pass re-encode of it to fit under GitHub's 100 MB file limit. The audio is copied unchanged."
+  },
+  "song_file": "song.m4a",
+  "input": "../../noises.m4a, a 7.7 s recording with six noises: Ahh, Ooo, Mmm, Nyaa, Dum and Eee",
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. Every run reported claude-sonnet-5-5 as the executed model. Unlike the other generations in this repo, this one was not made from prompt.md in a single message. It was made over several messages in two Sonnet sessions on two accounts. Each session first answered the repo owner's no-tools model check; the second was picked from ten fresh sessions on its account because it was one of two that passed. The first session chose which noises to ask for, split the recording, picked the song and built the backing track and video. After its account hit a usage limit, the second session added the sung vocal line and, after the owner pointed it out, fixed the head angle in the flying pose. prompt.md combines the owner's requests into one prompt and leaves out that fix. The owner had been asked for ten noises, including four drum sounds, but the recording has six, so the drums are built from those six. An orchestrating Claude Opus 5.5 session only relayed messages; all code is the Sonnet sessions' own. build_time_minutes is the summed run time of the agent turns (32 + 15 min), not wall-clock time, which also included the owner recording the noises."
+}
