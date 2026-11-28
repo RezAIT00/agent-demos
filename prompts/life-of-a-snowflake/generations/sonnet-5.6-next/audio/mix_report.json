@@ -1,0 +1,10 @@
+{
+  "I": -16,
+  "LRA": 2.3,
+  "TP": -3.3,
+  "gainDb": 4.2,
+  "maxLimiterReductionDb": 0,
+  "percentTimeLimitedOver1dB": 0,
+  "samples": 960000,
+  "seconds": 20
+}

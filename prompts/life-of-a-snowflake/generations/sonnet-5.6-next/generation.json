@@ -1,0 +1,30 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-26",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "xhigh",
+  "build_time_minutes": 134,
+  "build_time_breakdown_minutes": {
+    "film": 116,
+    "soundtrack": 18
+  },
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": "0.180.0",
+  "renderer": "three.js with custom shaders: a Gravner-Griffeath hexagonal-lattice growth model run in Web Workers (65 crystals, the hero at radius 422 cells over 73,760 steps), a per-frame ice height field raymarched with refraction and thin-film interference, procedural cloud, pine valley with 15,089 trees and a knitted wool mitten; rendered at 2160x2160 and downscaled",
+  "film_title": "Diary of a Snowflake",
+  "video": {
+    "file": "snowflake-sound.mp4",
+    "width": 1080,
+    "height": 1080,
+    "fps": 30,
+    "frames": 600,
+    "duration_seconds": 20.0,
+    "codec": "h264 High, yuv420p, about 8.8 Mbit/s",
+    "audio": "AAC-LC, 48 kHz stereo, about 194 kbit/s, -16.1 LUFS integrated, true peak -3.3 dBTP",
+    "size_bytes": 22598477,
+    "silent_copy": "snowflake.mp4, the same video stream with no audio, 22097175 bytes",
+    "not_in_repo": "audio/snowflake.wav, because snowflake-sound.mp4 carries the same mix, and the node_modules folders"
+  },
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. Every request in the session reported claude-sonnet-5-5 as the model, and the agent started no subagents. Before the prompt, the same session answered one short no-tools question the repo owner uses to check which model is answering. The prompt was written by an orchestrating Claude Opus 5.5 session that only prompted; all code is the Sonnet session's own. The run was staged: the film brief came first, with the output folder filled in and a line saying up to nine other demo builds were rendering on the same RTX 5090 (32 GB), which prompt.md leaves out. The soundtrack brief came as a second message while the final film render was running, about 107 minutes in, and asked the agent to finish and report the build first; prompt.md merges the two into one prompt. build_time_minutes is wall-clock time from the film prompt to the agent's final reply: 115 min 41 s for the film by the agent's own log, then about 18 min for the sound. Up to nine other agent builds shared the GPU during the film stage. The session's other turns were wake-ups from its own background renders, with no other follow-up messages. An earlier attempt at default effort, in a different session, was stopped after a few minutes and its folder deleted; this generation is a fresh session. The agent reported one slip: a stray redirect in one command tried to write outside its folder, was refused, and created no file. In this repo, one absolute path in work/render.log is shortened to the file name."
+}

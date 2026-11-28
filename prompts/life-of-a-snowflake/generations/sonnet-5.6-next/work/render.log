@@ -1,0 +1,15 @@
+ready {"gpu":"ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11)","size":2160,"growMs":5127,"setupMs":11063,"heroSteps":73760,"heroRadius":422,"crystals":65,"pockets":46,"sealedHollows":7,"trees":15089}
+frame 60/600  965 ms/frame
+frame 120/600  962 ms/frame
+frame 180/600  946 ms/frame
+frame 240/600  938 ms/frame
+frame 300/600  920 ms/frame
+frame 360/600  912 ms/frame
+frame 420/600  911 ms/frame
+frame 480/600  904 ms/frame
+frame 540/600  909 ms/frame
+frame 600/600  910 ms/frame
+determinism: 32 frames re-rendered out of order, 0 mismatches
+unique frames: 600/600
+page errors/warnings: none
+wrote snowflake.mp4 in 559 s

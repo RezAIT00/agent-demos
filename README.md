@@ -16,6 +16,7 @@ Fixed prompts for coding agents, and what different models built from them. Ever
 | [Color vs. Monochrome Fight](prompts/color-vs-monochrome-fight/) | A 50-second anime fight between a full-colour fighter and a pure black-and-white one, built around making every hit feel insanely heavy and destructive, with a synthesized score, all in code | 1 |
 | [Voice-Noise Music Video](prompts/voice-noise-music-video/) | A popular song recreated, sung lines included, using only a 7.7-second recording of six voice noises, plus a 100% original anime-style music video that opens with the raw recording | 1 |
 | [Slow Light](prompts/slow-light/) | A physically exact 20-second three.js film of a night street where light travels at 5 m/s: every shadow, reflection and switch-off is delayed by its path length, and a synthesized soundtrack lets sound outrun the light | 1 |
+| [The Life of a Snowflake](prompts/life-of-a-snowflake/) | A 20-second three.js film of one snowflake from a dust grain to a wool mitten, grown by a real hexagonal-lattice ice simulation so its shape records the air it fell through, with a synthesized soundtrack | 1 |
 
 ## Layout
 

@@ -1,0 +1,19 @@
+{
+  "info": {
+    "gpu": "ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "size": 2160,
+    "growMs": 5127,
+    "setupMs": 11063,
+    "heroSteps": 73760,
+    "heroRadius": 422,
+    "crystals": 65,
+    "pockets": 46,
+    "sealedHollows": 7,
+    "trees": 15089
+  },
+  "frames": 600,
+  "res": 2160,
+  "seconds": 558.478,
+  "mismatches": 0,
+  "unique": 600
+}

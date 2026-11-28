@@ -1,0 +1,7 @@
+{
+  "name": "diary-of-a-snowflake-audio",
+  "private": true,
+  "type": "commonjs",
+  "scripts": { "cues": "node cues.js", "synth": "node synth.js", "check": "python check_audio.py" },
+  "dependencies": { "three": "0.180.0" }
+}

@@ -1,0 +1,8 @@
+step 10000 radius 44 1s
+step 20000 radius 71 3s
+step 30000 radius 112 5s
+step 40000 radius 154 9s
+step 50000 radius 243 18s
+step 60000 radius 368 38s
+step 70000 radius 409 64s
+{"iceCells":216193,"cellsWithoutAllRotations":0,"cellsDifferingFromWedgeRun":0,"radius":422,"seconds":77.538}
