@@ -1,0 +1,85 @@
+{
+ "loudness": {
+  "wav": {
+   "integrated_LUFS": -16.0,
+   "LRA_LU": 10.9,
+   "true_peak_dBTP": -1.9
+  },
+  "mp4_aac": {
+   "integrated_LUFS": -16.1,
+   "LRA_LU": 10.9,
+   "true_peak_dBTP": -1.9
+  }
+ },
+ "aac_alignment": {
+  "decoded_samples": 960000,
+  "wav_samples": 960000,
+  "lag_samples": 0,
+  "correlation_at_lag": 0.9993297683963093
+ },
+ "neon_cut_without_drips": {
+  "tick_peak_s": 12.3358,
+  "cue_s": 12.3347,
+  "error_ms": 1.1,
+  "above_buzz_dB": 14.2
+ },
+ "neon_stutter": {
+  "buzz_heard_in_mp4_audio": {
+   "fitted_start_s": 8.534,
+   "expected_s": 8.535,
+   "error_ms": -1.0,
+   "correlation": 0.906
+  },
+  "tone_in_mp4_audio": {
+   "fitted_start_s": 10.885,
+   "expected_s": 10.884,
+   "error_ms": 1.0,
+   "correlation": 0.836
+  },
+  "sign_in_mp4_picture": {
+   "fitted_start_s": 10.883,
+   "expected_s": 10.884,
+   "error_ms": -1.0,
+   "correlation": 0.877
+  },
+  "you_hear_it_this_long_before_you_see_it_s": 2.349
+ }
+}
+unexplained clicks {'sample_peak_dBFS': -2.12, 'samples_at_full_scale': 0, 'quietest_50ms_window_dBFS_0.05_to_19.4s': -38.3, 'first_sample': 0.0, 'last_10ms_peak_dBFS': -99.8, 'dc_offset': [9.02e-08, 3.14e-07]} []
+
+cue            kind    frame   cue s   onset(WAV)  err ms   onset(MP4)  err ms   rise dB
+click-on       street     0    0.028      0.026     -1.9       0.026    -2.0     30.2
+bloom          light     60    2.000      2.002      1.7       2.002     1.7     17.4
+mirror-on      light    135    4.500      4.501      1.1       4.501     1.0      9.4
+gas-on         street   193    6.442      6.437     -4.8       6.437    -4.8      5.0
+neon-on        street   256    8.535      8.524    -10.5       8.524   -10.6      3.3
+strike-1       street   261    8.710      8.710     -0.3       8.709    -0.4      9.2
+strike-2       street   267    8.920      8.919     -0.8       8.919    -0.9      8.0
+strike-3       street   270    9.030      9.029     -0.4       9.029    -0.4      8.4
+lantern-tone   light    278    9.267      9.268      1.3       9.268     1.4     13.0
+neon-tone      light    326   10.867     10.866     -1.0      10.866    -0.9     14.4
+click-off      street   362   12.077     12.075     -1.3      12.075    -1.3      6.8
+neon-off       street   370   12.335     12.323    -11.6      12.363    28.0      2.7
+gas-off        street   373   12.462     12.461     -0.7      12.461    -0.7     19.7
+bulb-dark      light    420   14.000     14.002      1.8      14.002     1.7     16.1
+neon-dark      light    441   14.700     14.699     -0.9      14.699    -1.0     11.1
+lantern-dark   light    459   15.300     15.303      2.8      15.303     2.8     14.1
+mirror-dark    light    499   16.633     16.631     -2.4      16.631    -2.6     25.0
+
+picture vs sound (score hits):
+  bloom         picture frame  60   sound frame  60   physics said  60
+  mirror-on     picture frame 135   sound frame 135   physics said 136
+  lantern-tone  picture frame 278   sound frame 278   physics said 278
+  neon-tone     picture frame 326   sound frame 326   physics said 326
+  bulb-dark     picture frame 420   sound frame 420   physics said 419
+  neon-dark     picture frame 441   sound frame 441   physics said 441
+  lantern-dark  picture frame 459   sound frame 459   physics said 459
+  mirror-dark   picture frame 499   sound frame 499   physics said 498
+
+street sounds lead the light:
+  click-on   heard   0.028  seen   2.000  lead 1.972 s
+  click-off  heard  12.077  seen  13.975  lead 1.898 s
+  gas-on     heard   6.442  seen   9.258  lead 2.817 s
+  neon-on    heard   8.535  seen  10.884  lead 2.349 s
+  neon-off   heard  12.335  seen  14.689  lead 2.354 s
+  gas-off    heard  12.462  seen  15.279  lead 2.817 s

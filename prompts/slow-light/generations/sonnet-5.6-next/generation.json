@@ -1,0 +1,31 @@
+{
+  "label": "Sonnet 5.6 (next)",
+  "date": "2026-11-25",
+  "harness": "Claude Code (via T3 Code)",
+  "model_requested": "claude-sonnet-5-5",
+  "reasoning_effort": "high for the film, xhigh for the soundtrack",
+  "build_time_minutes": 76,
+  "build_time_breakdown_minutes": {
+    "film": 50,
+    "soundtrack": 26
+  },
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "three_js": "0.170.0",
+  "renderer": "custom WebGL2 deferred renderer on three.js: per-path light delay (path length / 5 m/s) for direct light, cube-map PCSS shadows, mirrored-camera planar reflections, 101 one-bounce virtual point lights and closed-form mist fronts; 16 sub-frames of motion blur per frame, rendered at 2160x2160 and resolved to 1080x1080",
+  "film_title": "Slow Light",
+  "physics_audit": "18 switch-on and switch-off times measured from rendered pixels (direct light, the cafe mirror and a puddle bounce), all within 10 ms of t_switch + path / 5; frames re-rendered out of order are byte-identical",
+  "video": {
+    "file": "slow-light-sound.mp4",
+    "width": 1080,
+    "height": 1080,
+    "fps": 30,
+    "frames": 600,
+    "duration_seconds": 20.0,
+    "codec": "h264 High, yuv420p, BT.709, crf 15, about 12.7 Mbit/s",
+    "audio": "AAC-LC, 48 kHz stereo, about 194 kbit/s, -16.1 LUFS integrated, true peak -1.9 dBTP",
+    "size_bytes": 32215763,
+    "silent_copy": "slow-light.mp4, the same video stream with no audio, 31714639 bytes",
+    "not_in_repo": "audio/slow-light.wav (48 kHz, 24-bit), because slow-light-sound.mp4 carries the same mix, and tools/node_modules"
+  },
+  "notes": "Labeled \"Sonnet 5.6 (next)\" by the repo owner, who believes requests for claude-sonnet-5-5 were being routed to a newer model at the time. Every request in the session reported claude-sonnet-5-5 as the model, and the agent started no subagents. Before the prompt, the same session answered one short no-tools question the repo owner uses to check which model is answering. The prompt was written by an orchestrating Claude Opus 5.5 session that only prompted; all code is the Sonnet session's own. The run was staged: the film brief came first, with the output folder filled in and a line saying three other demo builds were rendering on the same RTX 5090, which prompt.md leaves out. The soundtrack brief came as a second message about 3 h 19 min after the film was reported, and prompt.md merges the two into one prompt. The film stage ran at high effort, the default when none is set, and the soundtrack stage at xhigh. build_time_minutes is the sum of the two stages, each timed from its message to the agent's reply: 50 min for the film and 26 min for the sound. Three other agent builds shared the GPU during the film stage. There were no other follow-up messages. The agent reported one slip: a rebuild command briefly copied the WAV to the system temp folder, outside its output folder, and deleted it straight away."
+}

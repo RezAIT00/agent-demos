@@ -1,0 +1,1402 @@
+{
+ "fps": 30,
+ "sampleRate": 48000,
+ "soundSpeed": 343,
+ "lightSpeed": 5,
+ "seen": {
+  "bulbOn": 2,
+  "bulbOff": 13.97472303149747,
+  "mirrorOn": 4.5105394171161155,
+  "mirrorOff": 16.596775997716293,
+  "lanternOn": 9.258385152598674,
+  "lanternOff": 15.27902419660025,
+  "neonFirst": 10.848980101314531,
+  "neonCentre": 10.884207440968037,
+  "neonOff": 14.688992292645093
+ },
+ "frames": {
+  "bulbOn": 60,
+  "bulbOff": 420,
+  "mirrorOn": 135,
+  "mirrorOff": 499,
+  "lanternOn": 278,
+  "lanternOff": 459,
+  "neonFirst": 326,
+  "neonCentre": 327,
+  "neonOff": 441
+ },
+ "physicsFrames": {
+  "bulbOn": 60,
+  "bulbOff": 419,
+  "mirrorOn": 136,
+  "mirrorOff": 498,
+  "lanternOn": 278,
+  "lanternOff": 459,
+  "neonFirst": 326,
+  "neonCentre": 327,
+  "neonOff": 441
+ },
+ "cues": [
+  {
+   "id": "bed",
+   "kind": "bed",
+   "name": "City hush, downpipe trickle, open-fifth moonlight drone (never changes)",
+   "time": 0,
+   "frame": 0,
+   "until": 20,
+   "videoFrame": 0
+  },
+  {
+   "id": "click-on",
+   "kind": "street",
+   "name": "Switch clicks ON",
+   "event": 0,
+   "time": 0.0276,
+   "seen": 2,
+   "check": {
+    "hz": [
+     900,
+     5000
+    ]
+   },
+   "videoFrame": 0,
+   "seenFrame": 60
+  },
+  {
+   "id": "filament",
+   "kind": "street",
+   "name": "Filament hum (100 Hz and harmonics)",
+   "event": 0,
+   "time": 0.0295,
+   "until": 12.0785,
+   "videoFrame": 0
+  },
+  {
+   "id": "swell",
+   "kind": "light",
+   "name": "Warm D-major swell: loudness = share of the scene inside the lamp's ellipsoid",
+   "time": 2,
+   "frame": 60,
+   "until": 20,
+   "videoFrame": 60
+  },
+  {
+   "id": "bloom",
+   "kind": "light",
+   "name": "BULB SEEN: warm bloom (sub D, soft struck D-A-F#)",
+   "time": 2,
+   "frame": 60,
+   "seen": 2,
+   "check": {
+    "hz": [
+     120,
+     900
+    ]
+   },
+   "videoFrame": 60,
+   "seenFrame": 60
+  },
+  {
+   "id": "tap-1",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 3.4,
+   "time": 3.4294,
+   "minor": true,
+   "videoFrame": 102
+  },
+  {
+   "id": "mirror-on",
+   "kind": "light",
+   "name": "SAME BULB appears in the café mirror: glass shimmer",
+   "time": 4.5,
+   "frame": 135,
+   "seen": 4.5105,
+   "check": {
+    "hz": [
+     1350,
+     3200
+    ]
+   },
+   "videoFrame": 135,
+   "seenFrame": 135
+  },
+  {
+   "id": "tap-2",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 5.94,
+   "time": 5.9691,
+   "minor": true,
+   "videoFrame": 179
+  },
+  {
+   "id": "gas-on",
+   "kind": "street",
+   "name": "Street lamp catches: soft gas \"fwup\"",
+   "event": 6.4,
+   "time": 6.4418,
+   "seen": 9.2584,
+   "check": {
+    "hz": [
+     300,
+     5000
+    ]
+   },
+   "videoFrame": 193,
+   "seenFrame": 278
+  },
+  {
+   "id": "tap-3",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 6.86,
+   "time": 6.8888,
+   "minor": true,
+   "videoFrame": 206
+  },
+  {
+   "id": "tap-4",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 8.12,
+   "time": 8.1488,
+   "minor": true,
+   "videoFrame": 244
+  },
+  {
+   "id": "neon-on",
+   "kind": "street",
+   "name": "Neon relay clunks; transformer buzz stutters (the shader's own pattern)",
+   "event": 8.5,
+   "time": 8.5348,
+   "seen": 10.8842,
+   "check": {
+    "hz": [
+     600,
+     4200
+    ]
+   },
+   "videoFrame": 256,
+   "seenFrame": 327
+  },
+  {
+   "id": "strike-1",
+   "kind": "street",
+   "name": "Neon re-strike 1",
+   "event": 8.675,
+   "time": 8.7098,
+   "seen": 11.0592,
+   "check": {
+    "hz": [
+     1500,
+     6000
+    ],
+    "window": 0.045
+   },
+   "videoFrame": 261,
+   "seenFrame": 332
+  },
+  {
+   "id": "strike-2",
+   "kind": "street",
+   "name": "Neon re-strike 2",
+   "event": 8.885,
+   "time": 8.9198,
+   "seen": 11.2692,
+   "check": {
+    "hz": [
+     1500,
+     6000
+    ],
+    "window": 0.045
+   },
+   "videoFrame": 267,
+   "seenFrame": 338
+  },
+  {
+   "id": "strike-3",
+   "kind": "street",
+   "name": "Neon re-strike 3",
+   "event": 8.995,
+   "time": 9.0298,
+   "seen": 11.3792,
+   "check": {
+    "hz": [
+     1500,
+     6000
+    ],
+    "window": 0.045
+   },
+   "videoFrame": 270,
+   "seenFrame": 342
+  },
+  {
+   "id": "lantern-tone",
+   "kind": "light",
+   "name": "STREET LAMP seen: small soft bell (C#)",
+   "time": 9.2667,
+   "frame": 278,
+   "seen": 9.2584,
+   "check": {
+    "hz": [
+     1060,
+     1160
+    ]
+   },
+   "videoFrame": 278,
+   "seenFrame": 278
+  },
+  {
+   "id": "tap-5",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 10.02,
+   "time": 10.0489,
+   "minor": true,
+   "videoFrame": 301
+  },
+  {
+   "id": "neon-tone",
+   "kind": "light",
+   "name": "NEON seen: soft tone (B) that stutters with the sign on screen",
+   "time": 10.8667,
+   "frame": 326,
+   "seen": 10.849,
+   "check": {
+    "hz": [
+     940,
+     1040
+    ]
+   },
+   "videoFrame": 326,
+   "seenFrame": 326
+  },
+  {
+   "id": "tap-6",
+   "kind": "street",
+   "name": "Moth taps the bulb glass",
+   "event": 11.8,
+   "time": 11.8285,
+   "minor": true,
+   "videoFrame": 354
+  },
+  {
+   "id": "click-off",
+   "kind": "street",
+   "name": "Switch clicks OFF",
+   "event": 12.05,
+   "time": 12.0767,
+   "seen": 13.9747,
+   "check": {
+    "hz": [
+     900,
+     5000
+    ]
+   },
+   "videoFrame": 362,
+   "seenFrame": 420
+  },
+  {
+   "id": "neon-off",
+   "kind": "street",
+   "name": "Neon buzz cuts out",
+   "event": 12.3,
+   "time": 12.3347,
+   "seen": 14.689,
+   "check": {
+    "hz": [
+     1500,
+     5000
+    ],
+    "window": 0.05
+   },
+   "videoFrame": 370,
+   "seenFrame": 441
+  },
+  {
+   "id": "gas-off",
+   "kind": "street",
+   "name": "Street lamp gas puffs out",
+   "event": 12.42,
+   "time": 12.4616,
+   "seen": 15.279,
+   "check": {
+    "hz": [
+     1900,
+     4300
+    ]
+   },
+   "videoFrame": 373,
+   "seenFrame": 459
+  },
+  {
+   "id": "bulb-dark",
+   "kind": "light",
+   "name": "BULB SEEN to go dark: low falling breath",
+   "time": 14,
+   "frame": 420,
+   "seen": 13.9747,
+   "check": {
+    "hz": [
+     1800,
+     5000
+    ]
+   },
+   "videoFrame": 420,
+   "seenFrame": 420
+  },
+  {
+   "id": "neon-dark",
+   "kind": "light",
+   "name": "NEON seen to go dark: tone drops",
+   "time": 14.7,
+   "frame": 441,
+   "seen": 14.689,
+   "check": {
+    "hz": [
+     700,
+     1030
+    ],
+    "window": 0.12
+   },
+   "videoFrame": 441,
+   "seenFrame": 441
+  },
+  {
+   "id": "lantern-dark",
+   "kind": "light",
+   "name": "STREET LAMP seen to go dark: bell drops",
+   "time": 15.3,
+   "frame": 459,
+   "seen": 15.279,
+   "check": {
+    "hz": [
+     800,
+     1150
+    ],
+    "window": 0.12
+   },
+   "videoFrame": 459,
+   "seenFrame": 459
+  },
+  {
+   "id": "mirror-dark",
+   "kind": "light",
+   "name": "The bulb finally goes out IN THE MIRROR: last glass note falls",
+   "time": 16.6333,
+   "frame": 499,
+   "seen": 16.5968,
+   "check": {
+    "hz": [
+     1140,
+     1520
+    ]
+   },
+   "videoFrame": 499,
+   "seenFrame": 499
+  }
+ ],
+ "drips": [
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 0.0509,
+   "heard": 0.0735,
+   "rippleSeen": 1.585,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 0.0605,
+   "heard": 0.0961,
+   "rippleSeen": 2.482,
+   "water": false
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 0.1811,
+   "heard": 0.2196,
+   "rippleSeen": 2.803,
+   "water": true
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 0.7009,
+   "heard": 0.7129,
+   "rippleSeen": 1.515,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 0.9112,
+   "heard": 0.9607,
+   "rippleSeen": 4.287,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 0.943,
+   "heard": 0.9687,
+   "rippleSeen": 2.695,
+   "water": false
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 1.1,
+   "heard": 1.1401,
+   "rippleSeen": 3.835,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 1.4553,
+   "heard": 1.4833,
+   "rippleSeen": 3.369,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 1.6009,
+   "heard": 1.622,
+   "rippleSeen": 3.043,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 1.6851,
+   "heard": 1.736,
+   "rippleSeen": 5.167,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 1.9897,
+   "heard": 2.0119,
+   "rippleSeen": 3.51,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 2.1271,
+   "heard": 2.1447,
+   "rippleSeen": 3.333,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 2.1605,
+   "heard": 2.1958,
+   "rippleSeen": 4.577,
+   "water": false
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 2.261,
+   "heard": 2.2933,
+   "rippleSeen": 4.471,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 2.393,
+   "heard": 2.4186,
+   "rippleSeen": 4.142,
+   "water": false
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 2.65,
+   "heard": 2.6899,
+   "rippleSeen": 5.381,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 2.7112,
+   "heard": 2.7605,
+   "rippleSeen": 6.082,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 2.7509,
+   "heard": 2.7732,
+   "rippleSeen": 4.275,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 3.0811,
+   "heard": 3.1193,
+   "rippleSeen": 5.695,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 3.1553,
+   "heard": 3.1832,
+   "rippleSeen": 5.064,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 3.5009,
+   "heard": 3.5219,
+   "rippleSeen": 4.938,
+   "water": true
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 3.8009,
+   "heard": 3.8127,
+   "rippleSeen": 4.605,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 3.843,
+   "heard": 3.8685,
+   "rippleSeen": 5.589,
+   "water": false
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 3.8851,
+   "heard": 3.9359,
+   "rippleSeen": 7.362,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 4.0397,
+   "heard": 4.0619,
+   "rippleSeen": 5.554,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 4.2,
+   "heard": 4.2399,
+   "rippleSeen": 6.927,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 4.2605,
+   "heard": 4.2957,
+   "rippleSeen": 6.671,
+   "water": false
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 4.4271,
+   "heard": 4.4446,
+   "rippleSeen": 5.628,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 4.5112,
+   "heard": 4.5604,
+   "rippleSeen": 7.877,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 4.761,
+   "heard": 4.7932,
+   "rippleSeen": 6.965,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 4.8553,
+   "heard": 4.8831,
+   "rippleSeen": 6.76,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 5.293,
+   "heard": 5.3185,
+   "rippleSeen": 7.035,
+   "water": false
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 5.4009,
+   "heard": 5.4218,
+   "rippleSeen": 6.833,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 5.4509,
+   "heard": 5.4731,
+   "rippleSeen": 6.968,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 5.75,
+   "heard": 5.7898,
+   "rippleSeen": 8.473,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 5.9811,
+   "heard": 6.0192,
+   "rippleSeen": 8.588,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 6.0897,
+   "heard": 6.1118,
+   "rippleSeen": 7.599,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 6.0851,
+   "heard": 6.1358,
+   "rippleSeen": 9.556,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 6.3112,
+   "heard": 6.3604,
+   "rippleSeen": 9.673,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 6.3605,
+   "heard": 6.3956,
+   "rippleSeen": 8.766,
+   "water": false
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 6.5553,
+   "heard": 6.583,
+   "rippleSeen": 8.456,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 6.7271,
+   "heard": 6.7446,
+   "rippleSeen": 7.923,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 6.743,
+   "heard": 6.7684,
+   "rippleSeen": 8.482,
+   "water": false
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 6.9009,
+   "heard": 6.9126,
+   "rippleSeen": 7.698,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 7.261,
+   "heard": 7.2931,
+   "rippleSeen": 9.458,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 7.3009,
+   "heard": 7.3218,
+   "rippleSeen": 8.728,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 7.3,
+   "heard": 7.3398,
+   "rippleSeen": 10.02,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 8.1112,
+   "heard": 8.1603,
+   "rippleSeen": 11.476,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 8.1397,
+   "heard": 8.1617,
+   "rippleSeen": 9.644,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 8.1509,
+   "heard": 8.173,
+   "rippleSeen": 9.661,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 8.193,
+   "heard": 8.2184,
+   "rippleSeen": 9.93,
+   "water": false
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 8.2553,
+   "heard": 8.283,
+   "rippleSeen": 10.154,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 8.2851,
+   "heard": 8.3357,
+   "rippleSeen": 11.761,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 8.4605,
+   "heard": 8.4955,
+   "rippleSeen": 10.866,
+   "water": false
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 8.85,
+   "heard": 8.8897,
+   "rippleSeen": 11.575,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 8.8811,
+   "heard": 8.9191,
+   "rippleSeen": 11.49,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 9.0271,
+   "heard": 9.0445,
+   "rippleSeen": 10.221,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 9.2009,
+   "heard": 9.2217,
+   "rippleSeen": 10.629,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 9.643,
+   "heard": 9.6683,
+   "rippleSeen": 11.387,
+   "water": false
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 9.761,
+   "heard": 9.793,
+   "rippleSeen": 11.967,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 9.9112,
+   "heard": 9.9602,
+   "rippleSeen": 13.291,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 9.9553,
+   "heard": 9.9829,
+   "rippleSeen": 11.864,
+   "water": true
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 10.0009,
+   "heard": 10.0125,
+   "rippleSeen": 10.802,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 10.1897,
+   "heard": 10.2116,
+   "rippleSeen": 11.703,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 10.4,
+   "heard": 10.4397,
+   "rippleSeen": 13.14,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 10.4851,
+   "heard": 10.5357,
+   "rippleSeen": 13.983,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 10.5605,
+   "heard": 10.5955,
+   "rippleSeen": 12.984,
+   "water": false
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 10.8509,
+   "heard": 10.873,
+   "rippleSeen": 12.38,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 11.093,
+   "heard": 11.1184,
+   "rippleSeen": 12.855,
+   "water": false
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 11.1009,
+   "heard": 11.1218,
+   "rippleSeen": 12.549,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 11.3271,
+   "heard": 11.3446,
+   "rippleSeen": 12.548,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 11.6553,
+   "heard": 11.6831,
+   "rippleSeen": 13.589,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 11.7112,
+   "heard": 11.7603,
+   "rippleSeen": 15.116,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 11.7811,
+   "heard": 11.8191,
+   "rippleSeen": 14.426,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 11.95,
+   "heard": 11.9898,
+   "rippleSeen": 14.714,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 12.2397,
+   "heard": 12.2619,
+   "rippleSeen": 13.788,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 12.261,
+   "heard": 12.2932,
+   "rippleSeen": 14.504,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 12.543,
+   "heard": 12.5686,
+   "rippleSeen": 14.334,
+   "water": false
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 12.6605,
+   "heard": 12.6958,
+   "rippleSeen": 15.12,
+   "water": false
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 12.6851,
+   "heard": 12.7359,
+   "rippleSeen": 16.215,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 13.0009,
+   "heard": 13.0221,
+   "rippleSeen": 14.492,
+   "water": true
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 13.1009,
+   "heard": 13.1133,
+   "rippleSeen": 13.983,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 13.3553,
+   "heard": 13.3834,
+   "rippleSeen": 15.325,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 13.5,
+   "heard": 13.54,
+   "rippleSeen": 16.29,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 13.5112,
+   "heard": 13.5606,
+   "rippleSeen": 16.941,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 13.5509,
+   "heard": 13.5735,
+   "rippleSeen": 15.141,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 13.6271,
+   "heard": 13.6453,
+   "rippleSeen": 14.911,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 13.993,
+   "heard": 14.019,
+   "rippleSeen": 15.819,
+   "water": false
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 14.2897,
+   "heard": 14.3125,
+   "rippleSeen": 15.89,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 14.6811,
+   "heard": 14.7197,
+   "rippleSeen": 17.373,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 14.761,
+   "heard": 14.7938,
+   "rippleSeen": 17.052,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 14.7605,
+   "heard": 14.7962,
+   "rippleSeen": 17.257,
+   "water": false
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 14.9009,
+   "heard": 14.9228,
+   "rippleSeen": 16.443,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 14.8851,
+   "heard": 14.9363,
+   "rippleSeen": 18.437,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 15.0553,
+   "heard": 15.0839,
+   "rippleSeen": 17.061,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 15.05,
+   "heard": 15.0904,
+   "rippleSeen": 17.861,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 15.3112,
+   "heard": 15.3609,
+   "rippleSeen": 18.756,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 15.443,
+   "heard": 15.4695,
+   "rippleSeen": 17.3,
+   "water": false
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 15.9271,
+   "heard": 15.9463,
+   "rippleSeen": 17.278,
+   "water": true
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 16.2009,
+   "heard": 16.215,
+   "rippleSeen": 17.204,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 16.2509,
+   "heard": 16.2745,
+   "rippleSeen": 17.902,
+   "water": true
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 16.3397,
+   "heard": 16.3632,
+   "rippleSeen": 17.982,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 16.6,
+   "heard": 16.6408,
+   "rippleSeen": 19.42,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 16.7553,
+   "heard": 16.7844,
+   "rippleSeen": 18.783,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 16.8009,
+   "heard": 16.8235,
+   "rippleSeen": 18.38,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 16.8605,
+   "heard": 16.8968,
+   "rippleSeen": 19.374,
+   "water": false
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 16.893,
+   "heard": 16.92,
+   "rippleSeen": 18.769,
+   "water": false
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 17.0851,
+   "heard": 17.1367,
+   "rippleSeen": 20.64,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 17.1112,
+   "heard": 17.1613,
+   "rippleSeen": 20.557,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 17.261,
+   "heard": 17.2944,
+   "rippleSeen": 19.574,
+   "water": true
+  },
+  {
+   "drip": 6,
+   "lead": false,
+   "impact": 17.5811,
+   "heard": 17.6204,
+   "rippleSeen": 20.289,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 18.15,
+   "heard": 18.191,
+   "rippleSeen": 20.969,
+   "water": true
+  },
+  {
+   "drip": 2,
+   "lead": true,
+   "impact": 18.2271,
+   "heard": 18.2471,
+   "rippleSeen": 19.61,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 18.343,
+   "heard": 18.3703,
+   "rippleSeen": 20.223,
+   "water": false
+  },
+  {
+   "drip": 12,
+   "lead": false,
+   "impact": 18.3897,
+   "heard": 18.4137,
+   "rippleSeen": 20.046,
+   "water": true
+  },
+  {
+   "drip": 3,
+   "lead": false,
+   "impact": 18.4553,
+   "heard": 18.4848,
+   "rippleSeen": 20.486,
+   "water": true
+  },
+  {
+   "drip": 0,
+   "lead": true,
+   "impact": 18.7009,
+   "heard": 18.724,
+   "rippleSeen": 20.29,
+   "water": true
+  },
+  {
+   "drip": 8,
+   "lead": false,
+   "impact": 18.9112,
+   "heard": 18.9615,
+   "rippleSeen": 22.356,
+   "water": true
+  },
+  {
+   "drip": 1,
+   "lead": false,
+   "impact": 18.9509,
+   "heard": 18.9752,
+   "rippleSeen": 20.617,
+   "water": true
+  },
+  {
+   "drip": 4,
+   "lead": true,
+   "impact": 18.9605,
+   "heard": 18.9971,
+   "rippleSeen": 21.473,
+   "water": false
+  },
+  {
+   "drip": 10,
+   "lead": false,
+   "impact": 19.3009,
+   "heard": 19.3161,
+   "rippleSeen": 20.349,
+   "water": true
+  },
+  {
+   "drip": 9,
+   "lead": false,
+   "impact": 19.2851,
+   "heard": 19.3369,
+   "rippleSeen": 22.839,
+   "water": true
+  },
+  {
+   "drip": 5,
+   "lead": false,
+   "impact": 19.7,
+   "heard": 19.7411,
+   "rippleSeen": 22.519,
+   "water": true
+  },
+  {
+   "drip": 7,
+   "lead": false,
+   "impact": 19.761,
+   "heard": 19.7947,
+   "rippleSeen": 22.072,
+   "water": true
+  },
+  {
+   "drip": 11,
+   "lead": false,
+   "impact": 19.793,
+   "heard": 19.8204,
+   "rippleSeen": 21.672,
+   "water": false
+  }
+ ]
+}

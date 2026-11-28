@@ -1,0 +1,2392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slow Light (c = 5 m/s)</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{width:min(100vw,100vh);height:min(100vw,100vh);display:block}
+  body.render{display:block}
+  body.render canvas{width:1080px;height:1080px}
+  #loading{position:fixed;color:#56627a;font:14px system-ui,sans-serif;letter-spacing:.08em}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="loading">building the street…</div>
+<canvas id="c" width="1080" height="1080"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ───────────────────────────── core: constants, physics timeline, camera ─────────────────────────────
+const QS = new URLSearchParams(location.search);
+const RENDER_MODE = QS.get('render') === '1';
+const C_LIGHT = 5.0;                      // metres per second. The whole film.
+const DURATION = 20.0;
+const V3 = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const smoother = t => { t = clamp(t, 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); };
+
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const RNG = mulberry32(1888);
+const rand = (a = 0, b = 1) => a + (b - a) * RNG();
+const pick = arr => arr[Math.floor(RNG() * arr.length)];
+
+// Camera path. At t = 2.000 s the camera is exactly 10.000 m from the bulb, so the bulb appears at t = 2 s.
+function cameraAt(t) {
+  const drift = t < 2 ? (2 - t) : 0;                           // slow dolly in the dark
+  const late = Math.max(t - 2, 0);
+  const crane = smoother((t - 8.6) / 12.4);
+  const pos = V3(0.6 + 0.03 * drift - 0.006 * late,
+                 2.3 + 1.75 * crane,
+                 0.0 + 0.06 * drift - 0.013 * late + 0.25 * crane);
+  const tgt = V3(-0.12 - 0.003 * late + 0.004 * drift, 3.50 + 0.42 * crane, -10.0);
+  return { pos, tgt };
+}
+const FOV = 62;
+
+// ── lamps ──  on/off are EMISSION times (when the source itself changes). What you see is later by path/c.
+const LAMPS = [
+  { name: 'bulb',    pos: V3(-3.0, 7.1, -8.0),     on: 0.0,  off: 12.05, color: [1.0, 0.495, 0.175], flare: [1.0, 0.87, 0.70], I: 122, radius: 0.05, shadow: 2048 },
+  { name: 'lantern', pos: V3(-1.34, 3.60, -14.2),  on: 6.40, off: 12.42, color: [0.60, 0.95, 0.74], flare: [0.80, 1.0, 0.88], I: 17,  radius: 0.09, shadow: 1024 },
+  { name: 'neon',    pos: V3(2.19, 3.36, -11.88),  on: 8.50, off: 12.30, color: [1.0, 0.10, 0.34],  flare: [1.0, 0.42, 0.55], I: 13,  radius: 0.20, shadow: 1024 },
+];
+const MOON_DIR = V3(0.62, 0.70, -0.30).normalize();
+
+// ── actors see light-travel delay too: what the camera shows at time t is the object's state at t - dist/c
+const poseTime = (t, p, camPos) => t - p.distanceTo(camPos) / C_LIGHT;
+
+// ───────────────────────────── shaders ─────────────────────────────
+const GLSL_NOISE = /* glsl */`
+float hash13(vec3 p3){ p3 = fract(p3*.1031); p3 += dot(p3, p3.zyx+31.32); return fract((p3.x+p3.y)*p3.z); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+vec3 hash33(vec3 p3){ p3 = fract(p3*vec3(.1031,.1030,.0973)); p3 += dot(p3,p3.yxz+33.33); return fract((p3.xxy+p3.yxx)*p3.zyx); }
+float vnoise(vec3 x){ vec3 i=floor(x), f=fract(x); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash13(i),hash13(i+vec3(1,0,0)),f.x), mix(hash13(i+vec3(0,1,0)),hash13(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash13(i+vec3(0,0,1)),hash13(i+vec3(1,0,1)),f.x), mix(hash13(i+vec3(0,1,1)),hash13(i+vec3(1,1,1)),f.x),f.y),f.z); }
+float fbm(vec3 p){ float a=.5,s=0.; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+vec3(1.7,9.2,3.1); a*=.5;} return s; }
+float fbm2(vec3 p){ return .65*vnoise(p)+.35*vnoise(p*2.17+7.3); }
+`;
+
+// The ONE physical law of the film: a lamp's intensity as a function of emission time tau = t - pathLength / c.
+const GLSL_PHYSICS = /* glsl */`
+#define C_LIGHT 5.0
+#define RISE 0.016
+#define FALL 0.022
+#define FLARE_TF 0.042
+#define FLARE_A 6.2
+uniform vec3 uLampPos[3];
+uniform vec3 uLampCol[3];
+uniform vec3 uFlareCol[3];
+uniform vec3 uLampTiming[3];   // x = on, y = off, z = radius
+uniform float uTime;
+float s01(float x){ x=clamp(x,0.,1.); return x*x*(3.-2.*x); }
+float neonStutter(float a){
+  float e=0.006;
+  float g1 = s01((a-0.080)/e)*(1.-s01((a-0.175)/e));
+  float g2 = s01((a-0.245)/e)*(1.-s01((a-0.385)/e));
+  float g3 = s01((a-0.455)/e)*(1.-s01((a-0.495)/e));
+  return 1.0 - 0.95*(g1+g2+g3);
+}
+vec2 lampProfile(int i, float tau){
+  float a = tau - uLampTiming[i].x;
+  if(a <= 0.0) return vec2(0.0);
+  float on = s01(a/RISE);
+  float off = 1.0 - s01((tau - uLampTiming[i].y)/FALL);
+  float fl = on*exp(-a/FLARE_TF)*FLARE_A;
+  float st = (i==2) ? neonStutter(a) : 1.0;
+  return vec2(on*off*st, fl*off*st);
+}
+vec3 lampEmit(int i, float tau){ vec2 p = lampProfile(i,tau); return uLampCol[i]*p.x + uFlareCol[i]*p.y; }
+`;
+
+const GBUF_VERT = /* glsl */`
+in vec3 aColor;
+in vec4 aMat;
+out vec3 vWP;
+out vec3 vN;
+out vec3 vCol;
+flat out vec4 vMat;
+out vec3 vLocal;
+void main(){
+  vec3 p = position; vec3 n = normal; vec3 col = aColor;
+  #ifdef USE_INSTANCING
+    vec3 s2 = vec3(dot(instanceMatrix[0].xyz,instanceMatrix[0].xyz), dot(instanceMatrix[1].xyz,instanceMatrix[1].xyz), dot(instanceMatrix[2].xyz,instanceMatrix[2].xyz));
+    n = mat3(instanceMatrix) * (n / s2);
+    p = (instanceMatrix * vec4(p,1.0)).xyz;
+    #ifdef USE_INSTANCING_COLOR
+      col *= instanceColor;
+    #endif
+  #endif
+  vec4 wp = modelMatrix * vec4(p,1.0);
+  vWP = wp.xyz; vN = normalize(mat3(modelMatrix)*n); vCol = col; vMat = aMat; vLocal = position;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+const GBUF_FRAG = /* glsl */`
+precision highp float;
+in vec3 vWP; in vec3 vN; in vec3 vCol; flat in vec4 vMat; in vec3 vLocal;
+uniform vec3 uViewPos;
+uniform vec4 uClipPlane;
+uniform float uTime;
+uniform vec4 uDrips[24];     // xz position, phase, period
+layout(location=0) out vec4 gPos;
+layout(location=1) out vec4 gNor;
+layout(location=2) out vec4 gAlb;
+layout(location=3) out vec4 gEmi;
+${GLSL_NOISE}
+
+// bricks in wall coordinates
+vec4 brickPat(vec2 q, vec2 sz){
+  float row = floor(q.y/sz.y);
+  float off = mod(row,2.0)*0.5 + hash12(vec2(row,3.1))*0.12;
+  vec2 c = vec2(q.x/sz.x + off, q.y/sz.y);
+  vec2 id = floor(c); vec2 f = (fract(c)-0.5)*sz;
+  vec2 d = sz*0.5 - abs(f);
+  float edge = min(d.x,d.y) + (vnoise(vec3(q*38.0,1.0))-0.5)*0.006;
+  float m = smoothstep(0.004,0.009,edge);
+  return vec4(m, hash12(id+0.5), hash12(id+19.7), smoothstep(0.004,0.022,edge));
+}
+
+void main(){
+  if(dot(vec4(vWP,1.0), uClipPlane) < 0.0) discard;
+  float mid = floor(vMat.x + 0.5);
+  float interior = 0.0;
+  if(mid >= 100.0){ mid -= 100.0; interior = 1.0; }
+  int m = int(mid);
+  vec3 Ng = normalize(vN);
+  vec3 V = normalize(uViewPos - vWP);
+  if(m==10 || m==11 || m==12){ if(dot(Ng,V) < 0.0) Ng = -Ng; }
+  vec3 p = vWP;
+  // wall coordinates
+  vec3 tang = abs(Ng.y) > 0.75 ? vec3(1,0,0) : normalize(cross(vec3(0,1,0), Ng));
+  vec2 q = abs(Ng.y) > 0.75 ? p.xz : vec2(dot(p,tang), p.y);
+
+  vec3 alb = vCol; float rough = vMat.y; float metal = 0.0; float h = 0.0; float wet = 0.0; float transl = 0.0;
+  vec3 emi = vec3(0.0); float flag = 0.0;
+  vec3 Nout = Ng; bool bump = true;
+
+  if(m==0){ // plaster, weathered, with patches of bare brick
+    float big = fbm(p*0.55 + vCol*13.0);
+    float mot = fbm(p*2.6);
+    float fine = vnoise(p*34.0);
+    alb *= 0.74 + 0.52*big;
+    alb *= 0.86 + 0.28*mot;
+    alb *= 0.93 + 0.14*fine;
+    float streak = vnoise(vec3(q.x*5.2, q.y*0.42, 2.0))*vnoise(vec3(q.x*17.0, q.y*0.9, 5.0));
+    alb *= 1.0 - 0.52*smoothstep(0.22,0.62,streak);
+    float damp = 1.0 - smoothstep(0.35, 1.35, p.y + (fbm(p*1.7)-0.5)*1.1);
+    alb = mix(alb, alb*vec3(0.38,0.43,0.40), damp);
+    float pm = fbm(p*0.85 + 17.3) + (vnoise(p*9.0)-0.5)*0.07 + max(0.0, 1.6-p.y)*0.07;
+    float patchM = smoothstep(0.636,0.652,pm) * (1.0-interior);
+    float lip = smoothstep(0.622,0.640,pm) * (1.0-patchM) * (1.0-interior);
+    h = (fbm(p*11.0)-0.5)*0.006 + (fine-0.5)*0.0022 + (fbm(p*2.2)-0.5)*0.012;
+    float crk = abs(fbm(p*1.35+4.0) - 0.5);
+    float crack = (1.0-smoothstep(0.0015,0.006,crk)) * smoothstep(0.45,0.7,vnoise(p*0.8+9.0));
+    alb *= 1.0 - 0.55*crack; h -= crack*0.003;
+    if(patchM > 0.001){
+      vec4 b = brickPat(q, vec2(0.235,0.078));
+      vec3 bc = mix(vec3(0.30,0.105,0.060), vec3(0.40,0.20,0.10), b.y) * (0.7+0.6*b.z) * (0.8+0.4*fine);
+      vec3 mc = vec3(0.23,0.20,0.17)*(0.8+0.4*fine);
+      alb = mix(alb, mix(mc,bc,b.x), patchM);
+      h = mix(h, -0.016 + b.w*0.009 + (fine-0.5)*0.003, patchM);
+    }
+    h += lip*0.004; alb *= 1.0 + lip*0.14;
+    float wetk = smoothstep(0.46,0.72, fbm(vec3(q.x*1.9, q.y*0.28, 6.0))) ;
+    wetk = max(wetk, damp*0.8) * (1.0-interior);
+    alb *= 1.0 - 0.22*wetk;
+    rough = mix(0.86, 0.34, wetk);
+  } else if(m==1){ // brick
+    float fine = vnoise(p*40.0);
+    vec4 b = brickPat(q, vec2(0.232,0.076));
+    vec3 bc = vCol * (0.62+0.75*b.y) * mix(vec3(1.0), vec3(0.75,0.7,0.78), step(0.82,b.z));
+    bc *= 0.75 + 0.5*fbm(p*7.0);
+    alb = mix(vec3(0.22,0.195,0.165)*(0.75+0.5*fine), bc, b.x);
+    alb *= 0.8+0.4*fbm(p*0.7);
+    h = b.w*0.011 + (fine-0.5)*0.0035 + (vnoise(p*12.0)-0.5)*0.004;
+    float wetk = smoothstep(0.45,0.75,fbm(vec3(q.x*1.6,q.y*0.3,2.0)));
+    alb *= 1.0-0.25*wetk; rough = mix(0.82,0.3,wetk);
+  } else if(m==2){ // dressed stone
+    float fine = vnoise(p*55.0);
+    vec4 b = brickPat(q, vec2(0.58,0.29));
+    alb = vCol*(0.78+0.4*fbm(p*3.1))*(0.9+0.2*fine)*(0.88+0.24*b.y);
+    alb *= 0.65 + 0.35*b.x;
+    alb *= 1.0 - 0.35*smoothstep(0.4,0.8,fbm(vec3(q.x*4.0,q.y*0.6,8.0)));
+    h = b.w*0.006 + (fbm(p*14.0)-0.5)*0.006 + (fine-0.5)*0.0015;
+    rough = 0.42 + 0.3*fbm(p*2.0);
+  } else if(m==3){ // painted timber
+    float g = vnoise(vec3(q.x*70.0, q.y*3.0, 1.0));
+    alb = vCol*(0.78+0.3*g)*(0.8+0.4*fbm(p*4.0));
+    float chip = smoothstep(0.66,0.70,fbm(vec3(q.x*11.0,q.y*4.0,3.0)));
+    alb = mix(alb, vec3(0.16,0.11,0.07), chip*0.8);
+    h = (g-0.5)*0.0012 - chip*0.001;
+    rough = mix(0.46,0.75,chip);
+  } else if(m==4){ // wrought iron
+    alb = vCol*(0.7+0.6*vnoise(p*23.0));
+    float rust = smoothstep(0.6,0.78,fbm(p*9.0));
+    alb = mix(alb, vec3(0.10,0.045,0.02), rust);
+    metal = 0.55*(1.0-rust); rough = mix(0.34,0.7,rust);
+  } else if(m==5){ // old window glass with a faint curtain behind
+    vec2 cq = vec2(dot(p,tang), p.y);
+    float fold = 0.5+0.5*sin(cq.x*52.0 + 2.5*vnoise(vec3(cq*3.0,0.0)));
+    float curt = step(0.55, hash12(floor(cq*vec2(0.9,0.62))+3.0));
+    alb = mix(vec3(0.006,0.008,0.011), vec3(0.07,0.065,0.058)*(0.4+0.6*fold), curt*smoothstep(0.3,0.6,fbm2(vec3(cq*1.7,2.0))));
+    rough = 0.035; bump = false;
+    vec3 w = vec3(vnoise(p*5.0), vnoise(p*5.0+11.0), vnoise(p*5.0+23.0)) - 0.5;
+    Nout = normalize(Ng + w*0.022);
+    flag = 3.0;
+  } else if(m==6){ // wet cobble sett
+    float fine = vnoise(p*85.0);
+    float mid2 = fbm(p*17.0);
+    alb *= (0.62+0.76*mid2)*(0.86+0.28*fine);
+    alb = mix(alb, alb*vec3(1.35,1.2,1.0), smoothstep(0.55,0.75,fbm(p*5.3+3.0)));
+    alb *= 0.62;
+    h = (mid2-0.5)*0.0070 + (fine-0.5)*0.0012 + (vnoise(p*31.0)-0.5)*0.0022;
+    float film = smoothstep(0.34,0.66,fbm(p*1.9+vec3(3.0,0.0,1.0)));
+    rough = mix(0.36, 0.13, film);
+    wet = mix(0.35, 1.0, film);
+    float tide = 1.0 - smoothstep(0.0012, 0.0085, p.y + (fine-0.5)*0.003);
+    alb *= 1.0 - 0.45*tide; rough = mix(rough, 0.07, tide); wet = mix(wet, 1.0, tide); h *= 1.0 - 0.8*tide;
+    flag = 1.0;
+  } else if(m==7){ // wet grit between the setts
+    float fine = vnoise(p*70.0);
+    alb = vCol*(0.5+fine)*(0.7+0.6*fbm(p*8.0));
+    h = (fine-0.5)*0.004;
+    rough = 0.42; wet = 0.35; flag = 1.0;
+  } else if(m==8){ // puddle water at y = 0
+    float shallow = 1.0 - smoothstep(0.04, 0.55, vCol.r);
+    alb = vec3(0.004,0.0055,0.0065) + vec3(0.075,0.062,0.046)*shallow*shallow*(0.35+0.9*fbm(p*14.0));
+    rough = 0.02; wet = 1.0; flag = 2.0; bump = false;
+    vec2 grad = vec2(0.0);
+    for(int i=0;i<24;i++){
+      vec4 d = uDrips[i];
+      if(d.w <= 0.0) continue;
+      vec2 rv = p.xz - d.xy; float r = length(rv);
+      if(r > 0.9) continue;
+      // light-travel delay applies to the ripples too
+      float tv = uTime - length(vec3(p.x,0.0,p.z) - uViewPos)/5.0;
+      float age = mod(tv - d.z, d.w);
+      float front = age*0.34;
+      float x = r - front;
+      float env = exp(-x*x/0.0016) * exp(-age*2.1) * smoothstep(0.0,0.05,age);
+      float x2 = r - front*0.62;
+      float env2 = exp(-x2*x2/0.0009) * exp(-age*2.6) * smoothstep(0.1,0.2,age);
+      float sl = cos(x*150.0)*env*0.11 + cos(x2*170.0)*env2*0.07;
+      grad += (rv/max(r,1e-3))*sl;
+    }
+    vec2 mic = vec2(vnoise(vec3(p.xz*7.0,1.0)), vnoise(vec3(p.xz*7.0,9.0))) - 0.5;
+    grad += mic*0.006;
+    Nout = normalize(vec3(-grad.x, 1.0, -grad.y));
+  } else if(m==9){ // silvered mirror, foxed with age
+    float edgeFox = smoothstep(0.62,0.80, fbm(p*4.3+31.0));
+    alb = vec3(0.86,0.84,0.78)*(1.0-0.5*edgeFox*smoothstep(0.5,0.8,vnoise(p*23.0)));
+    rough = 0.03; metal = 1.0; flag = 4.0; bump = false;
+  } else if(m==10){ // cloth
+    float weave = vnoise(p*140.0);
+    alb = vCol*(0.9+0.2*weave)*(0.85+0.3*fbm(p*3.3));
+    rough = 0.85; transl = 0.55; h = (weave-0.5)*0.0008;
+  } else if(m==11){ // leaves
+    alb = vCol*(0.65+0.7*vnoise(p*19.0));
+    rough = 0.36; transl = 0.45; bump = false;
+  } else if(m==12){ // petals
+    alb = vCol*(0.75+0.5*vnoise(p*40.0));
+    rough = 0.6; transl = 0.4; bump = false;
+  } else if(m==13){ // generic matte
+    alb = vCol*(0.8+0.4*vnoise(p*60.0))*(0.85+0.3*fbm(p*9.0));
+    h = (vnoise(p*160.0)-0.5)*0.0012;
+  } else if(m==14){ // roof tile
+    alb = vCol*(0.6+0.8*fbm(p*5.0));
+    alb = mix(alb, vec3(0.03,0.05,0.02), smoothstep(0.58,0.74,fbm(p*2.2+8.0)));
+    rough = 0.33+0.3*vnoise(p*4.0); h = (vnoise(p*45.0)-0.5)*0.003;
+  } else if(m==15){ // bottle glass
+    alb = vCol*0.22; rough = 0.055; transl = 1.0; bump = false; flag = 5.0;
+  } else if(m==16){ // brass
+    alb = vCol*(0.8+0.4*vnoise(p*18.0)); metal = 0.9; rough = 0.3; bump = false;
+  } else if(m==17){ // emitter: colour carries the source tint, aMat.z the lamp
+    alb = vec3(0.025); rough = 0.12; bump = false;
+    emi = vec3(vMat.z, vMat.w, 0.0);
+    flag = 6.0;
+  } else if(m==18){ // interior plaster / wallpaper
+    alb = vCol*(0.85+0.3*fbm(p*1.8))*(0.94+0.12*vnoise(p*45.0));
+    alb *= 0.93 + 0.07*step(0.5, fract(q.x*7.0));
+    rough = 0.82; h = (vnoise(p*45.0)-0.5)*0.001;
+  } else if(m==19){ // wooden boards (interior floor, counter)
+    float board = floor(q.x/0.14);
+    float g = vnoise(vec3(q.x*55.0, q.y*4.0, board));
+    alb = vCol*(0.7+0.5*g)*(0.8+0.4*hash12(vec2(board,2.0)));
+    alb *= 0.55+0.45*smoothstep(0.004,0.01, min(fract(q.x/0.14), 1.0-fract(q.x/0.14))*0.14);
+    rough = 0.34; h = (g-0.5)*0.0008;
+  } else if(m==20){ // fur
+    float f1 = vnoise(vec3(p.x*190.0, p.y*70.0, p.z*190.0));
+    float tab = smoothstep(0.35,0.65, 0.5+0.5*sin(p.y*70.0 + p.z*55.0 + 6.0*fbm(p*11.0)));
+    alb = vCol*(0.55+0.9*f1)*mix(1.0,0.45,tab);
+    rough = 0.72; h = (f1-0.5)*0.0022; transl = 0.0;
+  }
+
+  if(bump){
+    vec3 dpx = dFdx(vWP), dpy = dFdy(vWP);
+    float dhx = dFdx(h), dhy = dFdy(h);
+    vec3 r1 = cross(dpy, Ng), r2 = cross(Ng, dpx);
+    float det = dot(dpx, r1);
+    vec3 gr = sign(det)*(dhx*r1 + dhy*r2);
+    vec3 nb = abs(det)*Ng - gr;
+    if(dot(nb,nb) > 1e-24) Nout = normalize(nb);
+  }
+  gPos = vec4(vWP, float(m)+1.0 + interior*100.0);
+  gNor = vec4(Nout, rough);
+  gAlb = vec4(alb, metal);
+  gEmi = m==17 ? vec4(vCol, vMat.z*1000.0 + vMat.w) : vec4(transl, wet, flag, 0.0);
+}`;
+
+const DIST_VERT = /* glsl */`
+out vec3 vWP;
+void main(){
+  vec3 p = position;
+  #ifdef USE_INSTANCING
+    p = (instanceMatrix*vec4(p,1.0)).xyz;
+  #endif
+  vec4 wp = modelMatrix*vec4(p,1.0); vWP = wp.xyz;
+  gl_Position = projectionMatrix*viewMatrix*wp;
+}`;
+const DIST_FRAG = /* glsl */`
+precision highp float;
+in vec3 vWP; uniform vec3 uOrigin; uniform vec3 uAxis; uniform float uMode;
+layout(location=0) out vec4 o;
+void main(){
+  float d = uMode < 0.5 ? length(vWP-uOrigin) : dot(uOrigin - vWP, uAxis);
+  o = vec4(d/100.0, 0.0, 0.0, 1.0);
+}`;
+
+const FS_VERT = /* glsl */`
+out vec2 vUv;
+void main(){ vUv = position.xy*0.5+0.5; gl_Position = vec4(position.xy,0.0,1.0); }`;
+
+// shared by all lighting passes
+const GLSL_LIGHT_COMMON = /* glsl */`
+precision highp float; precision highp sampler3D;
+in vec2 vUv;
+uniform sampler2D tPos, tNor, tAlb, tEmi;
+uniform samplerCube tShadow0, tShadow1, tShadow2;
+uniform sampler2D tMoonShadow;
+uniform mat4 uMoonMatrix; uniform vec3 uMoonDir; uniform vec3 uMoonOrigin;
+uniform sampler3D tNoise3;
+uniform sampler2D tBlue;
+uniform vec3 uViewPos;        // camera position; for a reflection this is the MIRRORED camera
+uniform mat4 uInvViewProj;
+uniform mat4 uViewProj;
+uniform vec4 uPlane;          // mirror plane of this view (0 for the main view)
+uniform float uIsRefl;
+uniform float uSample;
+uniform vec2 uRes;
+uniform float uLampI[3];
+#define NVPL 112
+uniform sampler2D tVpl;       // 3 rows: position+path0, normal, flux
+uniform int uVplCount;
+${GLSL_NOISE}
+${GLSL_PHYSICS}
+
+vec4 blue(vec2 fc, float k){
+  vec4 b = texelFetch(tBlue, ivec2(mod(fc + floor(vec2(k*17.0, k*29.0)), 64.0)), 0);
+  return fract(b + k*vec4(0.61803398875, 0.75487766625, 0.56984029099, 0.41421356237));
+}
+float shadowRaw(int i, vec3 d){
+  if(i==0) return textureLod(tShadow0, d, 0.0).r*100.0;
+  if(i==1) return textureLod(tShadow1, d, 0.0).r*100.0;
+  return textureLod(tShadow2, d, 0.0).r*100.0;
+}
+// contact-hardening shadows from a small spherical source
+float lampShadow(int i, vec3 P, vec3 N, vec4 bn){
+  vec3 L = uLampPos[i];
+  float d0 = distance(P,L);
+  vec3 Po = P + N*(0.006 + 0.0011*d0);
+  vec3 v = Po - L; float dr = length(v); vec3 w = v/dr;
+  vec3 T = normalize(cross(w, abs(w.y)<0.9 ? vec3(0,1,0) : vec3(1,0,0))), B = cross(w,T);
+  float rad = uLampTiming[i].z;
+  float planeD = dot(v,N);
+  float rot = bn.x*6.2831853;
+  float bsum = 0.0, bn_ = 0.0;
+  float searchR = clamp(rad*(dr-1.0)/1.0, 0.02, 0.28);
+  for(int k=0;k<8;k++){
+    float r = sqrt((float(k)+bn.y)/8.0), a = float(k)*2.39996+rot;
+    vec3 sp = v + (T*cos(a)+B*sin(a))*r*searchR;
+    vec3 sd = normalize(sp);
+    float occ = shadowRaw(i, sd);
+    float nd = dot(sd,N); float rec = nd < -0.06 ? planeD/nd : dr;
+    if(occ < min(rec, dr+0.3) - 0.018 - dr*0.0012){ bsum += occ; bn_ += 1.0; }
+  }
+  if(bn_ < 0.5) return 1.0;
+  float db = bsum/bn_;
+  float pen = clamp(rad*(dr-db)/max(db,0.15), 0.006, 0.24);
+  float lit = 0.0;
+  for(int k=0;k<14;k++){
+    float r = sqrt((float(k)+bn.z)/14.0), a = float(k)*2.39996+rot+1.3;
+    vec3 sp = v + (T*cos(a)+B*sin(a))*r*pen;
+    vec3 sd = normalize(sp);
+    float occ = shadowRaw(i, sd);
+    float nd = dot(sd,N); float rec = nd < -0.06 ? min(planeD/nd, dr+0.35) : dr;
+    lit += step(rec - 0.016 - dr*0.0012, occ);
+  }
+  return lit/14.0;
+}
+float moonShadow(vec3 P, vec3 N, vec4 bn){
+  vec3 Po = P + N*0.035 + uMoonDir*0.02;
+  vec4 c = uMoonMatrix*vec4(Po,1.0); vec2 uv = c.xy*0.5+0.5;
+  if(any(lessThan(uv,vec2(0.0))) || any(greaterThan(uv,vec2(1.0)))) return 1.0;
+  float d = dot(uMoonOrigin - Po, uMoonDir);
+  float lit = 0.0; float rot = bn.w*6.2831853;
+  for(int k=0;k<6;k++){
+    float r = sqrt((float(k)+bn.x)/6.0), a = float(k)*2.39996+rot;
+    vec2 o = vec2(cos(a),sin(a))*r*0.0014;
+    lit += step(d - 0.05, textureLod(tMoonShadow, uv+o, 0.0).r*100.0);
+  }
+  return lit/6.0;
+}
+
+// one-bounce light: virtual point lights, each with its own exact path  lamp -> Q -> P -> camera
+vec3 indirectAt(vec3 P, vec3 N, vec3 camP, int stride, int phase){
+  vec3 sum = vec3(0.0);
+  float dPC = distance(P,camP);
+  for(int j=phase;j<uVplCount;j+=stride){
+    vec4 a = texelFetch(tVpl, ivec2(j,0), 0);
+    vec3 d = a.xyz - P; float d2 = dot(d,d); float dl = sqrt(d2); vec3 w = d/max(dl,1e-3);
+    float cp = max(dot(N,w)*0.9+0.1, 0.0); if(cp <= 0.0) continue;
+    vec4 b = texelFetch(tVpl, ivec2(j,1), 0);
+    float cq = max(dot(b.xyz,-w), 0.0); if(cq <= 0.0) continue;
+    vec4 f = texelFetch(tVpl, ivec2(j,2), 0);
+    int li = int(f.w+0.5);
+    float tau = uTime - (a.w + dl + dPC)/C_LIGHT;
+    // an area patch spreads its arrival times, so its front is softer than a point source's
+    float on = s01((tau - uLampTiming[li].x + 0.09)/0.18);
+    float off = 1.0 - s01((tau - uLampTiming[li].y + 0.09)/0.18);
+    float g = on*off; if(g <= 0.0) continue;
+    sum += f.rgb * uLampCol[li] * (g*cp*cq/(3.14159*(d2+0.9)));
+  }
+  return sum*float(stride);
+}
+
+float mistDensity(vec3 x){
+  vec3 q = x*vec3(0.085,0.15,0.085) + vec3(uTime*0.0035, -uTime*0.001, uTime*0.002);
+  float n = textureLod(tNoise3, q, 0.0).r;
+  float n2 = textureLod(tNoise3, q*2.9+0.37, 0.0).r;
+  float w = smoothstep(0.42,0.74, n*0.68+n2*0.32);
+  float clearPocket = mix(0.28, 1.0, smoothstep(1.5, 7.5, length(x.xz - vec2(0.6, 0.0))));
+  return (0.22 + 2.1*w*w) * exp(-max(x.y-1.2,0.0)/8.0) * (1.0 + 0.7*exp(-max(x.y,0.0)/0.8)) * clearPocket;
+}
+float phaseHG(float c, float g){ float g2=g*g; return (1.0-g2)/(12.566*pow(1.0+g2-2.0*g*c, 1.5)); }
+float mistVis(int i, vec3 X, vec3 jit){
+  vec3 v = X - uLampPos[i] + jit*(0.04 + 0.034*distance(X,uLampPos[i])); float d = length(v);
+  return step(d - 0.05, shadowRaw(i, v/d));
+}
+#define SIGMA 0.0125
+#define SHELL_GAIN 7.4
+// In-scatter along a view ray. Because |L - X(s)| + s grows monotonically with s, the lit part of any ray is
+// exactly the interval [s_darkness_front, s_light_front]: solved in closed form, so the shell never bands.
+float frontS(float R, vec3 m, vec3 dir){
+  float D2 = dot(m,m); if(R*R <= D2) return -1.0;
+  return (R*R - D2)/(2.0*(R + dot(dir,m)));
+}
+vec3 mistRay(vec3 ro, vec3 dir, float s0, float s1, vec4 bn, int NS){
+  vec3 acc = vec3(0.0);
+  vec3 vj = fract(bn.zwx + bn.y*vec3(1.0,2.0,3.0)) - 0.5;
+  for(int i=0;i<3;i++){
+    vec3 L = uLampPos[i];
+    vec3 m = ro - L;
+    float tOn = uTime - uLampTiming[i].x;
+    float tOff = uTime - uLampTiming[i].y;
+    float sOn = frontS(C_LIGHT*(tOn - 0.5*RISE), m, dir);
+    if(sOn < 0.0) continue;
+    float sOff = frontS(C_LIGHT*(tOff - 0.5*FALL), m, dir);
+    float a = max(s0, max(sOff, 0.0)), b = min(s1, sOn);
+    float jit = fract(bn.x + float(i)*0.37);
+    if(b > a + 1e-3){
+      float tc = -dot(dir,m);
+      float hh = max(sqrt(max(dot(m,m) - tc*tc, 0.0)), 0.16);
+      float tha = atan((a-tc)/hh), thb = atan((b-tc)/hh);
+      for(int k=0;k<NS;k++){
+        float th = mix(tha,thb,(float(k)+jit)/float(NS));
+        float s = tc + hh*tan(th);
+        vec3 X = ro + dir*s;
+        float dl = length(X-L);
+        float tau = uTime - (dl + s)/C_LIGHT;
+        vec2 pr = lampProfile(i, tau);
+        if(pr.x <= 0.0) continue;
+        float w = (thb-tha)/(float(NS)*hh) * (hh*hh + (s-tc)*(s-tc))/(dl*dl + 0.03);
+        float ph = phaseHG(dot((X-L)/dl, -dir), 0.34);
+        acc += uLampCol[i]*pr.x * (uLampI[i]*SIGMA*ph*w*mistDensity(X)*mistVis(i,X,vj)*exp(-0.012*(s+dl)));
+      }
+    }
+    // the shell: sample uniformly in PATH LENGTH behind the front, then map back to distance along the ray
+    float R = C_LIGHT*tOn;
+    float D = length(m);
+    for(int k=0;k<5;k++){
+      float u = (float(k) + fract(bn.y + float(i)*0.21))/5.0;
+      float lam = C_LIGHT*FLARE_TF*2.2;
+      float x = -lam*log(1.0 - u*0.985);
+      float pth = R - x;
+      if(pth <= D) continue;
+      float bb = dot(dir,m);
+      float s = (pth*pth - D*D)/(2.0*(pth+bb));
+      if(s < s0 || s > s1) continue;
+      float dsdp = min((pth*pth + 2.0*pth*bb + D*D)/(2.0*(pth+bb)*(pth+bb)), 2.0);
+      float pdf = exp(-x/lam)/(lam*0.985);
+      vec3 X = ro + dir*s; float dl = length(X-L);
+      float tau = uTime - pth/C_LIGHT;
+      vec2 pr = lampProfile(i, tau);
+      float ph = phaseHG(dot((X-L)/dl, -dir), 0.15);
+      float dens = mistDensity(X);
+      acc += uFlareCol[i]*vec3(1.0,0.83,0.60)*pr.y * (uLampI[i]*SIGMA*mix(0.8, SHELL_GAIN, smoothstep(0.1, 5.0, R-D))*ph*(0.78+0.36*dens)*mistVis(i,X,vj)*exp(-0.012*pth)/(dl*dl*0.13 + dl*0.82 + 1.9) * dsdp/(pdf*5.0));
+    }
+  }
+  return acc;
+}
+
+vec3 skyColor(vec3 d){
+  float h = clamp(d.y, 0.0, 1.0);
+  vec3 c = mix(vec3(0.030,0.054,0.100), vec3(0.0065,0.0135,0.038), pow(h,0.55));
+  vec2 cp = d.xz/(d.y+0.22);
+  float cl = fbm(vec3(cp*1.35 + 3.0, uTime*0.006));
+  float cl2 = fbm(vec3(cp*3.7, 5.0 + uTime*0.01));
+  float cloud = smoothstep(0.50,0.80, cl*0.75+cl2*0.25);
+  float md = max(dot(d, uMoonDir),0.0);
+  c = mix(c, vec3(0.030,0.043,0.070) + vec3(0.05,0.065,0.09)*pow(md,4.0), cloud*0.8);
+  c += vec3(0.020,0.030,0.045)*pow(md,6.0);
+  vec3 sd = d*210.0; vec3 id = floor(sd);
+  vec3 rn = hash33(id);
+  if(rn.x > 0.982){
+    vec3 sp = id + 0.3 + 0.4*hash33(id+7.0);
+    float dd = length(sd - sp);
+    c += mix(vec3(0.6,0.75,1.0), vec3(1.0,0.86,0.7), rn.z) * exp(-dd*dd*11.0) * (0.06 + 1.1*pow(rn.y,6.0)) * (1.0-cloud*0.9) * smoothstep(0.02,0.25,d.y);
+  }
+  return c;
+}
+`;
+
+// half-resolution: mist, one-bounce light, ambient occlusion
+const HALF_FRAG = /* glsl */`
+${GLSL_LIGHT_COMMON}
+layout(location=0) out vec4 oMist;
+layout(location=1) out vec4 oInd;
+void main(){
+  ivec2 full = textureSize(tPos,0);
+  vec4 bn = blue(gl_FragCoord.xy, uSample);
+  ivec2 ip = ivec2(vUv*vec2(full));
+  vec4 P = texelFetch(tPos, ip, 0);
+  vec4 wf = uInvViewProj*vec4(vUv*2.0-1.0, 1.0, 1.0);
+  vec3 dir = normalize(wf.xyz/wf.w - uViewPos);
+  float depth = 60.0;
+  vec3 ind = vec3(0.0); float ao = 1.0;
+  if(P.w > 0.5){
+    depth = distance(P.xyz, uViewPos);
+    dir = (P.xyz - uViewPos)/depth;
+    vec3 N = texelFetch(tNor, ip, 0).xyz;
+    ind = indirectAt(P.xyz, N, uViewPos, 1, 0);
+    vec3 T = normalize(cross(N, abs(N.y)<0.9?vec3(0,1,0):vec3(1,0,0))), B = cross(N,T);
+    float occ = 0.0;
+    for(int k=0;k<14;k++){
+      float u = (float(k)+bn.z)/14.0;
+      float a = float(k)*2.39996 + bn.w*6.2831853;
+      float ct = sqrt(1.0-u*0.92), st = sqrt(1.0-ct*ct);
+      float rr = mix(0.05, 0.85, pow(fract(u*7.31+bn.y),1.6));
+      vec3 S = P.xyz + N*0.012 + (T*cos(a)*st + B*sin(a)*st + N*ct)*rr;
+      vec4 c = uViewProj*vec4(S,1.0); if(c.w<=0.0) continue;
+      vec2 uv = c.xy/c.w*0.5+0.5;
+      if(any(lessThan(uv,vec2(0.0)))||any(greaterThan(uv,vec2(1.0)))) continue;
+      vec4 Q = texture(tPos, uv); if(Q.w<0.5) continue;
+      float dq = distance(Q.xyz,uViewPos), ds = distance(S,uViewPos);
+      if(dq < ds - 0.012){ occ += smoothstep(1.3, 0.35, distance(Q.xyz,P.xyz)); }
+    }
+    ao = clamp(1.0 - occ/14.0*1.35, 0.06, 1.0);
+  }
+  oMist = vec4(mistRay(uViewPos, dir, 0.0, depth, bn, 18), depth);
+  oInd = vec4(ind, ao);
+}`;
+
+// full-resolution shading; the same shader shades the reflection views from the mirrored camera
+const LIGHT_FRAG = /* glsl */`
+${GLSL_LIGHT_COMMON}
+uniform sampler2D tHalfMist, tHalfInd;
+uniform sampler2D tReflG, tReflM;
+uniform vec4 uGlass[4];       // analytic panes: centre + half width
+uniform vec3 uGlassU[4];
+uniform vec4 uGlassN[4];      // normal + half height
+uniform vec3 uMirrorN;
+uniform float uAudit;       // > 0: show only the direct light of lamp (uAudit - 1)
+layout(location=0) out vec4 o;
+
+float D_GGX(float nh, float a){ float a2=a*a; float d=nh*nh*(a2-1.0)+1.0; return a2/(3.14159*d*d+1e-7); }
+float V_Smith(float nv, float nl, float a){ float a2=a*a; float gv=nl*sqrt(nv*nv*(1.0-a2)+a2), gsl=nv*sqrt(nl*nl*(1.0-a2)+a2); return 0.5/(gv+gsl+1e-6); }
+vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 diffC, vec3 F0, float rough, float sphereK){
+  float nl = max(dot(N,L),0.0); if(nl<=0.0) return vec3(0.0);
+  float nv = max(dot(N,V),1e-3);
+  vec3 H = normalize(V+L); float nh = max(dot(N,H),0.0), vh = max(dot(V,H),0.0);
+  float a = max(rough*rough, 0.0016);
+  float a2 = clamp(a + sphereK, 0.0, 1.0);
+  float norm = (a/a2)*(a/a2);
+  vec3 F = F0 + (1.0-F0)*pow(1.0-vh,5.0);
+  vec3 spec = D_GGX(nh,a2)*V_Smith(nv,nl,a2)*F*max(norm, 0.04);
+  return (diffC/3.14159*(1.0-F) + min(spec, vec3(40.0)))*nl;
+}
+
+vec3 sampleRefl(sampler2D t, vec2 uv, vec2 spread, vec4 bn){
+  vec3 s = vec3(0.0);
+  float lod = max(log2(max(max(spread.x,spread.y)*float(textureSize(t,0).x)*0.45, 1.0)), 0.0);
+  for(int k=0;k<10;k++){
+    float r = sqrt((float(k)+bn.y)/10.0), a = float(k)*2.39996 + bn.x*6.2831853;
+    s += textureLod(t, uv + vec2(cos(a),sin(a))*r*spread, lod).rgb;
+  }
+  return s/10.0;
+}
+
+void main(){
+  vec4 bn = blue(gl_FragCoord.xy, uSample+3.0);
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 P4 = texelFetch(tPos, ip, 0);
+  vec4 wf = uInvViewProj*vec4(vUv*2.0-1.0, 1.0, 1.0);
+  vec3 ray = normalize(wf.xyz/wf.w - uViewPos);
+  vec3 col;
+  float depth = 60.0;
+  float mid = P4.w;
+  float interior = 0.0; if(mid > 100.0){ mid -= 100.0; interior = 1.0; }
+
+  bool audit = uAudit > 0.5; int auditLamp = int(uAudit + 0.5) - 1;
+  if(P4.w < 0.5){
+    col = audit ? vec3(0.0) : skyColor(ray);
+  } else {
+    vec3 P = P4.xyz;
+    depth = distance(P, uViewPos);
+    ray = (P - uViewPos)/depth;
+    vec3 V = -ray;
+    vec4 nr = texelFetch(tNor, ip, 0), am = texelFetch(tAlb, ip, 0), em = texelFetch(tEmi, ip, 0);
+    vec3 N = nr.xyz; float rough = nr.w;
+    int m = int(mid + 0.5) - 1;
+    float transl = em.x, wet = em.y, flag = em.z;
+    if(m==17){ transl = 0.0; wet = 0.0; flag = 6.0; }
+    vec3 alb = am.rgb; float metal = am.a;
+    vec3 diffC = alb*(1.0-metal);
+    vec3 F0 = mix(vec3(m==8 ? 0.02 : 0.04), alb, metal);
+    col = vec3(0.0);
+
+    // ── indirect + occlusion ──
+    vec3 ind; float ao;
+    if(uIsRefl < 0.5){
+      // depth-aware upsample of the half-resolution buffers
+      vec2 hs = vec2(textureSize(tHalfInd,0));
+      vec2 hp = vUv*hs - 0.5; ivec2 i0 = ivec2(floor(hp)); vec2 f = hp - floor(hp);
+      vec4 sum = vec4(0.0); float ws = 0.0;
+      for(int j=0;j<4;j++){
+        ivec2 o_ = ivec2(j&1, j>>1);
+        ivec2 c = clamp(i0+o_, ivec2(0), ivec2(hs)-1);
+        float dd = texelFetch(tHalfMist, c, 0).a;
+        float w = (o_.x==1?f.x:1.0-f.x)*(o_.y==1?f.y:1.0-f.y) / (0.002 + abs(dd-depth)/depth*8.0);
+        sum += texelFetch(tHalfInd, c, 0)*w; ws += w;
+      }
+      sum /= max(ws,1e-6); ind = sum.rgb; ao = sum.a;
+    } else {
+      ind = indirectAt(P, N, uViewPos, 3, int(mod(uSample,3.0)));
+      ao = 0.8;
+    }
+
+    // ── steady sky fill and moonlight: they arrived long ago and never change ──
+    float skyVis = mix(0.52, 1.0, smoothstep(0.0, 8.5, P.y));
+    if(interior > 0.5) skyVis *= 0.16;
+    vec3 skyAmb = mix(vec3(0.044,0.062,0.094), vec3(0.108,0.176,0.325), N.y*0.5+0.5);
+    skyAmb += vec3(0.028,0.046,0.086)*max(N.x,0.0) + vec3(0.016,0.025,0.046)*max(N.z,0.0);
+    float aoA = ao*ao*0.55 + ao*0.45;
+    col += diffC*skyAmb*skyVis*aoA*1.12;
+    col += diffC*ind*aoA;
+    {
+      vec3 R = reflect(ray, N);
+      float fr = pow(1.0-max(dot(N,V),0.0),5.0);
+      vec3 envF = F0 + (max(vec3(1.0-rough),F0)-F0)*fr;
+      vec3 env = mix(vec3(0.018,0.027,0.042), vec3(0.046,0.086,0.175), smoothstep(-0.2,0.7,R.y));
+      if(flag == 1.0) env *= 2.3;
+      if(flag < 1.5 || flag > 2.5) col += envF*env*skyVis*ao*(1.0-rough*0.6)*(flag==4.0?0.0:1.0)*(flag==3.0?1.9:1.0);
+      col += ind*envF*ao*0.18*(flag==2.0||flag==4.0?0.0:1.0);
+    }
+    float nlM = dot(N, uMoonDir);
+    vec3 moonC = vec3(0.235,0.355,0.640)*0.86;
+    if(nlM > 0.0 || transl > 0.0){
+      float ms = moonShadow(P, N*sign(nlM+1e-5), bn);
+      if(flag != 2.0 && flag != 4.0) col += brdf(N,V,uMoonDir, diffC, F0, max(rough,0.16), 0.004)*moonC*3.14159*ms;
+      col += diffC*moonC*max(-nlM,0.0)*transl*0.45*ms;
+    }
+
+    if(audit) col = vec3(0.0);
+
+    // ── lamps: every term carries the full path length ──
+    float dPC = depth;
+    for(int i=0;i<3;i++){
+      if(audit && i != auditLamp) continue;
+      vec3 Lv = uLampPos[i] - P; float dl = length(Lv); vec3 L = Lv/dl;
+      float tau = uTime - (dl + dPC)/C_LIGHT;
+      vec3 e = lampEmit(i, tau);
+      if(e.r+e.g+e.b <= 0.0) continue;
+      float nl = dot(N,L);
+      if(nl <= 0.0 && transl <= 0.0) continue;
+      vec3 f = vec3(0.0);
+      if(flag != 2.0 && flag != 4.0) f = brdf(N,V,L, diffC, F0, rough, uLampTiming[i].z/(2.0*dl));
+      if(flag == 2.0) f = diffC*max(nl,0.0)*0.22;
+      float tw = transl > 0.0 ? max(-nl,0.0)*transl : 0.0;
+      if(flag==5.0){ tw = 0.0;
+        // light caught inside a bottle: a soft coloured body glow plus a refracted caustic edge
+        f += alb*(0.20 + 1.1*pow(1.0-abs(dot(N,V)),2.0) + 1.6*pow(max(dot(refract(-L,N,0.72),V),0.0),6.0))*0.55;
+      }
+      f += alb*tw*0.5/3.14159;
+      if(f.r+f.g+f.b <= 0.0) continue;
+      float sh = lampShadow(i, P, nl>0.0 ? N : -N, bn);
+      if(sh <= 0.0) continue;
+      float fall = 1.0/(dl*dl + 0.22);
+      col += min(f*e*(uLampI[i]*fall*sh), vec3(30.0));
+    }
+
+    // ── emitters (bulb, lantern, neon tubes) ──
+    if(flag == 6.0){
+      float code = em.a; int li = int(floor(code/1000.0 + 0.0005)); float str = code - float(li)*1000.0;
+      float tau = uTime - dPC/C_LIGHT;
+      vec2 pr = lampProfile(li, tau);
+      float rim = li==2 ? 1.0 : 0.55 + 0.45*max(dot(N,V),0.0);
+      if(!audit || li == auditLamp) col += em.rgb*(pr.x + pr.y*0.35)*str*rim;
+      if(!audit) col += em.rgb*0.006;
+    }
+
+    // ── planar reflections (rendered from the mirrored camera, so their delay is the full bounce path) ──
+    if(uIsRefl < 0.5){
+      if(flag == 1.0 || flag == 2.0){
+        float cosV = max(dot(N,V), 0.0);
+        if(flag == 2.0){
+          float F = 0.085 + 0.915*pow(1.0-max(V.y,0.0), 3.4);
+          vec2 dist = audit ? vec2(0.0) : N.xz*vec2(0.55, 0.9)/(1.0+depth*0.25);
+          vec3 rf = sampleRefl(tReflG, vUv + dist, audit ? vec2(0.0) : vec2(0.0007, 0.0014), bn);
+          col += rf*min(F*1.55, 1.0);
+        } else {
+          float up = smoothstep(0.35, 0.9, N.y);
+          float F = 0.028 + 0.972*pow(1.0-clamp(mix(V.y, cosV, 0.35),0.0,1.0), 4.0);
+          vec2 dist = (N.xz)*vec2(0.10, 0.07)/(1.0+depth*0.2);
+          vec2 spr = vec2(0.0035, 0.020)*(rough*2.6) ;
+          vec3 rf = sampleRefl(tReflG, vUv + dist, spr, bn);
+          if(!audit) col += rf*F*wet*up*(1.0-rough*1.2)*0.95*mix(0.55,1.0,ao);
+        }
+      } else if(flag == 4.0){
+        vec2 dist = audit ? vec2(0.0) : (vec2(vnoise(P*3.1), vnoise(P*3.1+5.0))-0.5)*0.0016;
+        vec3 rf = textureLod(tReflM, vUv + dist, 0.0).rgb;
+        col += rf*alb*1.05;
+      }
+    } else if(flag == 4.0){
+      col += vec3(0.004,0.006,0.010);
+    }
+  }
+
+  // ── thin clear panes in front of the cafe and the shop: faint, with exact glints ──
+  float paneT = 1.0;
+  if(uIsRefl < 0.5 && !audit){
+    for(int g=0; g<4; g++){
+      if(uGlass[g].w <= 0.0) continue;
+      vec3 gn = uGlassN[g].xyz;
+      float den = dot(ray, gn); if(den >= -0.02) continue;
+      float s = dot(uGlass[g].xyz - uViewPos, gn)/den;
+      if(s <= 0.0 || s >= depth) continue;
+      vec3 X = uViewPos + ray*s; vec3 r = X - uGlass[g].xyz;
+      if(abs(dot(r,uGlassU[g])) > uGlass[g].w || abs(r.y) > uGlassN[g].w) continue;
+      vec3 w = vec3(vnoise(X*3.0), vnoise(X*3.0+11.0), vnoise(X*3.0+23.0)) - 0.5;
+      vec3 N = normalize(gn + w*0.035);
+      float F = 0.04 + 0.96*pow(1.0-abs(dot(ray,N)),5.0);
+      vec3 R = reflect(ray,N);
+      vec3 refl = mix(vec3(0.006,0.010,0.017), vec3(0.028,0.050,0.10), smoothstep(0.0,0.5,R.y));
+      for(int i=0;i<3;i++){
+        vec3 Lv = uLampPos[i]-X; float dl = length(Lv);
+        float cs = max(dot(R, Lv/dl), 0.0);
+        float glint = pow(cs, 2600.0)*220.0 + pow(cs, 120.0)*0.5;
+        if(glint < 0.01) continue;
+        refl += lampEmit(i, uTime-(dl+s)/C_LIGHT)*glint*uLampI[i]/(dl*dl)*1.2;
+      }
+      float smear = smoothstep(0.55,0.85,fbm(X*vec3(2.6,1.1,2.6)));
+      col = col*(1.0 - F) + refl*F + vec3(0.002,0.003,0.005)*smear;
+    }
+  }
+
+  // steady moonlit haze for depth
+  float s0 = 0.0;
+  if(uIsRefl > 0.5){
+    float den = dot(ray, uPlane.xyz);
+    s0 = clamp(-(dot(uViewPos, uPlane.xyz)+uPlane.w)/(abs(den)<1e-4?1e-4:den), 0.0, depth);
+  }
+  float fogA = 1.0 - exp(-(min(depth,45.0) - s0)*0.0085);
+  if(P4.w > 0.5 && !audit) col = mix(col, vec3(0.017,0.032,0.064), fogA*(interior>0.5?0.2:1.0));
+
+  vec3 mist = vec3(0.0);
+  if(uIsRefl < 0.5){
+    vec2 hs = vec2(textureSize(tHalfMist,0));
+    vec2 hp = vUv*hs - 0.5; ivec2 i0 = ivec2(floor(hp)); vec2 f = hp - floor(hp);
+    float ws = 0.0;
+    for(int j=0;j<4;j++){
+      ivec2 o_ = ivec2(j&1, j>>1);
+      ivec2 c = clamp(i0+o_, ivec2(0), ivec2(hs)-1);
+      vec4 s = texelFetch(tHalfMist, c, 0);
+      float w = (o_.x==1?f.x:1.0-f.x)*(o_.y==1?f.y:1.0-f.y) / (0.004 + abs(s.a-depth)/depth*5.0);
+      mist += s.rgb*w; ws += w;
+    }
+    mist /= max(ws,1e-6);
+  } else {
+    mist = mistRay(uViewPos, ray, s0, depth, bn, 9);
+  }
+  if(!audit) col += mist;
+  if(!(col.r >= 0.0) || !(col.g >= 0.0) || !(col.b >= 0.0)) col = vec3(0.0);
+  o = vec4(min(col, vec3(60.0)), 1.0);
+}`;
+
+const ACC_FRAG = /* glsl */`
+precision highp float; in vec2 vUv; uniform sampler2D tSrc; uniform float uW; layout(location=0) out vec4 o;
+void main(){ o = vec4(texelFetch(tSrc, ivec2(gl_FragCoord.xy), 0).rgb*uW, uW); }`;
+
+const DOWN_FRAG = /* glsl */`
+precision highp float; in vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uFirst; layout(location=0) out vec4 o;
+vec3 S(vec2 d){ return texture(tSrc, vUv + d*uTexel).rgb; }
+float karis(vec3 c){ return 1.0/(1.0+dot(c,vec3(0.2126,0.7152,0.0722))*0.25); }
+void main(){
+  vec3 a=S(vec2(-2,2)),b=S(vec2(0,2)),c=S(vec2(2,2)),d=S(vec2(-2,0)),e=S(vec2(0,0)),f=S(vec2(2,0)),g=S(vec2(-2,-2)),h=S(vec2(0,-2)),i=S(vec2(2,-2)),j=S(vec2(-1,1)),k=S(vec2(1,1)),l=S(vec2(-1,-1)),m=S(vec2(1,-1));
+  vec3 r;
+  if(uFirst > 0.5){
+    vec3 g0=(j+k+l+m)*0.25, g1=(a+b+d+e)*0.25, g2=(b+c+e+f)*0.25, g3=(d+e+g+h)*0.25, g4=(e+f+h+i)*0.25;
+    float w0=karis(g0)*0.5,w1=karis(g1)*0.125,w2=karis(g2)*0.125,w3=karis(g3)*0.125,w4=karis(g4)*0.125;
+    r=(g0*w0+g1*w1+g2*w2+g3*w3+g4*w4)/(w0+w1+w2+w3+w4);
+  } else r = e*0.125 + (a+c+g+i)*0.03125 + (b+d+f+h)*0.0625 + (j+k+l+m)*0.125;
+  o = vec4(r,1.0);
+}`;
+const UP_FRAG = /* glsl */`
+precision highp float; in vec2 vUv; uniform sampler2D tSrc; uniform sampler2D tBase; uniform vec2 uTexel; uniform float uMix; layout(location=0) out vec4 o;
+vec3 S(vec2 d){ return texture(tSrc, vUv + d*uTexel).rgb; }
+void main(){
+  vec3 u = S(vec2(0))*4.0 + (S(vec2(1,0))+S(vec2(-1,0))+S(vec2(0,1))+S(vec2(0,-1)))*2.0 + S(vec2(1,1))+S(vec2(-1,1))+S(vec2(1,-1))+S(vec2(-1,-1));
+  o = vec4(mix(texture(tBase,vUv).rgb, u/16.0, uMix), 1.0);
+}`;
+
+const FINAL_FRAG = /* glsl */`
+precision highp float; in vec2 vUv;
+uniform sampler2D tHDR, tBloom, tBlue;
+uniform vec2 uOut; uniform float uFrame; uniform float uSS; uniform float uExposure;
+layout(location=0) out vec4 o;
+vec3 RRTAndODTFit(vec3 v){ vec3 a=v*(v+0.0245786)-0.000090537; vec3 b=v*(0.983729*v+0.4329510)+0.238081; return a/b; }
+vec3 aces(vec3 c){
+  const mat3 I = mat3(0.59719,0.07600,0.02840, 0.35458,0.90834,0.13383, 0.04823,0.01566,0.83777);
+  const mat3 O = mat3(1.60475,-0.10208,-0.00327, -0.53108,1.10813,-0.07276, -0.07367,-0.00605,1.07602);
+  return clamp(O*RRTAndODTFit(I*(c/0.6)),0.0,1.0);
+}
+vec3 srgb(vec3 c){ return mix(c*12.92, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(0.0031308,c)); }
+void main(){
+  vec2 px = 1.0/uOut;
+  vec3 bloom = texture(tBloom, vUv).rgb;
+  vec2 cc = vUv - 0.5;
+  float vig = 1.0 - 0.27*smoothstep(0.18, 0.78, dot(cc,cc)*1.7);
+  vec3 sum = vec3(0.0);
+  // supersample resolve in display-linear light
+  int n = uSS > 1.5 ? 2 : 1;
+  for(int y=0;y<n;y++) for(int x=0;x<n;x++){
+    vec2 uv = n==2 ? vUv + (vec2(x,y)-0.5)*0.5*px : vUv;
+    vec3 h = texture(tHDR, uv).rgb;
+    h = mix(h, bloom, 0.045) + max(bloom - 0.55, 0.0)*0.05;
+    sum += aces(h*uExposure*vig);
+  }
+  vec3 c = sum/float(n*n);
+  float lum = dot(c, vec3(0.2126,0.7152,0.0722));
+  // gentle grade: cool lifted shadows, warm highlights
+  c *= mix(vec3(0.95,1.0,1.07), vec3(1.03,1.0,0.96), smoothstep(0.02,0.45,lum));
+  vec3 s = srgb(clamp(c,0.0,1.0));
+  s = s + vec3(0.0035,0.0065,0.0135)*(1.0-smoothstep(0.0,0.35,s));
+  float L = dot(s, vec3(0.299,0.587,0.114));
+  // fine grain, strongest in the midtones and nearly absent in the darks
+  ivec2 fc = ivec2(gl_FragCoord.xy);
+  ivec2 off = ivec2(int(mod(uFrame*47.0,64.0)), int(mod(uFrame*83.0,64.0)));
+  vec4 bn = texelFetch(tBlue, (fc+off)%64, 0);
+  float h1 = fract(sin(dot(vec2(fc) + mod(uFrame,97.0)*vec2(1.37,2.11), vec2(12.9898,78.233)))*43758.5453);
+  float gAmt = 0.020*smoothstep(0.03,0.30,L)*(1.0-0.6*smoothstep(0.55,0.95,L));
+  s += (h1 + bn.g - 1.0)*gAmt;
+  // blue-noise TPDF dither of one 8-bit step
+  float u1 = bn.r;
+  float tri = u1 < 0.5 ? sqrt(2.0*u1)-1.0 : 1.0-sqrt(2.0-2.0*u1);
+  s += tri/255.0;
+  o = vec4(clamp(s,0.0,1.0), 1.0);
+}`;
+
+// ───────────────────────────── geometry toolkit ─────────────────────────────
+const M = { PLASTER: 0, BRICK: 1, STONE: 2, WOOD: 3, IRON: 4, GLASS: 5, COBBLE: 6, GRIT: 7, WATER: 8, MIRROR: 9, CLOTH: 10, LEAF: 11, PETAL: 12, MATTE: 13, ROOF: 14, BOTTLE: 15, BRASS: 16, EMIT: 17, INNER: 18, BOARD: 19, FUR: 20 };
+
+class Builder {
+  constructor() { this.pos = []; this.nor = []; this.col = []; this.mat = []; }
+  add(geo, matrix, o = {}) {
+    let g = geo.index ? geo.toNonIndexed() : geo.clone();
+    if (matrix) g.applyMatrix4(matrix);
+    const p = g.attributes.position.array, n = g.attributes.normal.array;
+    const c = o.color || [0.5, 0.5, 0.5];
+    const mid = (o.mat ?? M.MATTE) + (o.interior ? 100 : 0);
+    const flip = matrix && matrix.determinant() < 0;
+    for (let i = 0; i < p.length; i += 3) {
+      this.pos.push(p[i], p[i + 1], p[i + 2]); this.nor.push(n[i], n[i + 1], n[i + 2]);
+      this.col.push(c[0], c[1], c[2]); this.mat.push(mid, o.rough ?? 0.7, o.lamp ?? 0, o.glow ?? 0);
+    }
+    g.dispose();
+    return this;
+  }
+  geometry() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
+    g.setAttribute('aColor', new THREE.Float32BufferAttribute(this.col, 3));
+    g.setAttribute('aMat', new THREE.Float32BufferAttribute(this.mat, 4));
+    return g;
+  }
+}
+
+const mtx = (x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sx = 1, sy = 1, sz = 1) =>
+  new THREE.Matrix4().compose(V3(x, y, z), new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, rz)), V3(sx, sy, sz));
+
+// A frame lets us build in local coordinates (u along a wall, v up, d out of the wall)
+class Frame {
+  constructor(origin, U) {
+    this.o = origin.clone(); this.U = U.clone().normalize(); this.Y = V3(0, 1, 0);
+    this.N = new THREE.Vector3().crossVectors(this.U, this.Y).normalize();
+    this.m = new THREE.Matrix4().makeBasis(this.U, this.Y, this.N).setPosition(this.o);
+  }
+  static wall(ax, az, bx, bz) { const U = V3(bx - ax, 0, bz - az); const f = new Frame(V3(ax, 0, az), U); f.len = U.length(); return f; }
+  p(u, v, d = 0) { return this.o.clone().addScaledVector(this.U, u).addScaledVector(this.Y, v).addScaledVector(this.N, d); }
+  at(u, v, d, rx = 0, ry = 0, rz = 0, sx = 1, sy = 1, sz = 1) { return this.m.clone().multiply(mtx(u, v, d, rx, ry, rz, sx, sy, sz)); }
+}
+
+const BOXC = new Map();
+function boxGeo(w, h, d) { const k = w + ',' + h + ',' + d; if (!BOXC.has(k)) BOXC.set(k, new THREE.BoxGeometry(w, h, d)); return BOXC.get(k); }
+function box(B, F, u0, u1, v0, v1, d0, d1, o) { // axis box in a wall frame
+  B.add(boxGeo(u1 - u0, v1 - v0, d1 - d0), F.at((u0 + u1) / 2, (v0 + v1) / 2, (d0 + d1) / 2), o);
+}
+function wbox(B, x, y, z, w, h, d, o, ry = 0, rx = 0, rz = 0) { B.add(boxGeo(w, h, d), mtx(x, y, z, rx, ry, rz), o); }
+
+// cylinder between two points
+function rod(B, a, b, r, o, seg = 7, r2 = null) {
+  const d = new THREE.Vector3().subVectors(b, a); const len = d.length(); if (len < 1e-4) return;
+  const g = new THREE.CylinderGeometry(r2 ?? r, r, len, seg, 1, false);
+  const q = new THREE.Quaternion().setFromUnitVectors(V3(0, 1, 0), d.normalize());
+  B.add(g, new THREE.Matrix4().compose(a.clone().add(b).multiplyScalar(0.5), q, V3(1, 1, 1)), o); g.dispose();
+}
+function tube(B, pts, r, o, segs = 24, rad = 6, closed = false) {
+  const c = new THREE.CatmullRomCurve3(pts, closed, 'catmullrom', 0.5);
+  const g = new THREE.TubeGeometry(c, segs, r, rad, closed); B.add(g, null, o); g.dispose();
+}
+function sphere(B, p, r, o, sx = 1, sy = 1, sz = 1, seg = 14) { const g = new THREE.SphereGeometry(r, seg, Math.max(6, seg * 0.75 | 0)); B.add(g, mtx(p.x, p.y, p.z, 0, 0, 0, sx, sy, sz), o); g.dispose(); }
+function lathe(B, pts, matrix, o, seg = 14) { const g = new THREE.LatheGeometry(pts.map(p => new THREE.Vector2(p[0], p[1])), seg); B.add(g, matrix, o); g.dispose(); }
+
+// slab of masonry with real openings: front face at d = 0, thickness going inwards, reveals for free
+function wallSlab(B, F, len, h, holes, thick, o, v0 = 0) {
+  const s = new THREE.Shape(); s.moveTo(0, v0); s.lineTo(len, v0); s.lineTo(len, h); s.lineTo(0, h); s.closePath();
+  for (const H of holes) {
+    const p = new THREE.Path();
+    if (H.arch) {
+      const r = (H.u1 - H.u0) / 2, spring = H.v1 - r;
+      p.moveTo(H.u0, H.v0); p.lineTo(H.u0, spring); p.absarc(H.u0 + r, spring, r, Math.PI, 0, true); p.lineTo(H.u1, H.v0); p.closePath();
+    } else { p.moveTo(H.u0, H.v0); p.lineTo(H.u0, H.v1); p.lineTo(H.u1, H.v1); p.lineTo(H.u1, H.v0); p.closePath(); }
+    s.holes.push(p);
+  }
+  const g = new THREE.ExtrudeGeometry(s, { depth: thick, bevelEnabled: false, curveSegments: 18 });
+  B.add(g, F.m.clone().multiply(mtx(0, 0, -thick)), o); g.dispose();
+}
+
+// naive surface nets: organic meshes (cat, figure) from signed distance functions
+function sdfMesh(sdf, min, max, cell) {
+  const nx = Math.ceil((max.x - min.x) / cell) + 1, ny = Math.ceil((max.y - min.y) / cell) + 1, nz = Math.ceil((max.z - min.z) / cell) + 1;
+  const val = new Float32Array(nx * ny * nz); const I = (i, j, k) => i + nx * (j + ny * k);
+  const p = V3();
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { p.set(min.x + i * cell, min.y + j * cell, min.z + k * cell); val[I(i, j, k)] = sdf(p); }
+  const vid = new Int32Array(nx * ny * nz).fill(-1); const verts = [], norms = [], idx = [];
+  const corners = [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]];
+  const edges = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+  const e = cell * 0.5;
+  for (let k = 0; k < nz - 1; k++) for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    const c = corners.map(o => val[I(i + o[0], j + o[1], k + o[2])]);
+    let neg = 0; for (const v of c) if (v < 0) neg++; if (neg === 0 || neg === 8) continue;
+    let sx = 0, sy = 0, sz = 0, n = 0;
+    for (const [a, b] of edges) if ((c[a] < 0) !== (c[b] < 0)) { const t = c[a] / (c[a] - c[b]); sx += corners[a][0] + (corners[b][0] - corners[a][0]) * t; sy += corners[a][1] + (corners[b][1] - corners[a][1]) * t; sz += corners[a][2] + (corners[b][2] - corners[a][2]) * t; n++; }
+    const q = V3(min.x + (i + sx / n) * cell, min.y + (j + sy / n) * cell, min.z + (k + sz / n) * cell);
+    vid[I(i, j, k)] = verts.length / 3; verts.push(q.x, q.y, q.z);
+    const gx = sdf(V3(q.x + e, q.y, q.z)) - sdf(V3(q.x - e, q.y, q.z)), gy = sdf(V3(q.x, q.y + e, q.z)) - sdf(V3(q.x, q.y - e, q.z)), gz = sdf(V3(q.x, q.y, q.z + e)) - sdf(V3(q.x, q.y, q.z - e));
+    const gn = V3(gx, gy, gz).normalize(); norms.push(gn.x, gn.y, gn.z);
+  }
+  const quad = (a, b, c, d, flip) => { if (a < 0 || b < 0 || c < 0 || d < 0) return; if (flip) idx.push(a, c, b, b, c, d); else idx.push(a, b, c, b, d, c); };
+  for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+    const v = val[I(i, j, k)] < 0;
+    if (i < nx - 1 && v !== (val[I(i + 1, j, k)] < 0)) quad(vid[I(i, j - 1, k - 1)], vid[I(i, j, k - 1)], vid[I(i, j - 1, k)], vid[I(i, j, k)], !v);
+    if (j < ny - 1 && v !== (val[I(i, j + 1, k)] < 0)) quad(vid[I(i - 1, j, k - 1)], vid[I(i - 1, j, k)], vid[I(i, j, k - 1)], vid[I(i, j, k)], !v);
+    if (k < nz - 1 && v !== (val[I(i, j, k + 1)] < 0)) quad(vid[I(i - 1, j - 1, k)], vid[I(i, j - 1, k)], vid[I(i - 1, j, k)], vid[I(i, j, k)], !v);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(norms, 3));
+  g.setIndex(idx);
+  return g;
+}
+const smin = (a, b, k) => { const h = clamp(0.5 + 0.5 * (b - a) / k, 0, 1); return lerp(b, a, h) - k * h * (1 - h); };
+function sdCapsule(p, a, b, r1, r2 = r1) {
+  const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z; const apx = p.x - a.x, apy = p.y - a.y, apz = p.z - a.z;
+  const t = clamp((apx * abx + apy * aby + apz * abz) / (abx * abx + aby * aby + abz * abz), 0, 1);
+  return Math.hypot(apx - abx * t, apy - aby * t, apz - abz * t) - lerp(r1, r2, t);
+}
+function sdEllipsoid(p, c, r) { const x = (p.x - c.x) / r.x, y = (p.y - c.y) / r.y, z = (p.z - c.z) / r.z; const k0 = Math.hypot(x, y, z); const k1 = Math.hypot(x / r.x, y / r.y, z / r.z); return k1 > 0 ? k0 * (k0 - 1) / k1 : -Math.min(r.x, r.y, r.z); }
+
+// ───────────────────────────── the street ─────────────────────────────
+// plan view: camera near the origin looking down -z. Left walls face +x, right walls face -x.
+const HERO = (() => { // facade with the lamp window, angled 30 deg toward the camera; the bulb hangs 14 cm proud of it
+  const U = V3(0.5, 0, -0.8660254).normalize(); const N = new THREE.Vector3().crossVectors(U, V3(0, 1, 0));
+  const behind = V3(-3.0, 0, -8.0).addScaledVector(N, -0.14);
+  const A = behind.clone().addScaledVector(U, -2.3); const f = new Frame(A, U); f.len = 4.7; f.ub = 2.3; return f;
+})();
+const HERO_END = HERO.p(HERO.len, 0, 0);
+const W_NEARL = Frame.wall(-3.75, 3.5, HERO.o.x, HERO.o.z);
+const W_FARL = Frame.wall(HERO_END.x, HERO_END.z, -2.02, -19.0);
+const W_NEARR = Frame.wall(4.6, -8.6, 5.0, 3.5);
+const CAFE = Frame.wall(2.4, -12.6, 4.6, -8.6);
+const W_FARR = Frame.wall(2.22, -19.0, 2.4, -12.6);
+const ENDW = Frame.wall(-2.02, -19.0, 2.22, -19.0);
+
+const CAFE_WIN = { u0: 1.0, u1: 4.22, v0: 0.55, v1: 3.25 };
+// The mirror is aimed by the law of reflection so that, from the camera around t = 4.5 s, it shows the bare bulb:
+// its normal bisects (mirror -> camera) and (mirror -> bulb). Everything it shows then follows from that one pose.
+const MIRROR_AIM = CAFE.p(2.32, 1.50, -1.70);
+const MIRROR = (() => {
+  const toCam = cameraAt(4.45).pos.clone().sub(MIRROR_AIM).normalize();
+  const toLamp = LAMPS[0].pos.clone().sub(MIRROR_AIM).normalize();
+  const n = toCam.add(toLamp).normalize();
+  const right = CAFE.U.clone().addScaledVector(n, -CAFE.U.dot(n)).normalize();
+  const up = new THREE.Vector3().crossVectors(n, right).normalize(); if (up.y < 0) up.negate();
+  const c = MIRROR_AIM.clone().addScaledVector(up, 0.30).addScaledVector(right, 0.02);
+  return { n, c, right, up, hw: 1.13, hh: 0.70 };
+})();
+const SHOP = { u0: 1.86, u1: 4.02, v0: 0.50, v1: 2.72 };
+
+const PROXIES = [];   // rectangles used to place the one-bounce virtual lights
+function proxy(F, u0, u1, v0, v1, d, albedo, flipN = false) {
+  PROXIES.push({ o: F.p(u0, v0, d), a: F.U.clone().multiplyScalar(u1 - u0), b: V3(0, v1 - v0, 0), n: F.N.clone().multiplyScalar(flipN ? -1 : 1), albedo });
+}
+
+const COL = {
+  heroPl: [0.50, 0.34, 0.20], ochre: [0.47, 0.30, 0.14], rose: [0.46, 0.25, 0.19], cream: [0.55, 0.47, 0.34], sage: [0.30, 0.33, 0.25], grey: [0.36, 0.34, 0.31], terracotta: [0.40, 0.17, 0.09],
+  stone: [0.36, 0.33, 0.27], darkStone: [0.20, 0.19, 0.17], iron: [0.035, 0.036, 0.040],
+  shTeal: [0.045, 0.135, 0.135], shGreen: [0.060, 0.115, 0.055], shRed: [0.21, 0.045, 0.030], shBlue: [0.055, 0.085, 0.17], wood: [0.12, 0.062, 0.028], frame: [0.30, 0.27, 0.21],
+};
+
+// ── foliage ──
+const LEAF_GEO = (() => {
+  const s = new THREE.Shape(); s.moveTo(0, -0.5); s.bezierCurveTo(0.55, -0.35, 0.5, 0.15, 0.0, 0.55); s.bezierCurveTo(-0.5, 0.15, -0.55, -0.35, 0, -0.5);
+  const g = new THREE.ShapeGeometry(s, 3); const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setZ(i, Math.abs(p.getX(i)) * 0.28);
+  g.computeVertexNormals(); return g;
+})();
+function leaf(B, pos, size, normalHint, col, mat = M.LEAF) {
+  const n = normalHint.clone().add(V3(rand(-0.7, 0.7), rand(-0.3, 0.8), rand(-0.7, 0.7))).normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(V3(0, 0, 1), n).multiply(new THREE.Quaternion().setFromAxisAngle(V3(0, 0, 1), rand(0, 6.28)));
+  B.add(LEAF_GEO, new THREE.Matrix4().compose(pos, q, V3(size, size, size)), { mat, color: col });
+}
+function leafCluster(B, c, rx, ry, rz, count, size, nh, base) {
+  for (let i = 0; i < count; i++) {
+    const p = V3(c.x + rand(-rx, rx) * Math.sqrt(RNG()), c.y + rand(-ry, ry), c.z + rand(-rz, rz) * Math.sqrt(RNG()));
+    const k = rand(0.6, 1.35);
+    leaf(B, p, size * rand(0.7, 1.3), nh, [base[0] * k, base[1] * k * rand(0.85, 1.15), base[2] * k]);
+  }
+}
+function ivy(B, F, u, v, count, spread, up) {
+  for (let s = 0; s < count; s++) {
+    let cu = u + rand(-spread, spread) * 0.4, cv = v;
+    const pts = [F.p(cu, cv, 0.015)];
+    const steps = 18 + (RNG() * 16 | 0);
+    let du = rand(-0.06, 0.06);
+    for (let i = 0; i < steps; i++) {
+      du = clamp(du + rand(-0.05, 0.05), -0.12, 0.12); cu += du; cv += up * rand(0.05, 0.17);
+      if (cu < 0.03 || cu > F.len - 0.03) du *= -1;
+      cu = clamp(cu, 0.03, F.len - 0.03);
+      pts.push(F.p(cu, cv, 0.018));
+      const dense = 1 - i / steps;
+      const n = 3 + (RNG() * 9 * (0.35 + dense) | 0);
+      for (let k = 0; k < n; k++) { const c = pick([[0.040, 0.105, 0.028], [0.060, 0.135, 0.030], [0.028, 0.075, 0.025], [0.09, 0.13, 0.03]]); leaf(B, F.p(cu + rand(-0.16, 0.16) * (0.4 + dense), cv + rand(-0.1, 0.1), rand(0.025, 0.11)), rand(0.055, 0.105), F.N, c); }
+    }
+    if (pts.length > 3) tube(B, pts, 0.007, { mat: M.WOOD, color: [0.05, 0.035, 0.02] }, pts.length * 2, 4);
+  }
+}
+function flowerBox(B, F, u0, u1, v, flowers) {
+  box(B, F, u0, u1, v - 0.16, v, 0.03, 0.24, { mat: M.WOOD, color: pick([[0.14, 0.07, 0.03], COL.shGreen, [0.22, 0.09, 0.05]]) });
+  const n = Math.max(2, Math.round((u1 - u0) / 0.2));
+  for (let i = 0; i < n; i++) {
+    const cu = lerp(u0 + 0.09, u1 - 0.09, i / (n - 1));
+    const c = F.p(cu, v + 0.07, 0.15);
+    leafCluster(B, c, 0.14, 0.10, 0.12, 55, 0.062, F.N, [0.05, 0.13, 0.03]);
+    for (let k = 0; k < 9; k++) {
+      const fp = F.p(cu + rand(-0.11, 0.11), v + rand(0.06, 0.2), rand(0.1, 0.27));
+      for (let j = 0; j < 6; j++) leaf(B, fp.clone().add(V3(rand(-0.025, 0.025), rand(-0.02, 0.02), rand(-0.025, 0.025))), 0.034, F.N, flowers, M.PETAL);
+    }
+    if (RNG() < 0.5) { // trailing stem
+      let q = F.p(cu, v - 0.04, 0.26); for (let k = 0; k < 8; k++) { q = q.clone().add(V3(rand(-0.02, 0.02), -0.045, rand(-0.01, 0.01))); leaf(B, q, 0.05, F.N, [0.05, 0.12, 0.03]); }
+    }
+  }
+}
+
+// ── windows, shutters, balconies ──
+function shutterLeaf(B, F, u0, u1, v0, v1, d, col, swing = 0, hingeLeft = true) {
+  const w = u1 - u0;
+  const hu = hingeLeft ? u0 : u1;
+  const G = F.m.clone().multiply(mtx(hu, 0, d, 0, hingeLeft ? -swing : swing, 0));
+  const s = hingeLeft ? 1 : -1;
+  const part = (a, b, c0, c1, th, o) => B.add(boxGeo(Math.abs(b - a), c1 - c0, th), G.clone().multiply(mtx(s * (a + b) / 2, (c0 + c1) / 2, 0)), o);
+  const o = { mat: M.WOOD, color: col };
+  part(0, 0.055, v0, v1, 0.045, o); part(w - 0.055, w, v0, v1, 0.045, o);
+  part(0.055, w - 0.055, v0, v0 + 0.07, 0.045, o); part(0.055, w - 0.055, v1 - 0.07, v1, 0.045, o); part(0.055, w - 0.055, (v0 + v1) / 2 - 0.03, (v0 + v1) / 2 + 0.03, 0.045, o);
+  for (let y = v0 + 0.1; y < v1 - 0.09; y += 0.058) B.add(boxGeo(w - 0.1, 0.048, 0.01), G.clone().multiply(mtx(s * w / 2, y, 0, 0.6, 0, 0)), o);
+  for (const y of [v0 + 0.2, v1 - 0.2]) part(0.0, w * 0.55, y, y + 0.025, 0.056, { mat: M.IRON, color: COL.iron });
+}
+function surround(B, F, u0, u1, v0, v1, o = { mat: M.STONE, color: COL.stone }) {
+  box(B, F, u0 - 0.09, u0, v0, v1, -0.01, 0.045, o);
+  box(B, F, u1, u1 + 0.09, v0, v1, -0.01, 0.045, o);
+  box(B, F, u0 - 0.13, u1 + 0.13, v1, v1 + 0.15, -0.01, 0.065, o);
+  box(B, F, u0 - 0.15, u1 + 0.15, v1 + 0.15, v1 + 0.19, -0.01, 0.10, o);
+  box(B, F, u0 - 0.14, u1 + 0.14, v0 - 0.10, v0, -0.01, 0.13, o);
+}
+function windowFill(B, F, u0, u1, v0, v1, d = -0.17) {
+  box(B, F, u0, u1, v0, v1, d - 0.03, d, { mat: M.GLASS, color: [0.01, 0.012, 0.015] });
+  const o = { mat: M.WOOD, color: COL.frame };
+  const um = (u0 + u1) / 2;
+  box(B, F, u0, u0 + 0.05, v0, v1, d, d + 0.035, o); box(B, F, u1 - 0.05, u1, v0, v1, d, d + 0.035, o);
+  box(B, F, u0, u1, v0, v0 + 0.06, d, d + 0.035, o); box(B, F, u0, u1, v1 - 0.05, v1, d, d + 0.035, o);
+  box(B, F, um - 0.032, um + 0.032, v0, v1, d, d + 0.045, o);
+  for (const t of [0.36, 0.70]) box(B, F, u0, u1, lerp(v0, v1, t) - 0.013, lerp(v0, v1, t) + 0.013, d, d + 0.03, o);
+}
+// opts: sh: 'open' | 'closed' | 'half' | null,  box: flower colour,  arch
+function stdWindow(B, F, w) {
+  const { u0, u1, v0, v1 } = w;
+  surround(B, F, u0, u1, v0, v1);
+  windowFill(B, F, u0, u1, v0, v1);
+  const um = (u0 + u1) / 2, hw = (u1 - u0) / 2;
+  const sc = w.sc || COL.shTeal;
+  if (w.sh === 'closed') { shutterLeaf(B, F, u0 + 0.005, um - 0.004, v0 + 0.01, v1 - 0.01, -0.025, sc, 0, true); shutterLeaf(B, F, um + 0.004, u1 - 0.005, v0 + 0.01, v1 - 0.01, -0.025, sc, 0, false); }
+  else if (w.sh === 'open') { shutterLeaf(B, F, u0 - hw - 0.1, u0 - 0.1, v0, v1, 0.07, sc, 0.03, true); shutterLeaf(B, F, u1 + 0.1, u1 + 0.1 + hw, v0, v1, 0.07, sc, -0.0, false); }
+  else if (w.sh === 'half') { shutterLeaf(B, F, u0 + 0.0, um - 0.004, v0 + 0.01, v1 - 0.01, 0.03, sc, 1.0, true); shutterLeaf(B, F, u1 + 0.1, u1 + 0.1 + hw, v0, v1, 0.07, sc, 0, false); }
+  if (w.box) flowerBox(B, F, u0 - 0.04, u1 + 0.04, v0 - 0.1, w.box);
+}
+function ironRailing(B, F, u0, u1, v0, v1, d, step = 0.115, scroll = true) {
+  const o = { mat: M.IRON, color: COL.iron };
+  rod(B, F.p(u0, v1, d), F.p(u1, v1, d), 0.022, o, 8);
+  rod(B, F.p(u0, v1 - 0.09, d), F.p(u1, v1 - 0.09, d), 0.009, o, 6);
+  rod(B, F.p(u0, v0 + 0.05, d), F.p(u1, v0 + 0.05, d), 0.012, o, 6);
+  const n = Math.max(2, Math.round((u1 - u0) / step));
+  for (let i = 0; i <= n; i++) {
+    const u = lerp(u0, u1, i / n);
+    rod(B, F.p(u, v0, d), F.p(u, v1, d), (i === 0 || i === n) ? 0.017 : 0.0085, o, 6);
+    sphere(B, F.p(u, v0 + (v1 - v0) * 0.5, d), 0.016, o, 1, 1.4, 1, 7);
+    if (scroll && i < n) {
+      const cu = lerp(u0, u1, (i + 0.5) / n);
+      const ring = (cv, r) => { const g = new THREE.TorusGeometry(r, 0.0055, 5, 14, Math.PI * 1.65); B.add(g, F.at(cu, cv, d, 0, 0, (i % 2 ? 0.6 : 3.7)), o); g.dispose(); };
+      ring(v0 + 0.15, 0.036); ring(v1 - 0.17, 0.028);
+    }
+  }
+}
+function balcony(B, F, u0, u1, v, depth = 0.55) {
+  box(B, F, u0 - 0.06, u1 + 0.06, v - 0.09, v, 0, depth, { mat: M.STONE, color: COL.stone });
+  box(B, F, u0 - 0.03, u1 + 0.03, v - 0.14, v - 0.09, 0, depth - 0.05, { mat: M.STONE, color: COL.darkStone });
+  for (const u of [u0 + 0.12, u1 - 0.12]) {
+    tube(B, [F.p(u, v - 0.6, 0.01), F.p(u, v - 0.5, 0.17), F.p(u, v - 0.26, 0.2), F.p(u, v - 0.13, depth - 0.1)], 0.016, { mat: M.IRON, color: COL.iron }, 16, 6);
+    rod(B, F.p(u, v - 0.6, 0.015), F.p(u, v - 0.13, 0.015), 0.014, { mat: M.IRON, color: COL.iron });
+  }
+  ironRailing(B, F, u0, u1, v, v + 0.92, depth - 0.04);
+  for (const u of [u0, u1]) { for (let d = 0.1; d < depth - 0.05; d += 0.12) rod(B, F.p(u, v, d), F.p(u, v + 0.92, d), 0.008, { mat: M.IRON, color: COL.iron }); rod(B, F.p(u, v + 0.92, 0), F.p(u, v + 0.92, depth - 0.04), 0.02, { mat: M.IRON, color: COL.iron }); }
+}
+function door(B, F, u0, u1, v1, col = COL.wood, arch = false) {
+  const o = { mat: M.WOOD, color: col };
+  box(B, F, u0, u1, 0, v1, -0.22, -0.18, o);
+  const um = (u0 + u1) / 2;
+  for (const [a, b] of [[u0 + 0.07, um - 0.04], [um + 0.04, u1 - 0.07]]) for (const [c, d] of [[0.2, 0.75], [0.86, 1.5], [1.62, v1 - 0.22]]) { box(B, F, a, b, c, d, -0.18, -0.158, o); box(B, F, a + 0.05, b - 0.05, c + 0.05, d - 0.05, -0.158, -0.14, o); }
+  box(B, F, um - 0.012, um + 0.012, 0.05, v1 - 0.05, -0.18, -0.15, o);
+  sphere(B, F.p(um + 0.09, 1.08, -0.11), 0.035, { mat: M.BRASS, color: [0.55, 0.38, 0.12] });
+  if (!arch) surround(B, F, u0, u1, 0.1, v1);
+  box(B, F, u0 - 0.15, u1 + 0.15, 0, 0.12, -0.2, 0.22, { mat: M.STONE, color: COL.darkStone });
+}
+function plinth(B, F, ranges, h = 0.5) { for (const [a, b] of ranges) box(B, F, a, b, 0, h + rand(-0.03, 0.03), -0.02, 0.055, { mat: M.STONE, color: COL.darkStone }); }
+function quoins(B, F, u, h, dir = 1) {
+  for (let v = 0.5, i = 0; v < h - 0.4; v += 0.31, i++) {
+    const w = i % 2 ? 0.28 : 0.46;
+    box(B, F, dir > 0 ? u : u - w, dir > 0 ? u + w : u, v, v + 0.29, -0.01, 0.03 + rand(0, 0.008), { mat: M.STONE, color: COL.stone.map(c => c * rand(0.8, 1.1)) });
+  }
+}
+function eaves(B, F, len, h) {
+  box(B, F, -0.05, len + 0.05, h - 0.12, h, 0, 0.12, { mat: M.STONE, color: COL.darkStone });
+  for (let u = 0.15; u < len; u += 0.42) box(B, F, u, u + 0.09, h, h + 0.09, -0.05, 0.30, { mat: M.WOOD, color: [0.07, 0.045, 0.028] });
+  // tiled roof: pitched slab plus rows of curved tiles
+  B.add(boxGeo(len + 0.1, 0.04, 1.6), F.at(len / 2, h + 0.55, -0.36, 0.55, 0, 0), { mat: M.ROOF, color: [0.17, 0.065, 0.035] });
+  const g = new THREE.CylinderGeometry(0.075, 0.085, 0.42, 8, 1, true, -Math.PI / 2, Math.PI);
+  for (let u = 0.08; u < len; u += 0.17) for (let r = 0; r < 4; r++) {
+    const d = 0.36 - r * 0.32, v = h + 0.115 + r * 0.196;
+    B.add(g, F.at(u + rand(-0.008, 0.008), v + rand(-0.006, 0.006), d - 0.12, -Math.PI / 2 + 0.55, 0, 0), { mat: M.ROOF, color: pick([[0.22, 0.085, 0.042], [0.17, 0.07, 0.04], [0.26, 0.12, 0.06], [0.13, 0.07, 0.05]]) });
+  }
+  g.dispose();
+  // half-round gutter
+  const gg = new THREE.CylinderGeometry(0.075, 0.075, len + 0.1, 10, 1, true, 0, Math.PI);
+  B.add(gg, F.at(len / 2, h + 0.045, 0.40, 0, 0, Math.PI / 2).multiply(mtx(0, 0, 0, 0, -Math.PI / 2, 0)), { mat: M.IRON, color: [0.09, 0.11, 0.10] }); gg.dispose();
+  rod(B, F.p(-0.05, h + 0.045, 0.475), F.p(len + 0.05, h + 0.045, 0.475), 0.012, { mat: M.IRON, color: [0.09, 0.11, 0.10] });
+}
+function downpipe(B, F, u, h) {
+  const o = { mat: M.IRON, color: [0.075, 0.095, 0.088] };
+  tube(B, [F.p(u, h + 0.03, 0.4), F.p(u, h - 0.2, 0.3), F.p(u, h - 0.45, 0.085), F.p(u, h - 0.7, 0.085)], 0.045, o, 16, 8);
+  rod(B, F.p(u, h - 0.7, 0.085), F.p(u, 0.35, 0.085), 0.045, o, 10);
+  tube(B, [F.p(u, 0.36, 0.085), F.p(u, 0.18, 0.1), F.p(u, 0.12, 0.22)], 0.045, o, 8, 8);
+  for (let v = 0.9; v < h - 0.7; v += 1.35) box(B, F, u - 0.065, u + 0.065, v, v + 0.035, 0, 0.14, o);
+}
+function chimney(B, x, y, z, ry = 0) {
+  wbox(B, x, y + 0.5, z, 0.5, 1.0, 0.38, { mat: M.BRICK, color: [0.24, 0.095, 0.05] }, ry);
+  wbox(B, x, y + 1.04, z, 0.58, 0.08, 0.46, { mat: M.STONE, color: COL.darkStone }, ry);
+  for (const dx of [-0.12, 0.12]) rod(B, V3(x + dx, y + 1.05, z), V3(x + dx, y + 1.38, z), 0.07, { mat: M.ROOF, color: [0.2, 0.08, 0.04] }, 8, 0.055);
+}
+function facade(B, F, len, h, color, windows, doors = [], opts = {}) {
+  const holes = [];
+  for (const w of windows) holes.push({ u0: w.u0, u1: w.u1, v0: w.v0, v1: w.v1 });
+  for (const d of doors) holes.push({ u0: d[0], u1: d[1], v0: 0.001, v1: d[2] });
+  for (const e of (opts.extraHoles || [])) holes.push(e);
+  wallSlab(B, F, len, h, holes, 0.3, { mat: opts.mat ?? M.PLASTER, color });
+  for (const w of windows) stdWindow(B, F, w);
+  for (const d of doors) door(B, F, d[0], d[1], d[2], d[3] || COL.wood);
+  if (opts.eaves !== false) eaves(B, F, len, h);
+}
+
+function bottle(B, p, kind, col, s = 1) {
+  const P = [
+    [[0.001, 0], [0.05, 0], [0.055, 0.02], [0.055, 0.19], [0.045, 0.23], [0.016, 0.27], [0.015, 0.34], [0.02, 0.345], [0.001, 0.35]],
+    [[0.001, 0], [0.085, 0], [0.10, 0.05], [0.085, 0.13], [0.028, 0.19], [0.022, 0.27], [0.032, 0.285], [0.001, 0.29]],
+    [[0.001, 0], [0.043, 0], [0.046, 0.015], [0.046, 0.25], [0.02, 0.29], [0.017, 0.37], [0.001, 0.38]],
+    [[0.001, 0], [0.062, 0], [0.065, 0.16], [0.038, 0.19], [0.036, 0.22], [0.05, 0.235], [0.001, 0.25]],
+  ][kind];
+  lathe(B, P, mtx(p.x, p.y, p.z, 0, 0, 0, s, s, s), { mat: M.BOTTLE, color: col }, 12);
+  rod(B, V3(p.x, p.y + P[P.length - 1][1] * s - 0.004, p.z), V3(p.x, p.y + P[P.length - 1][1] * s + 0.025 * s, p.z), 0.017 * s, { mat: M.MATTE, color: [0.3, 0.2, 0.1] }, 7);
+  if (kind !== 1) rod(B, V3(p.x, p.y + 0.06 * s, p.z), V3(p.x, p.y + 0.13 * s, p.z), (P[3][0] + 0.002) * s, { mat: M.MATTE, color: pick([[0.55, 0.48, 0.32], [0.4, 0.1, 0.06], [0.6, 0.58, 0.5]]) }, 12);
+}
+const BOTTLE_COLS = [[0.10, 0.52, 0.18], [0.75, 0.32, 0.05], [0.12, 0.30, 0.70], [0.65, 0.07, 0.07], [0.62, 0.75, 0.70], [0.30, 0.55, 0.45], [0.70, 0.55, 0.12]];
+
+function tableAndChairs(B, x, z, cloth, chairAngles) {
+  const iron = { mat: M.IRON, color: [0.05, 0.075, 0.062] };
+  const y0 = 0.035;
+  rod(B, V3(x, y0 + 0.07, z), V3(x, 0.74, z), 0.028, iron, 9);
+  for (let i = 0; i < 3; i++) { const a = i * 2.094 + 0.4; tube(B, [V3(x, 0.22, z), V3(x + Math.cos(a) * 0.14, 0.10, z + Math.sin(a) * 0.14), V3(x + Math.cos(a) * 0.30, y0 + 0.012, z + Math.sin(a) * 0.30)], 0.016, iron, 10, 6); }
+  lathe(B, [[0.001, 0.74], [0.34, 0.74], [0.345, 0.755], [0.34, 0.77], [0.001, 0.77]], mtx(x, 0, z), { mat: cloth ? M.CLOTH : M.STONE, color: cloth ? [0.72, 0.70, 0.62] : [0.42, 0.4, 0.36] }, 40);
+  if (cloth) {
+    const g = new THREE.CylinderGeometry(0.343, 0.39, 0.30, 72, 5, true); const p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) { const px = p.getX(i), py = p.getY(i), pz = p.getZ(i); const a = Math.atan2(pz, px); const w = (0.15 - py) / 0.30; const k = 1 + w * 0.13 * Math.sin(a * 11) + w * 0.04 * Math.sin(a * 23 + 1.0); p.setXYZ(i, px * k, py - w * 0.025 * Math.cos(a * 11), pz * k); }
+    g.computeVertexNormals(); B.add(g, mtx(x, 0.62, z), { mat: M.CLOTH, color: [0.68, 0.66, 0.58] }); g.dispose();
+  }
+  // cup, saucer, carafe and two glasses
+  lathe(B, [[0.001, 0], [0.065, 0.004], [0.075, 0.014], [0.001, 0.012]], mtx(x + 0.13, 0.772, z + 0.06), { mat: M.STONE, color: [0.7, 0.7, 0.68] }, 18);
+  lathe(B, [[0.001, 0.012], [0.025, 0.015], [0.037, 0.07], [0.033, 0.07], [0.022, 0.025], [0.001, 0.022]], mtx(x + 0.13, 0.772, z + 0.06), { mat: M.STONE, color: [0.75, 0.74, 0.70] }, 18);
+  bottle(B, V3(x - 0.07, 0.772, z - 0.04), 0, [0.10, 0.40, 0.14], 0.92);
+  for (const [dx, dz] of [[0.04, -0.15], [-0.17, 0.09]]) { lathe(B, [[0.001, 0], [0.035, 0.002], [0.006, 0.01], [0.005, 0.07], [0.035, 0.10], [0.04, 0.155], [0.037, 0.155], [0.031, 0.105], [0.001, 0.078]], mtx(x + dx, 0.772, z + dz), { mat: M.BOTTLE, color: [0.7, 0.75, 0.72] }, 14); }
+  for (const a of chairAngles) chair(B, x + Math.cos(a) * 0.62, z + Math.sin(a) * 0.62, a + Math.PI);
+}
+function chair(B, x, z, face) {
+  const o = { mat: M.IRON, color: [0.075, 0.05, 0.032] };
+  const G = mtx(x, 0.035, z, 0, -face + Math.PI / 2, 0);   // chair faces local +z
+  const P = (a, b, c) => V3(a, b, c).applyMatrix4(G);
+  lathe(B, [[0.001, 0.44], [0.2, 0.44], [0.205, 0.452], [0.19, 0.468], [0.001, 0.462]], G, { mat: M.WOOD, color: [0.16, 0.075, 0.03] }, 24);
+  const ring = []; for (let i = 0; i < 16; i++) { const a = i / 16 * 6.283; ring.push(P(Math.cos(a) * 0.17, 0.2, Math.sin(a) * 0.17)); }
+  tube(B, ring, 0.008, o, 32, 5, true);
+  for (const [sx, sz] of [[1, 1], [-1, 1]]) tube(B, [P(sx * 0.14, 0.45, sz * 0.12), P(sx * 0.16, 0.25, sz * 0.14), P(sx * 0.19, 0.01, sz * 0.18)], 0.015, o, 10, 6);
+  for (const sx of [1, -1]) tube(B, [P(sx * 0.19, 0.01, -0.21), P(sx * 0.14, 0.25, -0.16), P(sx * 0.14, 0.46, -0.14), P(sx * 0.16, 0.7, -0.19), P(sx * 0.12, 0.88, -0.21), P(0, 0.93, -0.215)], 0.0155, o, 20, 6);
+  tube(B, [P(0.09, 0.46, -0.15), P(0.095, 0.7, -0.2), P(0, 0.82, -0.215), P(-0.095, 0.7, -0.2), P(-0.09, 0.46, -0.15)], 0.011, o, 20, 5);
+}
+
+function bicycle(B, center, dir, lean) { // dir: unit vector along the bike, lean toward the wall
+  const Fb = new Frame(V3(center.x, 0, center.z), dir);
+  const G = Fb.m.clone().multiply(mtx(0, 0.035, 0, -lean, 0, 0));
+  const P = (u, v, d = 0) => V3(u, v, d).applyMatrix4(G);
+  const iron = { mat: M.IRON, color: [0.018, 0.075, 0.085] }, chrome = { mat: M.BRASS, color: [0.42, 0.42, 0.40] }, rubber = { mat: M.MATTE, color: [0.018, 0.017, 0.016], rough: 0.5 }, leather = { mat: M.MATTE, color: [0.13, 0.055, 0.022], rough: 0.4 };
+  const R = 0.335;
+  for (const cu of [-0.54, 0.54]) {
+    const t = new THREE.TorusGeometry(R, 0.022, 10, 64); B.add(t, G.clone().multiply(mtx(cu, R + 0.01, 0)), rubber); t.dispose();
+    const t2 = new THREE.TorusGeometry(R - 0.028, 0.009, 8, 64); B.add(t2, G.clone().multiply(mtx(cu, R + 0.01, 0)), chrome); t2.dispose();
+    for (let i = 0; i < 20; i++) { const a = i / 20 * 6.283; rod(B, P(cu, R + 0.01, (i % 2 ? 0.025 : -0.025)), P(cu + Math.cos(a + 0.35) * (R - 0.03), R + 0.01 + Math.sin(a + 0.35) * (R - 0.03)), 0.0028, chrome, 4); }
+    rod(B, P(cu, R + 0.01, -0.045), P(cu, R + 0.01, 0.045), 0.022, chrome, 8);
+    const f = new THREE.TorusGeometry(R + 0.045, 0.014, 6, 40, Math.PI * (cu < 0 ? 0.95 : 0.7)); B.add(f, G.clone().multiply(mtx(cu, R + 0.01, 0, 0, 0, cu < 0 ? 0.25 : 0.55)), iron); f.dispose();
+  }
+  const rear = P(-0.54, 0.345), front = P(0.54, 0.345), bb = P(-0.08, 0.30), seatT = P(-0.19, 0.80), headT = P(0.36, 0.82), headB = P(0.40, 0.64);
+  for (const [a, b] of [[rear, bb], [bb, seatT], [rear, seatT], [bb, headB], [headT, headB]]) rod(B, a, b, 0.017, iron, 8);
+  tube(B, [seatT.clone(), P(0.05, 0.66), headB.clone().lerp(headT, 0.35)], 0.016, iron, 16, 8);
+  rod(B, headB, front, 0.015, iron, 8); rod(B, headT, P(0.33, 0.98), 0.013, chrome, 8);
+  tube(B, [P(0.22, 0.99, -0.27), P(0.31, 0.985, -0.18), P(0.35, 0.98, 0), P(0.31, 0.985, 0.18), P(0.22, 0.99, 0.27)], 0.012, chrome, 24, 8);
+  for (const d of [-0.27, 0.27]) rod(B, P(0.22, 0.99, d), P(0.13, 0.97, d), 0.019, leather, 8);
+  rod(B, seatT, P(-0.21, 0.89), 0.012, chrome); sphere(B, P(-0.22, 0.91), 0.07, leather, 1.8, 0.45, 0.8);
+  const cr = new THREE.TorusGeometry(0.085, 0.008, 6, 28); B.add(cr, G.clone().multiply(mtx(-0.08, 0.30, 0.05)), chrome); cr.dispose();
+  rod(B, P(-0.08, 0.30, 0.06), P(0.04, 0.22, 0.07), 0.01, chrome); wbox(B, ...P(0.04, 0.22, 0.11).toArray(), 0.09, 0.025, 0.06, rubber);
+  rod(B, P(-0.54, 0.43), P(-0.08, 0.30), 0.004, rubber, 4);
+  // wicker basket with a baguette
+  for (let i = 0; i < 6; i++) { const v = 0.74 + i * 0.034, s = 0.82 + i * 0.036; const pts = [[-1, -1], [0, -1.1], [1, -1], [1.1, 0], [1, 1], [0, 1.1], [-1, 1], [-1.1, 0]].map(([a, b]) => P(0.55 + a * 0.13 * s, v, b * 0.14 * s)); tube(B, pts, 0.011, { mat: M.WOOD, color: [0.28, 0.16, 0.06] }, 32, 5, true); }
+  for (let i = 0; i < 18; i++) { const a = i / 18 * 6.283; rod(B, P(0.55 + Math.cos(a) * 0.10, 0.73, Math.sin(a) * 0.11), P(0.55 + Math.cos(a) * 0.135, 0.91, Math.sin(a) * 0.145), 0.006, { mat: M.WOOD, color: [0.22, 0.12, 0.05] }, 4); }
+  rod(B, P(0.50, 0.80, -0.03), P(0.66, 1.14, 0.06), 0.034, { mat: M.MATTE, color: [0.42, 0.24, 0.08] }, 8, 0.022);
+  leafCluster(B, P(0.55, 0.93, 0), 0.09, 0.05, 0.09, 45, 0.055, V3(0, 1, 0), [0.07, 0.14, 0.04]);
+}
+
+// ── ground ──
+const PUDDLES = [ // x, z, rx, rz, rotation
+  [-0.55, -6.9, 1.05, 0.85, 0.2], [0.95, -9.1, 0.75, 1.15, -0.3], [-1.25, -10.9, 0.65, 0.9, 0.4], [1.35, -5.6, 0.55, 0.6, 0.0],
+  [0.05, -13.3, 0.9, 1.35, 0.1], [-0.9, -16.2, 0.85, 1.1, -0.2], [0.85, -17.3, 0.95, 0.75, 0.3], [-2.4, -6.7, 0.6, 0.55, 0.0], [0.6, -3.2, 1.1, 0.8, 0.0], [-0.2, -11.7, 0.45, 0.5, 0],
+];
+function vn2(x, z) {
+  const h = (i, j) => { let n = Math.imul(i, 374761393) + Math.imul(j, 668265263); n = Math.imul(n ^ (n >>> 13), 1274126177); return ((n ^ (n >>> 16)) >>> 0) / 4294967296; };
+  const i = Math.floor(x), j = Math.floor(z), fx = x - i, fz = z - j, sx = fx * fx * (3 - 2 * fx), sz = fz * fz * (3 - 2 * fz);
+  return lerp(lerp(h(i, j), h(i + 1, j), sx), lerp(h(i, j + 1), h(i + 1, j + 1), sx), sz);
+}
+function groundBase(x, z) {
+  let base = 0.004 + (vn2(x * 0.9, z * 0.9) - 0.5) * 0.010;
+  const wob = (vn2(x * 3.1 + 7, z * 3.1) - 0.5) * 0.55 + (vn2(x * 8.0, z * 8.0 + 3) - 0.5) * 0.22;
+  let dip = 0, bank = 0;
+  for (const [px, pz, rx, rz, a] of PUDDLES) {
+    const dx = x - px, dz = z - pz, c = Math.cos(a), s = Math.sin(a);
+    const r = Math.hypot((dx * c + dz * s) / rx, (-dx * s + dz * c) / rz) + wob;
+    dip = Math.max(dip, 1 - sstep(0.34, 0.98, r));
+    bank = Math.max(bank, 1 - sstep(0.72, 1.52, r));      // a broad shallow bank: water creeps into the joints first
+  }
+  base -= dip * 0.027 + bank * 0.0145;
+  // a shallow gutter runs down the middle of the lane
+  const gx = 0.15 + Math.sin(z * 0.21) * 0.15;
+  base -= 0.010 * Math.exp(-((x - gx) ** 2) / 0.03);
+  return base;
+}
+function settGeometry() {
+  const g = new THREE.BoxGeometry(1, 1, 1, 8, 3, 8); const p = g.attributes.position;
+  const v = V3();
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i);
+    const ax = Math.abs(v.x) * 2, az = Math.abs(v.z) * 2;
+    // pillow-topped sett with rounded corners
+    const edge = Math.pow(Math.pow(ax, 6) + Math.pow(az, 6), 1 / 6);
+    if (edge > 1) { v.x /= edge; v.z /= edge; }
+    if (v.y > 0) { const e = Math.min(1, edge); v.y = 0.5 - 0.46 * Math.pow(e, 5) - 0.07 * e * e; if (p.getY(i) < 0.49) v.y = Math.min(v.y, p.getY(i)); }
+    p.setXYZ(i, v.x, v.y, v.z);
+  }
+  g.deleteAttribute('uv'); g.deleteAttribute('normal');
+  const merged = mergeVertices(g); merged.computeVertexNormals(); return merged;
+}
+function buildCobbles(mat) {
+  const geo = settGeometry();
+  const items = [];
+  let z = 3.0;
+  while (z > -25.0) {
+    const depth = rand(0.115, 0.15);
+    let x = -4.75 + rand(0, 0.15);
+    while (x < 5.0) {
+      const w = rand(0.13, 0.215);
+      const cx = x + w / 2, cz = z - depth / 2 + Math.sin(cx * 1.15) * 0.07;
+      items.push([cx + rand(-0.006, 0.006), cz + rand(-0.007, 0.007), w - 0.016, depth - 0.016]);
+      x += w;
+    }
+    z -= depth;
+  }
+  const n = items.length;
+  const col = new Float32Array(n * 3), am = new Float32Array(geo.attributes.position.count * 4), ac = new Float32Array(geo.attributes.position.count * 3);
+  for (let i = 0; i < geo.attributes.position.count; i++) { am.set([M.COBBLE, 0.25, 0, 0], i * 4); ac.set([1, 1, 1], i * 3); }
+  geo.setAttribute('aMat', new THREE.BufferAttribute(am, 4)); geo.setAttribute('aColor', new THREE.BufferAttribute(ac, 3));
+  const mesh = new THREE.InstancedMesh(geo, mat, n);
+  const cols = [[0.20, 0.19, 0.175], [0.16, 0.165, 0.175], [0.23, 0.195, 0.16], [0.125, 0.125, 0.13], [0.19, 0.15, 0.13], [0.24, 0.23, 0.21]];
+  const c = new THREE.Color();
+  items.forEach(([x, zz, w, d], i) => {
+    const base = groundBase(x, zz);
+    const top = base + 0.016 + rand(-0.004, 0.006);
+    const hgt = 0.06;
+    mesh.setMatrixAt(i, mtx(x, top - hgt / 2, zz, rand(-0.045, 0.045), rand(-0.05, 0.05), rand(-0.045, 0.045), w, hgt, d));
+    const k = rand(0.78, 1.22); const cc = pick(cols);
+    mesh.setColorAt(i, c.setRGB(cc[0] * k, cc[1] * k, cc[2] * k, THREE.LinearSRGBColorSpace));
+  });
+  mesh.frustumCulled = false;
+  return mesh;
+}
+function gridPlane(x0, x1, z0, z1, step, yfn, mat, color, cfn = null) {
+  const nx = Math.ceil((x1 - x0) / step), nz = Math.ceil((z1 - z0) / step);
+  const g = new THREE.PlaneGeometry(x1 - x0, z1 - z0, nx, nz); g.rotateX(-Math.PI / 2); g.translate((x0 + x1) / 2, 0, (z0 + z1) / 2);
+  const p = g.attributes.position; for (let i = 0; i < p.count; i++) p.setY(i, yfn(p.getX(i), p.getZ(i)));
+  g.computeVertexNormals();
+  const b = new Builder(); b.add(g, null, { mat, color, rough: 0.4 }); const out = b.geometry();
+  if (cfn) { const q = out.attributes.position, c = out.attributes.aColor; for (let i = 0; i < q.count; i++) c.setXYZ(i, cfn(q.getX(i), q.getZ(i)), 0, 0); }
+  return out;
+}
+
+// ── the whole static set ──
+function buildStreet() {
+  const B = new Builder();
+  const Y = V3(0, 1, 0);
+
+  // ── hero facade ──
+  {
+    const F = HERO, ub = F.ub;
+    const heroWin = { u0: ub - 0.82, u1: ub + 0.50, v0: 5.78, v1: 7.62 };
+    const wins = [
+      { u0: 0.28, u1: 1.06, v0: 3.2, v1: 4.62, sh: 'closed', sc: COL.shTeal },
+      { u0: 3.42, u1: 4.2, v0: 3.2, v1: 4.62, sh: 'half', sc: COL.shTeal, box: [0.62, 0.035, 0.02] },
+      { u0: 3.66, u1: 4.34, v0: 5.95, v1: 7.45, sh: 'closed', sc: COL.shTeal },
+      { u0: 0.2, u1: 0.74, v0: 0.95, v1: 2.2, sh: 'closed', sc: COL.wood },
+      { u0: 0.9, u1: 1.6, v0: 8.25, v1: 9.15, sh: null }, { u0: 2.9, u1: 3.6, v0: 8.25, v1: 9.15, sh: 'closed' },
+    ];
+    facade(B, F, F.len, 9.65, COL.heroPl, wins, [[3.36, 4.34, 2.42, [0.045, 0.095, 0.085]]], { extraHoles: [heroWin] });
+    plinth(B, F, [[0, 3.2], [4.5, F.len]], 0.52);
+    quoins(B, F, F.len, 9.5, -1);
+    downpipe(B, F, 0.1, 9.65);
+    box(B, F, 0, F.len, 2.78, 2.9, -0.01, 0.07, { mat: M.STONE, color: COL.stone });
+    // the open lamp window
+    surround(B, F, heroWin.u0, heroWin.u1, heroWin.v0, heroWin.v1);
+    shutterLeaf(B, F, heroWin.u0 - 0.74, heroWin.u0 - 0.20, heroWin.v0, heroWin.v1, 0.07, COL.shTeal, 0.04, true);
+    shutterLeaf(B, F, heroWin.u1 + 0.11, heroWin.u1 + 0.75, heroWin.v0, heroWin.v1, 0.07, COL.shTeal, 0, false);
+    ironRailing(B, F, heroWin.u0 - 0.02, heroWin.u1 + 0.02, heroWin.v0, heroWin.v0 + 0.52, 0.085, 0.13, true);
+    // casements folded into the room
+    for (const [hu, dirn] of [[heroWin.u0, 1], [heroWin.u1, -1]]) {
+      const G = F.m.clone().multiply(mtx(hu, 0, -0.24, 0, dirn * 1.42, 0));
+      const part = (a, b2, c0, c1) => B.add(boxGeo(b2 - a, c1 - c0, 0.035), G.clone().multiply(mtx(dirn * (a + b2) / 2, (c0 + c1) / 2, 0)), { mat: M.WOOD, color: [0.14, 0.12, 0.09], interior: true });
+      part(0, 0.05, 5.8, 7.58); part(0.56, 0.61, 5.8, 7.58); for (const v of [5.8, 6.42, 7.02, 7.53]) part(0.05, 0.56, v, v + 0.045);
+    }
+    // the room
+    const wallC = [0.17, 0.105, 0.058];
+    const ru0 = ub - 1.5, ru1 = ub + 1.25, rv0 = 5.12, rv1 = 8.05, back = -2.1;
+    const io = { mat: M.INNER, color: wallC, interior: true };
+    box(B, F, ru0, ru1, rv0, rv1, back - 0.08, back, io);
+    box(B, F, ru0 - 0.08, ru0, rv0, rv1, back, -0.3, io); box(B, F, ru1, ru1 + 0.08, rv0, rv1, back, -0.3, io);
+    box(B, F, ru0, ru1, rv0 - 0.08, rv0, back, -0.3, { mat: M.BOARD, color: [0.2, 0.11, 0.05], interior: true });
+    box(B, F, ru0, ru1, rv1, rv1 + 0.08, back, -0.3, { mat: M.INNER, color: [0.17, 0.14, 0.10], interior: true });
+    // furnishings: picture, shelf with books, coat on a peg, wardrobe edge
+    box(B, F, ub - 1.0, ub - 0.38, 6.55, 7.28, back, back + 0.04, { mat: M.BRASS, color: [0.34, 0.22, 0.07], interior: true });
+    box(B, F, ub - 0.95, ub - 0.43, 6.60, 7.23, back + 0.04, back + 0.05, { mat: M.INNER, color: [0.07, 0.11, 0.13], interior: true });
+    box(B, F, ub - 0.05, ub + 0.9, 6.72, 6.76, back, back + 0.22, { mat: M.WOOD, color: COL.wood, interior: true });
+    for (let u = ub; u < ub + 0.82;) { const w = rand(0.03, 0.07), hh = rand(0.17, 0.28); box(B, F, u, u + w - 0.006, 6.76, 6.76 + hh, back + 0.03, back + 0.17, { mat: M.MATTE, color: pick([[0.35, 0.06, 0.04], [0.05, 0.13, 0.2], [0.42, 0.3, 0.1], [0.07, 0.15, 0.07]]), interior: true }); u += w; }
+    box(B, F, ru1 - 0.5, ru1, rv0, 7.35, back, back + 0.5, { mat: M.WOOD, color: [0.09, 0.043, 0.02], interior: true });
+    sphere(B, F.p(ub - 0.15, 7.28, back + 0.07), 0.11, { mat: M.BRASS, color: [0.5, 0.4, 0.2], interior: true }, 1, 1, 0.3);
+    // switch plate on the surround, left of the opening
+    box(B, F, ub - 0.905, ub - 0.835, 6.47, 6.58, 0.04, 0.062, { mat: M.STONE, color: [0.55, 0.50, 0.38] });
+    // bracket and flex for the bare bulb
+    const bl = LAMPS[0].pos;
+    const top = F.p(ub, 7.66, 0.04);
+    tube(B, [top, F.p(ub, 7.60, 0.11), F.p(ub, 7.50, 0.14)], 0.008, { mat: M.IRON, color: COL.iron }, 10, 6);
+    rod(B, F.p(ub, 7.50, 0.14), V3(bl.x, bl.y + 0.1, bl.z), 0.0045, { mat: M.MATTE, color: [0.02, 0.015, 0.012] }, 5);
+    // wet laundry peg-pulley on the wall
+    ivy(B, F, 0.35, 0.15, 3, 0.25, 1);
+    flowerBox(B, F, 0.22, 1.12, 3.08, [0.60, 0.08, 0.12]);
+    proxy(F, 0, F.len, 0, 5.7, 0.0, [0.42, 0.30, 0.18]);
+    // room proxies
+    proxy(F, ru0, ru1, rv0, rv1, back + 0.01, wallC);
+    PROXIES.push({ o: F.p(ru0, rv0 + 0.01, back), a: F.U.clone().multiplyScalar(ru1 - ru0), b: F.N.clone().multiplyScalar(-back - 0.3), n: Y.clone(), albedo: [0.2, 0.12, 0.06] });
+  }
+
+  // ── near left ──
+  {
+    const F = W_NEARL;
+    const wins = []; for (const v of [1.0, 3.35, 6.0]) for (let u = 1.0; u < F.len - 1.4; u += 2.15) wins.push({ u0: u, u1: u + 0.85, v0: v, v1: v + 1.45, sh: pick(['closed', 'open', 'closed']), sc: COL.shRed });
+    facade(B, F, F.len, 10.4, COL.rose, wins);
+    plinth(B, F, [[0, F.len]]); downpipe(B, F, F.len - 0.16, 10.4); quoins(B, F, F.len, 10.2, -1);
+    ivy(B, F, F.len - 0.8, 0.1, 5, 0.4, 1);
+  }
+
+  // ── far left ──
+  {
+    const F = W_FARL;
+    const wins = [
+      { u0: 0.55, u1: 1.4, v0: 0.95, v1: 2.35, sh: 'closed', sc: COL.shRed }, { u0: 5.7, u1: 6.55, v0: 0.95, v1: 2.35, sh: null, box: [0.7, 0.45, 0.05] },
+      { u0: 0.7, u1: 1.55, v0: 3.45, v1: 4.9, sh: 'open', sc: COL.shRed }, { u0: 3.45, u1: 4.3, v0: 4.1, v1: 5.45, sh: 'closed', sc: COL.shRed }, { u0: 6.3, u1: 7.15, v0: 3.45, v1: 4.9, sh: 'open', sc: COL.shRed, box: [0.65, 0.05, 0.03] },
+      { u0: 1.5, u1: 2.3, v0: 6.15, v1: 7.45, sh: 'closed', sc: COL.shRed }, { u0: 4.6, u1: 5.4, v0: 6.15, v1: 7.45, sh: 'half', sc: COL.shRed }, { u0: 7.4, u1: 8.2, v0: 6.15, v1: 7.45, sh: null },
+    ];
+    facade(B, F, F.len, 8.45, COL.ochre, wins, [[2.55, 3.5, 2.5]]);
+    plinth(B, F, [[0, 2.4], [3.65, F.len]]); downpipe(B, F, 5.15, 8.45);
+    ivy(B, F, 7.9, 0.1, 9, 0.7, 1);
+    proxy(F, 0, F.len, 0, 8.0, 0, COL.ochre);
+    // small step-back between the hero facade and this wall
+  }
+
+  // ── near right (mostly beyond the frame; its balcony and pipe catch the light) ──
+  {
+    const F = W_NEARR;
+    const wins = [
+      { u0: 0.5, u1: 1.35, v0: 0.95, v1: 2.4, sh: 'closed', sc: COL.shGreen }, { u0: 2.6, u1: 3.45, v0: 0.95, v1: 2.4, sh: 'open', sc: COL.shGreen },
+      { u0: 0.55, u1: 1.4, v0: 3.55, v1: 5.2, sh: 'open', sc: COL.shGreen }, { u0: 3.0, u1: 3.85, v0: 3.55, v1: 5.2, sh: 'closed', sc: COL.shGreen },
+      { u0: 0.55, u1: 1.4, v0: 6.15, v1: 7.6, sh: 'closed', sc: COL.shGreen }, { u0: 3.0, u1: 3.85, v0: 6.15, v1: 7.6, sh: 'open', sc: COL.shGreen, box: [0.65, 0.06, 0.03] },
+    ];
+    facade(B, F, F.len, 9.1, COL.cream, wins, [[5.2, 6.2, 2.45]]);
+    plinth(B, F, [[0, 5.05], [6.35, F.len]]); downpipe(B, F, 0.16, 9.1); balcony(B, F, 0.35, 1.6, 3.4);
+    ivy(B, F, 0.9, 0.1, 6, 0.55, 1);
+    proxy(F, 0, 6, 0, 9, 0, COL.cream);
+  }
+
+  // ── café building ──
+  {
+    const F = CAFE, w = CAFE_WIN;
+    const wins = [];
+    for (const [v0, v1, sh] of [[3.95, 5.45, 'open'], [6.25, 7.65, 'closed']]) for (const u of [1.05, 2.5, 3.72]) wins.push({ u0: u - 0.4 + (sh === 'open' ? 0 : 0.05), u1: u + 0.34 + (sh === 'open' ? 0 : 0.05), v0, v1, sh: (u === 2.5 && v0 < 5) ? 'half' : sh, sc: COL.shBlue, box: (v0 < 5 && u > 3) ? [0.68, 0.08, 0.03] : null });
+    facade(B, F, F.len, 8.85, COL.sage, wins, [], { extraHoles: [{ u0: w.u0, u1: w.u1, v0: w.v0, v1: w.v1 }, { u0: 0.12, u1: 0.82, v0: 0.001, v1: 2.5 }] });
+    quoins(B, F, 0.0, 8.6, 1); quoins(B, F, F.len, 8.6, -1);
+    // timber shopfront
+    const green = { mat: M.WOOD, color: [0.075, 0.04, 0.022] };
+    box(B, F, 0.02, F.len - 0.1, 3.25, 3.45, -0.02, 0.09, green); box(B, F, 0.02, F.len - 0.1, 3.45, 3.50, -0.02, 0.15, green);
+    box(B, F, w.u0 - 0.1, w.u0, 0, 3.27, -0.04, 0.07, green); box(B, F, w.u1, w.u1 + 0.1, 0, 3.27, -0.04, 0.07, green); box(B, F, 0.02, 0.12, 0, 3.27, -0.04, 0.07, green);
+    box(B, F, w.u0, w.u1, 0, w.v0, -0.02, 0.05, green); box(B, F, w.u0 - 0.04, w.u1 + 0.04, w.v0 - 0.05, w.v0, -0.12, 0.11, { mat: M.STONE, color: COL.stone });
+    for (let u = w.u0 + 0.08; u < w.u1 - 0.3; u += 0.54) box(B, F, u, u + 0.42, 0.1, 0.42, 0.05, 0.065, green);
+    for (const u of [w.u0 + 0.03, 1.68, 3.12, w.u1 - 0.03]) box(B, F, u - 0.022, u + 0.022, w.v0, w.v1, -0.11, -0.06, green);
+    for (const [a, b2] of [[w.u0, 1.68], [3.12, w.u1]]) box(B, F, a, b2, 2.76, 2.795, -0.11, -0.06, green); // transom over the side lights only
+    // door, ajar and half glazed
+    const dg = F.m.clone().multiply(mtx(0.12, 0, -0.14, 0, 0.5, 0));
+    const dp = (a, b2, c0, c1, o) => B.add(boxGeo(b2 - a, c1 - c0, 0.05), dg.clone().multiply(mtx((a + b2) / 2, (c0 + c1) / 2, 0)), o);
+    dp(0, 0.7, 0.02, 0.95, green); dp(0, 0.09, 0.95, 2.45, green); dp(0.61, 0.7, 0.95, 2.45, green); dp(0.09, 0.61, 2.3, 2.45, green); dp(0.09, 0.61, 1.62, 1.68, green);
+    // interior
+    const io = (color) => ({ mat: M.INNER, color, interior: true });
+    const u0 = 0.1, u1 = 4.45, dBack = -2.62;
+    box(B, F, u0, u1, 0, 3.42, dBack - 0.08, dBack, io([0.52, 0.22, 0.12]));
+    box(B, F, u0 - 0.08, u0, 0, 3.42, dBack, -0.3, io([0.66, 0.50, 0.27])); box(B, F, u1, u1 + 0.08, 0, 3.42, dBack, -0.3, io([0.66, 0.50, 0.27]));
+    box(B, F, u0, u1, 3.42, 3.50, dBack, -0.3, io([0.4, 0.34, 0.24]));
+    box(B, F, u0, u1, -0.03, 0.045, dBack, -0.02, { mat: M.BOARD, color: [0.2, 0.1, 0.045], interior: true });
+    box(B, F, u0, u1, 0.05, 1.0, dBack, dBack + 0.03, { mat: M.WOOD, color: [0.12, 0.055, 0.025], interior: true });
+    // the big mirror behind the bar, gilt frame, tilted a few degrees forward
+    {
+      const mm = new THREE.Matrix4().makeBasis(MIRROR.right, MIRROR.up, MIRROR.n).setPosition(MIRROR.c);
+      const quad = new THREE.PlaneGeometry(MIRROR.hw * 2, MIRROR.hh * 2); B.add(quad, mm, { mat: M.MIRROR, color: [0.9, 0.9, 0.87], interior: true });
+      const gold = { mat: M.WOOD, color: [0.17, 0.098, 0.030], interior: true };
+      const part = (cx, cy, wx, hy, dz = 0.02) => B.add(boxGeo(wx, hy, 0.05), mm.clone().multiply(mtx(cx, cy, dz)), gold);
+      part(0, MIRROR.hh + 0.04, MIRROR.hw * 2 + 0.16, 0.08); part(0, -MIRROR.hh - 0.04, MIRROR.hw * 2 + 0.16, 0.08); part(-MIRROR.hw - 0.04, 0, 0.08, MIRROR.hh * 2); part(MIRROR.hw + 0.04, 0, 0.08, MIRROR.hh * 2);
+      for (let i = 0; i <= 24; i++) for (const sy of [-1, 1]) sphere(B, V3(lerp(-MIRROR.hw, MIRROR.hw, i / 24), sy * (MIRROR.hh + 0.04), 0.045).applyMatrix4(mm), 0.017, { mat: M.BRASS, color: [0.24, 0.15, 0.05], interior: true }, 1, 1, 0.7, 7);
+      // two chains from the ceiling hold it at its lean
+      for (const sx of [-0.86, 0.86]) { const p = V3(sx * MIRROR.hw, MIRROR.hh + 0.07, 0.0).applyMatrix4(mm); rod(B, p, V3(p.x + CAFE.N.x * 0.12, 3.42, p.z + CAFE.N.z * 0.12), 0.007, { mat: M.BRASS, color: [0.3, 0.2, 0.07], interior: true }, 5); }
+    }
+    // bar counter
+    box(B, F, 1.35, 3.55, 0.04, 0.80, -1.10, -0.80, { mat: M.WOOD, color: [0.16, 0.065, 0.028], interior: true });
+    for (let u = 1.42; u < 3.4; u += 0.42) box(B, F, u, u + 0.34, 0.14, 0.70, -0.80, -0.785, { mat: M.WOOD, color: [0.20, 0.085, 0.035], interior: true });
+    box(B, F, 1.3, 3.6, 0.80, 0.855, -1.14, -0.74, { mat: M.BRASS, color: [0.5, 0.34, 0.14], interior: true });
+    rod(B, F.p(1.35, 0.2, -0.71), F.p(3.55, 0.2, -0.71), 0.022, { mat: M.BRASS, color: [0.6, 0.42, 0.15], interior: true });
+    for (let u = 1.45; u < 3.5; u += rand(0.14, 0.32)) bottle(B, F.p(u, 0.855, rand(-1.07, -0.9)), RNG() * 3 | 0, pick(BOTTLE_COLS), rand(0.72, 0.9));
+    // side shelves with bottles
+    for (const [a, b2] of [[0.16, 0.98], [3.72, 4.42]]) for (const v of [1.25, 1.75, 2.25]) { box(B, F, a, b2, v - 0.03, v, dBack + 0.03, dBack + 0.24, { mat: M.WOOD, color: COL.wood, interior: true }); for (let u = a + 0.08; u < b2 - 0.06; u += 0.14) bottle(B, F.p(u, v, dBack + 0.14), RNG() * 4 | 0, pick(BOTTLE_COLS), rand(0.8, 1.0)); }
+    // stools, an inside table and a dark pendant lamp (switched off)
+    for (const u of [1.7, 2.45, 3.2]) { const p = F.p(u, 0, -0.55); rod(B, V3(p.x, 0.05, p.z), V3(p.x, 0.62, p.z), 0.025, { mat: M.BRASS, color: [0.5, 0.36, 0.14], interior: true }); sphere(B, V3(p.x, 0.65, p.z), 0.14, { mat: M.MATTE, color: [0.22, 0.035, 0.025], interior: true }, 1, 0.33, 1); }
+    { const p = F.p(3.75, 2.55, -0.7); rod(B, F.p(3.75, 3.42, -0.7), p, 0.006, { mat: M.IRON, color: COL.iron, interior: true }); lathe(B, [[0.02, 0.12], [0.07, 0.1], [0.19, 0], [0.18, 0], [0.06, 0.08], [0.01, 0.1]], mtx(p.x, p.y - 0.1, p.z), { mat: M.BRASS, color: [0.28, 0.2, 0.08], interior: true }, 24); }
+    ivy(B, F, 4.45, 3.2, 4, 0.2, 1);
+    proxy(F, 0, w.u0, 0, 8.5, 0, COL.sage); proxy(F, w.u0, F.len, 2.9, 8.5, 0, COL.sage);
+    proxy(F, w.u0, w.u1, 0.3, 3.1, -1.6, [0.2, 0.09, 0.04]);
+  }
+  // outdoor tables
+  {
+    const t1 = CAFE.p(1.55, 0, 0.82), t2 = CAFE.p(3.42, 0, 0.92);
+    const au = Math.atan2(CAFE.U.z, CAFE.U.x);
+    tableAndChairs(B, t1.x, t1.z, true, [au + Math.PI * 0.98, au - 0.15]);
+    tableAndChairs(B, t2.x, t2.z, true, [au + Math.PI * 1.05, au + 0.1]);
+  }
+
+  // ── far right ──
+  {
+    const F = W_FARR;
+    const wins = [
+      { u0: 0.6, u1: 1.45, v0: 0.95, v1: 2.4, sh: 'closed', sc: COL.shGreen }, { u0: 4.75, u1: 5.6, v0: 0.95, v1: 2.4, sh: 'half', sc: COL.shGreen, box: [0.7, 0.5, 0.08] },
+      { u0: 1.0, u1: 1.85, v0: 3.5, v1: 5.25, sh: 'open', sc: COL.shGreen }, { u0: 4.1, u1: 4.95, v0: 3.5, v1: 5.25, sh: 'half', sc: COL.shGreen },
+      { u0: 1.0, u1: 1.85, v0: 6.15, v1: 7.75, sh: 'closed', sc: COL.shGreen }, { u0: 4.1, u1: 4.95, v0: 6.15, v1: 7.75, sh: 'open', sc: COL.shGreen },
+      { u0: 2.6, u1: 3.25, v0: 8.35, v1: 9.2, sh: null },
+    ];
+    facade(B, F, F.len, 9.8, COL.cream, wins, [[2.55, 3.5, 2.5, [0.09, 0.04, 0.025]]]);
+    plinth(B, F, [[0, 2.4], [3.65, F.len]]); downpipe(B, F, 5.98, 9.8);
+    balcony(B, F, 0.62, 2.25, 3.38); balcony(B, F, 3.72, 5.35, 3.38); balcony(B, F, 0.62, 2.25, 6.03, 0.5);
+    flowerBox(B, F, 3.95, 5.1, 6.05, [0.62, 0.03, 0.02]);
+    ivy(B, F, 0.25, 0.1, 6, 0.4, 1);
+    proxy(F, 0, F.len, 0, 9.4, 0, COL.cream);
+  }
+
+  // ── end of the lane ──
+  {
+    const F = ENDW, w = SHOP;
+    const arch = { u0: 0.18, u1: 1.52, v0: 0.001, v1: 2.98, arch: true };
+    const wins = [
+      { u0: 0.12, u1: 0.9, v0: 4.45, v1: 5.75, sh: null },
+      { u0: 1.72, u1: 2.47, v0: 3.9, v1: 5.3, sh: 'open', sc: COL.shBlue, box: [0.66, 0.05, 0.03] },
+      { u0: 3.1, u1: 3.78, v0: 3.9, v1: 5.3, sh: 'closed', sc: COL.shBlue },
+    ];
+    facade(B, F, F.len, 6.5, COL.terracotta, wins, [], { extraHoles: [arch, { u0: w.u0, u1: w.u1, v0: w.v0, v1: w.v1 }] });
+    plinth(B, F, [[1.62, F.len]], 0.42); plinth(B, F, [[0, 0.16]], 0.42);
+    // voussoirs round the arch and its jambs
+    const r = (arch.u1 - arch.u0) / 2, cu = arch.u0 + r, spring = arch.v1 - r;
+    for (let i = 0; i <= 10; i++) { const a = i / 10 * Math.PI; B.add(boxGeo(0.24, 0.21, 0.11), F.at(cu - Math.cos(a) * (r + 0.09), spring + Math.sin(a) * (r + 0.09), 0.015, 0, 0, Math.PI - a), { mat: M.STONE, color: COL.stone.map(c => c * rand(0.8, 1.12)) }); }
+    for (let v = 0, i = 0; v < spring - 0.1; v += 0.3, i++) for (const s of [-1, 1]) box(B, F, cu + s * r + (s < 0 ? -(i % 2 ? 0.17 : 0.26) : 0), cu + s * r + (s > 0 ? (i % 2 ? 0.17 : 0.26) : 0), v, v + 0.28, -0.02, 0.05, { mat: M.STONE, color: COL.stone.map(c => c * rand(0.8, 1.1)) });
+    // the passage beyond
+    const brick = { mat: M.BRICK, color: [0.30, 0.13, 0.07] };
+    wbox(B, ENDW.o.x + arch.u0 - 0.15, 1.7, -20.8, 0.3, 3.4, 3.0, brick); wbox(B, ENDW.o.x + arch.u1 + 0.15, 1.7, -20.8, 0.3, 3.4, 3.0, brick);
+    wbox(B, ENDW.o.x + cu, 3.2, -20.7, 1.7, 0.25, 2.8, brick);
+    wbox(B, ENDW.o.x + cu + 0.2, 2.6, -23.0, 3.4, 5.2, 0.3, { mat: M.PLASTER, color: COL.grey });
+    { const FP = new Frame(V3(ENDW.o.x + cu - 0.3, 0, -22.83), V3(1, 0, 0)); windowFill(B, FP, 0.1, 0.75, 1.1, 2.2, 0.03); surround(B, FP, 0.1, 0.75, 1.1, 2.2); leafCluster(B, FP.p(1.0, 0.35, 0.3), 0.3, 0.35, 0.25, 160, 0.09, V3(0, 0, 1), [0.045, 0.11, 0.03]); }
+    // the shop window full of bottles
+    const wood = { mat: M.WOOD, color: [0.032, 0.085, 0.070] };
+    box(B, F, w.u0 - 0.14, w.u0, 0, w.v1 + 0.05, -0.02, 0.09, wood); box(B, F, w.u1, w.u1 + 0.14, 0, w.v1 + 0.05, -0.02, 0.09, wood);
+    box(B, F, w.u0 - 0.16, w.u1 + 0.16, w.v1, w.v1 + 0.30, -0.02, 0.12, wood); box(B, F, w.u0 - 0.2, w.u1 + 0.2, w.v1 + 0.30, w.v1 + 0.37, -0.02, 0.2, wood);
+    box(B, F, w.u0, w.u1, 0, w.v0, -0.02, 0.07, wood); box(B, F, w.u0 - 0.05, w.u1 + 0.05, w.v0 - 0.05, w.v0, -0.05, 0.14, { mat: M.STONE, color: COL.stone });
+    for (const u of [w.u0 + 0.02, (w.u0 + w.u1) / 2, w.u1 - 0.02]) box(B, F, u - 0.02, u + 0.02, w.v0, w.v1, -0.05, -0.01, wood);
+    const back = -0.55;
+    box(B, F, w.u0 - 0.05, w.u1 + 0.05, w.v0 - 0.1, w.v1 + 0.1, back - 0.06, back, { mat: M.WOOD, color: [0.17, 0.095, 0.045], interior: true });
+    box(B, F, w.u0 - 0.05, w.u0, w.v0, w.v1, back, -0.3, { mat: M.WOOD, color: COL.wood, interior: true }); box(B, F, w.u1, w.u1 + 0.05, w.v0, w.v1, back, -0.3, { mat: M.WOOD, color: COL.wood, interior: true });
+    box(B, F, w.u0, w.u1, w.v0 - 0.06, w.v0, back, -0.04, { mat: M.WOOD, color: [0.2, 0.11, 0.05], interior: true });
+    for (let k = 0; k < 4; k++) {
+      const v = w.v0 + 0.005 + k * 0.54;
+      if (k) box(B, F, w.u0, w.u1, v - 0.035, v - 0.005, back, -0.12, { mat: M.WOOD, color: [0.18, 0.1, 0.045], interior: true });
+      for (let u = w.u0 + 0.1; u < w.u1 - 0.07; u += rand(0.115, 0.17)) bottle(B, F.p(u, v, rand(-0.27, -0.14)), RNG() * 4 | 0, pick(BOTTLE_COLS), rand(0.95, 1.28));
+      for (let u = w.u0 + 0.16; u < w.u1 - 0.1; u += rand(0.17, 0.26)) bottle(B, F.p(u, v, rand(-0.47, -0.38)), RNG() * 4 | 0, pick(BOTTLE_COLS), rand(1.0, 1.25));
+    }
+    ivy(B, F, 4.17, 0.1, 4, 0.12, 1); downpipe(B, F, 1.65, 6.5);
+    proxy(F, 0, F.len, 0, 6.2, 0, COL.terracotta);
+  }
+
+  // ── low garden wall in the right foreground (the cat's seat) ──
+  {
+    const F = Frame.wall(3.12, -7.65, 3.30, -5.15);
+    box(B, F, 0, F.len, 0, 0.86, -0.32, 0, { mat: M.BRICK, color: [0.33, 0.14, 0.075] });
+    for (let u = 0; u < F.len - 0.05; u += 0.52) box(B, F, u + 0.004, Math.min(F.len, u + 0.51), 0.86, 0.96, -0.37, 0.05, { mat: M.STONE, color: COL.stone.map(c => c * rand(0.85, 1.1)) });
+    ivy(B, F, 2.2, 0.03, 4, 0.25, 0.2);
+    // terracotta pots with plants at its foot
+    for (const [u, d, s] of [[0.25, 0.28, 1.0], [0.68, 0.22, 0.72], [2.3, 0.25, 0.8]]) {
+      const p = F.p(u, 0.03, d);
+      lathe(B, [[0.001, 0], [0.11, 0], [0.15, 0.25], [0.175, 0.255], [0.175, 0.29], [0.14, 0.29], [0.13, 0.25], [0.001, 0.25]], mtx(p.x, p.y, p.z, 0, 0, 0, s, s, s), { mat: M.ROOF, color: [0.36, 0.14, 0.065] }, 22);
+      leafCluster(B, V3(p.x, p.y + 0.43 * s, p.z), 0.19 * s, 0.17 * s, 0.19 * s, 130, 0.085 * s, V3(0, 1, 0), [0.055, 0.135, 0.032]);
+      if (s < 1) for (let k = 0; k < 30; k++) leaf(B, V3(p.x + rand(-0.13, 0.13), p.y + rand(0.42, 0.57) * s, p.z + rand(-0.13, 0.13)), 0.035, V3(0, 1, 0), [0.6, 0.07, 0.1], M.PETAL);
+    }
+  }
+
+  // ── bicycle against the lamp facade ──
+  bicycle(B, HERO.p(3.0, 0, 0.30), HERO.U, 0.13);
+  // a barrel and a crate by the hero door, and bins down the lane
+  {
+    const p = HERO.p(0.85, 0.03, 0.36);
+    lathe(B, [[0.001, 0], [0.23, 0], [0.28, 0.18], [0.29, 0.34], [0.27, 0.52], [0.23, 0.68], [0.001, 0.66]], mtx(p.x, p.y, p.z), { mat: M.BOARD, color: [0.18, 0.09, 0.035] }, 28);
+    for (const [y, r] of [[0.08, 0.26], [0.24, 0.287], [0.48, 0.283], [0.62, 0.248]]) { const t = new THREE.TorusGeometry(r, 0.011, 6, 40); B.add(t, mtx(p.x, p.y + y, p.z, Math.PI / 2), { mat: M.IRON, color: COL.iron }); t.dispose(); }
+    leafCluster(B, V3(p.x, 0.82, p.z), 0.17, 0.12, 0.17, 100, 0.075, V3(0, 1, 0), [0.06, 0.13, 0.03]);
+    for (let k = 0; k < 24; k++) leaf(B, V3(p.x + rand(-0.15, 0.15), rand(0.85, 0.99), p.z + rand(-0.15, 0.15)), 0.036, V3(0, 1, 0), [0.75, 0.55, 0.06], M.PETAL);
+  }
+
+  // ── church tower beyond the end of the lane ──
+  {
+    const cx = 1.25, cz = -34.5;
+    const st = { mat: M.STONE, color: [0.34, 0.31, 0.26] };
+    wbox(B, cx, 8.5, cz, 3.5, 17.0, 3.5, st);
+    for (const y of [10.4, 13.9, 17.1]) wbox(B, cx, y, cz, 3.8, 0.24, 3.8, st);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) { wbox(B, cx + sx * 1.76, 8.6, cz + sz * 1.76, 0.32, 17.2, 0.32, st); rod(B, V3(cx + sx * 1.6, 17.1, cz + sz * 1.6), V3(cx + sx * 1.6, 18.9, cz + sz * 1.6), 0.18, st, 6, 0.02); }
+    const FT = new Frame(V3(cx - 1.75, 0, cz + 1.76), V3(1, 0, 0));
+    // belfry louvres
+    for (const u of [0.55, 1.95]) {
+      box(B, FT, u, u + 0.98, 14.3, 16.1, -0.03, 0.02, { mat: M.MATTE, color: [0.006, 0.006, 0.008] });
+      const t = new THREE.CircleGeometry(0.49, 20, 0, Math.PI); B.add(t, FT.at(u + 0.49, 16.1, 0.025), { mat: M.MATTE, color: [0.006, 0.006, 0.008] }); t.dispose();
+      const a = new THREE.TorusGeometry(0.55, 0.09, 6, 24, Math.PI); B.add(a, FT.at(u + 0.49, 16.1, 0.04), st); a.dispose();
+      for (let v = 14.4; v < 16.0; v += 0.2) B.add(boxGeo(0.96, 0.05, 0.14), FT.at(u + 0.49, v, 0.05, 0.6, 0, 0), { mat: M.WOOD, color: [0.06, 0.045, 0.035] });
+    }
+    // clock face (plain hour marks, no numerals)
+    const c = new THREE.CircleGeometry(0.86, 48); B.add(c, FT.at(1.75, 12.15, 0.03), { mat: M.STONE, color: [0.66, 0.63, 0.50] }); c.dispose();
+    const cr = new THREE.TorusGeometry(0.9, 0.07, 8, 48); B.add(cr, FT.at(1.75, 12.15, 0.05), st); cr.dispose();
+    for (let i = 0; i < 12; i++) { const a = i / 12 * 6.283; B.add(boxGeo(0.045, i % 3 ? 0.11 : 0.2, 0.02), FT.at(1.75 + Math.sin(a) * 0.71, 12.15 + Math.cos(a) * 0.71, 0.05, 0, 0, -a), { mat: M.IRON, color: COL.iron }); }
+    B.add(boxGeo(0.07, 0.48, 0.02), FT.at(1.75 - 0.18, 12.15 + 0.11, 0.065, 0, 0, 1.02), { mat: M.IRON, color: COL.iron });
+    B.add(boxGeo(0.045, 0.68, 0.02), FT.at(1.75 + 0.02, 12.15 + 0.32, 0.075, 0, 0, -0.06), { mat: M.IRON, color: COL.iron });
+    for (const y of [7.4]) { box(B, FT, 1.45, 2.05, y, y + 1.3, -0.02, 0.02, { mat: M.GLASS, color: [0.01, 0.01, 0.012] }); surround(B, FT, 1.45, 2.05, y, y + 1.3); }
+    const sp = new THREE.ConeGeometry(2.35, 6.4, 8, 1); B.add(sp, mtx(cx, 20.4, cz, 0, Math.PI / 8, 0), { mat: M.ROOF, color: [0.10, 0.07, 0.065] }); sp.dispose();
+    rod(B, V3(cx, 23.5, cz), V3(cx, 24.6, cz), 0.04, { mat: M.IRON, color: COL.iron }); rod(B, V3(cx - 0.28, 24.2, cz), V3(cx + 0.28, 24.2, cz), 0.035, { mat: M.IRON, color: COL.iron });
+    // nave roof and houses huddled at its foot
+    for (const [x, y, z, w, h, d] of [[-4.8, 3.9, -31, 5.5, 7.8, 5], [6.8, 4.4, -31.5, 5, 8.8, 5], [-1.2, 2.9, -29.5, 3.6, 5.8, 3]]) {
+      wbox(B, x, y, z, w, h, d, { mat: M.PLASTER, color: pick([COL.grey, COL.cream, COL.ochre]) });
+      B.add(boxGeo(w + 0.4, 0.14, d * 0.75), mtx(x, y + h / 2 + 0.75, z + d * 0.22, 0.62, 0, 0), { mat: M.ROOF, color: [0.15, 0.065, 0.04] });
+      for (let i = 0; i < 3; i++) wbox(B, x - w / 3 + i * w / 3, y + h / 2 - 1.5, z + d / 2 + 0.02, 0.55, 0.85, 0.05, { mat: M.GLASS, color: [0.01, 0.01, 0.012] });
+    }
+  }
+  // chimneys on the roof lines
+  chimney(B, -5.0, 10.2, -7.2, 0.5); chimney(B, -2.75, 9.0, -13.0); chimney(B, -2.8, 9.0, -17.4); chimney(B, 3.2, 10.35, -14.6); chimney(B, 3.15, 10.35, -17.8); chimney(B, 1.5, 7.0, -19.55, 1.57); chimney(B, 5.2, 9.4, -9.5, -1.0);
+  // closing masses so no sky shows through gaps
+  wbox(B, -3.4, 4.2, -20.0, 2.7, 8.4, 2.0, { mat: M.PLASTER, color: COL.grey });
+  wbox(B, 3.55, 4.8, -20.0, 2.6, 9.6, 2.0, { mat: M.PLASTER, color: COL.rose });
+  wbox(B, -2.5, 4.8, -10.35, 0.55, 9.5, 0.34, { mat: M.PLASTER, color: COL.ochre }, 0.15);
+  wbox(B, 5.4, 4.5, -8.2, 1.2, 9.0, 0.5, { mat: M.PLASTER, color: COL.cream });
+  // buildings behind the camera: seen only in reflections and shadows
+  wbox(B, -5.6, 5.0, 8.0, 3.0, 10.0, 9.0, { mat: M.PLASTER, color: COL.grey });
+
+  // gutter lantern bracket (the old street lamp)
+  buildLanternStatic(B);
+  buildNeonBacking(B);
+  return B;
+}
+
+function buildLanternStatic(B) {
+  const L = LAMPS[1].pos; const iron = { mat: M.IRON, color: [0.025, 0.032, 0.028] };
+  const wallX = -1.96;
+  const base = V3(wallX, L.y + 0.42, L.z);
+  tube(B, [base, V3(wallX + 0.25, L.y + 0.58, L.z), V3(L.x - 0.06, L.y + 0.56, L.z), V3(L.x, L.y + 0.40, L.z)], 0.022, iron, 28, 8);
+  tube(B, [V3(wallX, L.y - 0.05, L.z), V3(wallX + 0.18, L.y + 0.08, L.z), V3(wallX + 0.30, L.y + 0.37, L.z), V3(wallX + 0.43, L.y + 0.55, L.z)], 0.015, iron, 20, 6);
+  const t = new THREE.TorusGeometry(0.095, 0.01, 6, 28, 5.2); B.add(t, mtx(wallX + 0.17, L.y + 0.36, L.z, 0, 0, 1.2), iron); t.dispose();
+  wbox(B, wallX + 0.02, L.y + 0.25, L.z, 0.05, 0.75, 0.16, iron);
+}
+function buildLanternHead(B) { // excluded from the lantern's own shadow map; its glass glows
+  const L = LAMPS[1].pos; const iron = { mat: M.IRON, color: [0.025, 0.032, 0.028] };
+  const top = 0.19, bot = -0.2, wt = 0.165, wb = 0.10;
+  for (const [sx, sz] of [[1, 1], [1, -1], [-1, -1], [-1, 1]]) rod(B, V3(L.x + sx * wt, L.y + top, L.z + sz * wt), V3(L.x + sx * wb, L.y + bot, L.z + sz * wb), 0.012, iron, 6);
+  for (const [y, w] of [[top, wt], [bot, wb]]) for (const [a, b] of [[[1, 1], [1, -1]], [[1, -1], [-1, -1]], [[-1, -1], [-1, 1]], [[-1, 1], [1, 1]]]) rod(B, V3(L.x + a[0] * w, L.y + y, L.z + a[1] * w), V3(L.x + b[0] * w, L.y + y, L.z + b[1] * w), 0.014, iron, 6);
+  const cap = new THREE.ConeGeometry(0.29, 0.17, 4); B.add(cap, mtx(L.x, L.y + top + 0.09, L.z, 0, Math.PI / 4, 0), iron); cap.dispose();
+  sphere(B, V3(L.x, L.y + top + 0.2, L.z), 0.035, iron); sphere(B, V3(L.x, L.y + bot - 0.04, L.z), 0.045, iron);
+  sphere(B, L, 0.055, { mat: M.EMIT, color: [0.82, 1.0, 0.80], lamp: 1, glow: 16 }, 1, 1.35, 1);
+  // frosted panes: thin glowing plates, inset
+  const pane = { mat: M.EMIT, color: [0.50, 0.92, 0.66], lamp: 1, glow: 1.15 };
+  for (let i = 0; i < 4; i++) {
+    const a = i * Math.PI / 2;
+    const quad = new THREE.BufferGeometry();
+    const v = [-wb * 0.88, bot + 0.02, wb * 0.93, wb * 0.88, bot + 0.02, wb * 0.93, wt * 0.88, top - 0.02, wt * 0.93, -wb * 0.88, bot + 0.02, wb * 0.93, wt * 0.88, top - 0.02, wt * 0.93, -wt * 0.88, top - 0.02, wt * 0.93];
+    quad.setAttribute('position', new THREE.Float32BufferAttribute(v, 3)); quad.computeVertexNormals();
+    // leave the pane that faces the camera open to its mantle, with glazing bars
+    if (i !== 0) B.add(quad, mtx(L.x, L.y, L.z, 0, a, 0), pane);
+    quad.dispose();
+  }
+  for (const dx of [-0.045, 0.045]) rod(B, V3(L.x + dx, L.y + bot, L.z + wb), V3(L.x + dx * 1.5, L.y + top, L.z + wt), 0.006, iron, 5);
+}
+const NEON_F = (() => { const o = CAFE.p(0.47, 0, 0); return new Frame(o, CAFE.N.clone().negate()); })();
+function neonLocal(a, b, d = 0.035) { // a: out from the wall, b: height relative to the sign centre
+  return CAFE.p(0.47 + d, 3.36 + b, 0.58 + a);
+}
+function buildNeonBacking(B) {
+  const iron = { mat: M.IRON, color: [0.02, 0.02, 0.024] };
+  const ring = []; for (let i = 0; i < 40; i++) { const a = i / 40 * 6.283; ring.push(neonLocal(Math.cos(a) * 0.43, Math.sin(a) * 0.43, -0.03)); }
+  tube(B, ring, 0.016, iron, 90, 6, true);
+  rod(B, CAFE.p(0.47, 3.80, 0.0), CAFE.p(0.47, 3.80, 0.62), 0.018, iron);
+  rod(B, neonLocal(0, 0.43, -0.03), CAFE.p(0.47, 3.80, 0.58), 0.012, iron);
+  rod(B, CAFE.p(0.47, 3.18, 0.0), neonLocal(-0.42, -0.1, -0.03), 0.012, iron);
+  for (const b of [-0.2, 0.05]) rod(B, neonLocal(-0.39, b, -0.03), neonLocal(0.39, b, -0.03), 0.006, iron);
+}
+function buildNeonTubes(B) { // a neon cup of coffee: no lettering
+  const pink = { mat: M.EMIT, color: [1.0, 0.07, 0.30], lamp: 2, glow: 5.2 };
+  const amber = { mat: M.EMIT, color: [1.0, 0.36, 0.07], lamp: 2, glow: 4.5 };
+  const teal = { mat: M.EMIT, color: [0.10, 0.86, 1.0], lamp: 2, glow: 4.2 };
+  const P = (a, b) => neonLocal(a, b);
+  tube(B, [P(-0.23, 0.06), P(-0.215, -0.08), P(-0.15, -0.19), P(-0.03, -0.225), P(0.07, -0.19), P(0.135, -0.08), P(0.15, 0.06)], 0.017, pink, 40, 8);
+  tube(B, [P(-0.23, 0.06), P(-0.13, 0.068), P(0.05, 0.068), P(0.15, 0.06)], 0.017, pink, 24, 8);
+  tube(B, [P(0.148, 0.025), P(0.235, 0.035), P(0.265, -0.03), P(0.21, -0.1), P(0.117, -0.115)], 0.015, pink, 28, 8);
+  tube(B, [P(-0.29, -0.255), P(-0.18, -0.29), P(-0.04, -0.30), P(0.10, -0.29), P(0.22, -0.255)], 0.016, amber, 30, 8);
+  for (const [a, s] of [[-0.135, 0.85], [-0.035, 1.0], [0.065, 0.8]]) tube(B, [P(a, 0.12), P(a + 0.035, 0.175), P(a - 0.025, 0.24), P(a + 0.02, 0.12 + 0.22 * s)], 0.011, teal, 24, 8);
+}
+
+// ───────────────────────────── actors ─────────────────────────────
+// Everything here is a pure function of t, and each is posed at (t - distance/c): you see it as it was.
+function dynMesh(B, mat) { const m = new THREE.Mesh(B.geometry(), mat); m.frustumCulled = false; return m; }
+function paint(geo, matId, color, rough = 0.75, interior = false) {
+  const g = geo.index ? geo.toNonIndexed() : geo; const n = g.attributes.position.count;
+  const c = new Float32Array(n * 3), m = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) { c.set(color, i * 3); m.set([matId + (interior ? 100 : 0), rough, 0, 0], i * 4); }
+  g.setAttribute('aColor', new THREE.BufferAttribute(c, 3)); g.setAttribute('aMat', new THREE.BufferAttribute(m, 4));
+  return g;
+}
+function sdfPart(sdf, min, max, cell, matId, color, mat, interior = false) { const m = new THREE.Mesh(paint(sdfMesh(sdf, min, max, cell), matId, color, 0.75, interior), mat); m.frustumCulled = false; return m; }
+
+// ── the figure at the window ──
+function buildFigure(mat) {
+  const F = HERO, ub = F.ub;
+  const group = new THREE.Group();
+  const SHIRT = [0.30, 0.25, 0.20], PANTS = [0.035, 0.04, 0.055], SKIN = [0.38, 0.20, 0.13], HAIR = [0.035, 0.018, 0.010];
+  // local space of the figure: x along the wall, y up, z out of the window; origin at its feet
+  const base = { u: ub - 0.43, v: 5.12, d: -0.235 };
+  const body = new THREE.Group(); group.add(body);
+  body.matrixAutoUpdate = false;
+  const torso = sdfPart(p => {
+    let d = sdCapsule(p, V3(0, 1.04, -0.01), V3(0, 1.38, 0), 0.115, 0.135);
+    d = smin(d, sdEllipsoid(p, V3(0, 1.37, 0), V3(0.205, 0.12, 0.11)), 0.07);
+    d = smin(d, sdCapsule(p, V3(-0.16, 1.43, 0), V3(0.16, 1.43, 0), 0.062), 0.05);
+    d = smin(d, sdCapsule(p, V3(0.19, 1.42, 0), V3(0.245, 1.13, 0.0), 0.056, 0.042), 0.025);   // left arm at rest
+    d = smin(d, sdCapsule(p, V3(0.245, 1.13, 0.0), V3(0.24, 0.88, 0.04), 0.042, 0.031), 0.02);
+    return d;
+  }, V3(-0.3, 0.8, -0.2), V3(0.34, 1.54, 0.2), 0.013, M.CLOTH, SHIRT, mat);
+  const legs = sdfPart(p => smin(smin(sdEllipsoid(p, V3(0, 0.98, -0.01), V3(0.14, 0.11, 0.10)), sdCapsule(p, V3(-0.075, 0.95, -0.01), V3(-0.09, 0.05, 0), 0.075, 0.05), 0.05), sdCapsule(p, V3(0.075, 0.95, -0.01), V3(0.09, 0.05, 0), 0.075, 0.05), 0.05), V3(-0.2, 0, -0.15), V3(0.2, 1.12, 0.15), 0.018, M.CLOTH, PANTS, mat);
+  const hand0 = sdfPart(p => sdEllipsoid(p, V3(0.238, 0.83, 0.048), V3(0.024, 0.05, 0.03)), V3(0.19, 0.75, 0), V3(0.29, 0.9, 0.1), 0.008, M.MATTE, SKIN, mat);
+  body.add(torso, legs, hand0);
+  const head = new THREE.Group(); body.add(head);
+  head.add(
+    sdfPart(p => smin(smin(sdEllipsoid(p, V3(0, 0.115, 0.005), V3(0.088, 0.112, 0.097)), sdCapsule(p, V3(0, -0.03, -0.01), V3(0, 0.07, 0), 0.043, 0.047), 0.03), sdEllipsoid(p, V3(0, 0.095, 0.104), V3(0.014, 0.025, 0.018)), 0.012), V3(-0.13, -0.08, -0.14), V3(0.13, 0.26, 0.15), 0.009, M.MATTE, SKIN, mat),
+    sdfPart(p => { let d = smin(sdEllipsoid(p, V3(0, 0.158, -0.012), V3(0.10, 0.088, 0.108)), sdEllipsoid(p, V3(0, 0.09, -0.06), V3(0.078, 0.09, 0.065)), 0.04); d = smin(d, sdEllipsoid(p, V3(-0.015, 0.205, -0.075), V3(0.05, 0.043, 0.05)), 0.02); return Math.max(d, -sdEllipsoid(p, V3(0, 0.085, 0.105), V3(0.08, 0.105, 0.085))); }, V3(-0.14, -0.02, -0.16), V3(0.14, 0.28, 0.13), 0.009, M.MATTE, HAIR, mat));
+  for (const sx of [-0.031, 0.031]) { const e = new THREE.Mesh(paint(new THREE.SphereGeometry(0.009, 8, 6), M.MATTE, [0.02, 0.012, 0.01]), mat); e.position.set(sx, 0.128, 0.093); head.add(e); }
+  // right arm: two bones and a hand, solved each frame
+  const U1 = 0.285, U2 = 0.27;
+  const seg = (len, r0, r1, col, m = M.CLOTH) => sdfPart(p => sdCapsule(p, V3(0, 0, 0), V3(0, len, 0), r0, r1), V3(-0.08, -0.08, -0.08), V3(0.08, len + 0.08, 0.08), 0.01, m, col, mat);
+  const upper = seg(U1, 0.058, 0.042, SHIRT), fore = seg(U2, 0.041, 0.027, SHIRT);
+  const hand = new THREE.Group();
+  hand.add(sdfPart(p => { let d = sdEllipsoid(p, V3(0, 0.03, 0), V3(0.03, 0.042, 0.019)); d = smin(d, sdCapsule(p, V3(0.008, 0.055, 0), V3(0.012, 0.112, 0.0), 0.0105, 0.008), 0.012); d = smin(d, sdCapsule(p, V3(-0.018, 0.025, 0.006), V3(-0.036, 0.06, 0.012), 0.011, 0.008), 0.012); return d; }, V3(-0.06, -0.03, -0.04), V3(0.05, 0.14, 0.04), 0.0065, M.MATTE, SKIN, mat));
+  body.add(upper, fore, hand);
+  const lever = new THREE.Mesh(paint(new THREE.BoxGeometry(0.018, 0.05, 0.02), M.BRASS, [0.55, 0.40, 0.14], 0.3), mat);
+  const leverP = F.p(ub - 0.87, 6.525, 0.07);
+  lever.position.copy(leverP); group.add(lever);
+  const wallQ = new THREE.Quaternion().setFromRotationMatrix(F.m);
+
+  const key = (e) => { // [raise 0..1, flick 0..1, lean]
+    let raise = 0, flick = 0;
+    if (e < 6) { raise = sstep(-1.75, -0.55, e) * (1 - sstep(0.75, 1.9, e)); flick = sstep(-0.035, 0.02, e); }
+    else { raise = sstep(10.55, 11.65, e) * (1 - sstep(12.5, 13.7, e)); flick = 1 - sstep(12.015, 12.07, e); }
+    const lean = sstep(2.1, 4.2, e) * (1 - sstep(9.6, 11.0, e));
+    return { raise, flick, lean };
+  };
+  const place = (mesh, a, b) => { mesh.position.copy(a); mesh.quaternion.setFromUnitVectors(V3(0, 1, 0), b.clone().sub(a).normalize()); };
+  function update(t, cam) {
+    const e = poseTime(t, F.p(ub - 0.55, 6.5, -0.15), cam);
+    const k = key(e);
+    const breathe = Math.sin(e * 1.55) * 0.0035;
+    const walk = (1 - sstep(-2.4, -1.2, e)) * 0.09;
+    const m = F.m.clone().multiply(mtx(base.u + walk + 0.05 * k.lean, base.v + breathe, base.d + 0.03 * k.lean, 0.07 * k.lean, -0.50 - 0.05 * k.raise + 0.30 * k.lean, 0.02 * k.raise));
+    body.matrix.copy(m); body.matrixWorldNeedsUpdate = true;
+    head.position.set(0.0, 1.49, 0.01);
+    head.rotation.set(0.05 + 0.24 * k.lean + 0.02 * Math.sin(e * 0.7), -0.45 * k.raise * (1 - k.lean) + 0.30 * k.lean - 0.12 + 0.05 * Math.sin(e * 0.43), 0.03 * Math.sin(e * 0.9));
+    const inv = m.clone().invert();
+    const S = V3(-0.19, 1.425, 0.0);
+    const swTip = F.p(ub - 0.862, 6.552 - 0.045 * k.flick, 0.092).applyMatrix4(inv);
+    // the wrist sits behind and below the fingertip
+    const wristAtSwitch = swTip.clone().add(V3(0.075, -0.070, -0.045));
+    const rest = V3(-0.245, 0.90, 0.045);
+    const W = rest.clone().lerp(wristAtSwitch, k.raise);
+    W.z += Math.sin(k.raise * Math.PI) * 0.09; W.x -= Math.sin(k.raise * Math.PI) * 0.05;
+    const d = clamp(S.distanceTo(W), 0.08, U1 + U2 - 0.002);
+    const dir = W.clone().sub(S).normalize();
+    const a = (U1 * U1 - U2 * U2 + d * d) / (2 * d), hh = Math.sqrt(Math.max(U1 * U1 - a * a, 0));
+    const pole = V3(-0.7, -1, -0.25).normalize(); const perp = pole.addScaledVector(dir, -pole.dot(dir)).normalize();
+    const E = S.clone().addScaledVector(dir, a).addScaledVector(perp, hh);
+    const Wc = S.clone().addScaledVector(dir, d);
+    place(upper, S, E); place(fore, E, Wc);
+    const tipDir = swTip.clone().sub(Wc).normalize();
+    hand.position.copy(Wc);
+    hand.quaternion.setFromUnitVectors(V3(0, 1, 0), V3(0, -1, 0).lerp(tipDir, clamp(k.raise * 1.3, 0.02, 1)).normalize());
+    lever.quaternion.copy(wallQ).multiply(new THREE.Quaternion().setFromAxisAngle(V3(1, 0, 0), lerp(-0.55, 0.55, k.flick)));
+  }
+  return { group, update };
+}
+
+// ── the cat on the wall ──
+function buildCat(mat) {
+  const F = Frame.wall(3.12, -7.65, 3.30, -5.15);
+  const g = new THREE.Group(); const p0 = F.p(1.0, 0.958, -0.13);
+  g.position.copy(p0); g.rotation.y = Math.PI + 0.20; g.scale.setScalar(1.18);
+  const FUR = [0.135, 0.10, 0.068];
+  const body = sdfPart(p => {
+    let d = sdEllipsoid(p, V3(-0.085, 0.108, 0), V3(0.128, 0.112, 0.096));
+    d = smin(d, sdCapsule(p, V3(-0.07, 0.135, 0), V3(0.052, 0.255, 0), 0.098, 0.072), 0.05);
+    d = smin(d, sdEllipsoid(p, V3(0.062, 0.215, 0), V3(0.068, 0.095, 0.068)), 0.035);
+    d = smin(d, sdCapsule(p, V3(0.06, 0.28, 0), V3(0.098, 0.348, 0), 0.052, 0.043), 0.03);
+    for (const z of [-0.038, 0.038]) {
+      d = smin(d, sdCapsule(p, V3(0.07, 0.19, z), V3(0.112, 0.018, z), 0.030, 0.020), 0.018);
+      d = smin(d, sdEllipsoid(p, V3(0.132, 0.019, z), V3(0.038, 0.021, 0.025)), 0.012);
+    }
+    for (const z of [-0.073, 0.073]) { d = smin(d, sdEllipsoid(p, V3(-0.062, 0.092, z), V3(0.092, 0.08, 0.045)), 0.022); d = smin(d, sdEllipsoid(p, V3(0.012, 0.022, z * 1.12), V3(0.075, 0.025, 0.028)), 0.015); }
+    return d;
+  }, V3(-0.25, -0.01, -0.16), V3(0.2, 0.43, 0.16), 0.0085, M.FUR, FUR, mat);
+  const head = new THREE.Group();
+  head.add(sdfPart(p => {
+    let d = sdEllipsoid(p, V3(0, 0, 0), V3(0.063, 0.056, 0.064));
+    d = smin(d, sdEllipsoid(p, V3(0.048, -0.019, 0), V3(0.029, 0.022, 0.031)), 0.016);
+    for (const z of [-1, 1]) d = smin(d, sdCapsule(p, V3(0.0, 0.036, z * 0.036), V3(-0.012, 0.107, z * 0.052), 0.023, 0.002), 0.008);
+    return d;
+  }, V3(-0.09, -0.08, -0.09), V3(0.1, 0.13, 0.09), 0.0055, M.FUR, FUR, mat));
+  for (const z of [-0.024, 0.024]) { const e = new THREE.Mesh(paint(new THREE.SphereGeometry(0.0105, 10, 8), M.BRASS, [0.75, 0.62, 0.10], 0.15), mat); e.position.set(0.054, 0.006, z); head.add(e); }
+  { const nose = new THREE.Mesh(paint(new THREE.SphereGeometry(0.0065, 8, 6), M.MATTE, [0.12, 0.05, 0.045]), mat); nose.position.set(0.078, -0.012, 0); head.add(nose); }
+  const wb = new Builder(); for (const s of [-1, 1]) for (let i = 0; i < 4; i++) rod(wb, V3(0.062, -0.022, s * 0.016), V3(0.062 + i * 0.006, -0.036 + i * 0.012, s * 0.095), 0.0008, { mat: M.MATTE, color: [0.45, 0.44, 0.4] }, 3);
+  head.add(dynMesh(wb, mat));
+  head.position.set(0.112, 0.392, 0);
+  const tail = new THREE.Mesh(new THREE.BufferGeometry(), mat); tail.frustumCulled = false;
+  g.add(body, head, tail);
+  const tLit = LAMPS[0].pos.distanceTo(p0) / C_LIGHT;        // when the lamp's light reaches the cat
+  function update(t, cam) {
+    const e = poseTime(t, p0, cam);
+    const turn = sstep(tLit + 0.35, tLit + 1.25, e) * (1 - 0.45 * sstep(6.6, 7.9, e));
+    const turn2 = sstep(12.4, 13.5, e);
+    head.rotation.set(0, lerp(lerp(0.55, -0.28, turn), 0.45, turn2 * 0.7), lerp(-0.02, 0.36, turn * (1 - turn2 * 0.6)));
+    const sw = Math.sin(e * 1.35) * 0.5 + Math.sin(e * 0.57 + 1.0) * 0.5;
+    // the tail hangs over the lane side of the wall and sways
+    const pts = [V3(-0.19, 0.07, 0.0), V3(-0.21, 0.025, 0.08), V3(-0.12, 0.016, 0.13), V3(0.02, 0.017, 0.14), V3(0.14, 0.004, 0.13), V3(0.19, -0.075, 0.135 + sw * 0.012), V3(0.19 + sw * 0.02, -0.17, 0.14 + sw * 0.03), V3(0.19 + sw * 0.06, -0.24, 0.14 + sw * 0.06), V3(0.20 + sw * 0.10, -0.245 + Math.abs(sw) * 0.02, 0.14 + sw * 0.085)];
+    const c = new THREE.CatmullRomCurve3(pts);
+    const tg = new THREE.TubeGeometry(c, 48, 0.026, 10, false);
+    const pa = tg.attributes.position; const uv = tg.attributes.uv;
+    for (let i = 0; i < pa.count; i++) { const s = uv.getX(i); const cc = c.getPointAt(Math.min(1, s)); const k = 1.0 - 0.45 * s * s; pa.setXYZ(i, cc.x + (pa.getX(i) - cc.x) * k, cc.y + (pa.getY(i) - cc.y) * k, cc.z + (pa.getZ(i) - cc.z) * k); }
+    tg.computeVertexNormals();
+    tail.geometry.dispose(); tail.geometry = paint(tg, M.FUR, FUR);
+    body.scale.set(1, 1 + Math.sin(e * 2.1) * 0.006, 1 + Math.sin(e * 2.1) * 0.012);
+  }
+  return { group: g, update };
+}
+
+// ── laundry ──
+function buildLaundry(mat) {
+  const group = new THREE.Group(); const items = [];
+  const lines = [
+    { a: V3(-1.95, 5.55, -10.9), b: V3(2.36, 5.80, -12.75), sag: 0.17, cloth: [[0.09, 0.50, 0.58, 'shirt', [0.52, 0.10, 0.06]], [0.25, 0.30, 0.42, 'cloth', [0.62, 0.55, 0.38]], [0.63, 1.02, 1.02, 'sheet', [0.70, 0.68, 0.62]], [0.86, 0.46, 0.62, 'shirt', [0.12, 0.20, 0.36]]] },
+    { a: V3(-1.97, 6.15, -16.55), b: V3(2.27, 6.25, -17.05), sag: 0.2, cloth: [[0.17, 0.8, 0.9, 'sheet', [0.55, 0.58, 0.60]], [0.40, 0.46, 0.6, 'shirt', [0.64, 0.62, 0.56]], [0.60, 0.32, 0.75, 'trouser', [0.08, 0.10, 0.16]], [0.79, 0.55, 0.5, 'cloth', [0.50, 0.22, 0.08]]] },
+  ];
+  const sb = new Builder();
+  for (const L of lines) {
+    const at = s => L.a.clone().lerp(L.b, s).add(V3(0, -L.sag * 4 * s * (1 - s), 0));
+    const pts = []; for (let i = 0; i <= 24; i++) pts.push(at(i / 24));
+    tube(sb, pts, 0.006, { mat: M.MATTE, color: [0.16, 0.13, 0.09] }, 60, 4);
+    const len = L.a.distanceTo(L.b);
+    for (const [s, w, h, type, col] of L.cloth) {
+      const g = new THREE.PlaneGeometry(1, 1, 26, 34);
+      const uv = g.attributes.uv; const index = g.index.array; const keep = [];
+      const inside = (u, v) => { // v: 1 at the line
+        if (type === 'shirt') { const sleeve = v > 0.68; const bodyW = 0.30; if (!sleeve && Math.abs(u - 0.5) > bodyW) return false; if (sleeve && v < 0.68 + Math.max(0, Math.abs(u - 0.5) - 0.3) * 0.35) return false; if (Math.hypot((u - 0.5) * 1.0, (v - 1.02) * 1.1) < 0.12) return false; return true; }
+        if (type === 'trouser') return !(v < 0.62 && Math.abs(u - 0.5) < 0.07 + (0.62 - v) * 0.06);
+        return true;
+      };
+      for (let i = 0; i < index.length; i += 3) { let u = 0, v = 0; for (let k = 0; k < 3; k++) { u += uv.getX(index[i + k]) / 3; v += uv.getY(index[i + k]) / 3; } if (inside(u, v)) keep.push(index[i], index[i + 1], index[i + 2]); }
+      const base = []; for (let i = 0; i < uv.count; i++) base.push([uv.getX(i), uv.getY(i)]);
+      g.setIndex(keep);
+      const ng = g.toNonIndexed();
+      const painted = paint(ng, M.CLOTH, col, 0.85);
+      const mesh = new THREE.Mesh(painted, mat); mesh.frustumCulled = false;
+      const uvs = []; const u2 = painted.attributes.uv; for (let i = 0; i < u2.count; i++) uvs.push([u2.getX(i), u2.getY(i)]);
+      items.push({ mesh, at, s, w, h, len, uvs, phase: rand(0, 6.28) });
+      group.add(mesh);
+      for (const du of [-0.36, 0.36]) { const p = at(s + du * w / len); wbox(sb, p.x, p.y - 0.01, p.z, 0.022, 0.085, 0.03, { mat: M.WOOD, color: [0.32, 0.2, 0.09] }); }
+    }
+  }
+  group.add(dynMesh(sb, mat));
+  function update(t, cam) {
+    for (const it of items) {
+      const mid = it.at(it.s); const e = poseTime(t, mid, cam);
+      const pos = it.mesh.geometry.attributes.position;
+      const side = it.at(Math.min(1, it.s + 0.05)).sub(it.at(Math.max(0, it.s - 0.05))); side.y = 0; side.normalize();
+      const nrm = V3(-side.z, 0, side.x);
+      for (let i = 0; i < pos.count; i++) {
+        const [u, v] = it.uvs[i]; const down = 1 - v;
+        const top = it.at(it.s + (u - 0.5) * it.w / it.len);
+        const gust = Math.sin(e * 1.15 + it.phase) * 0.65 + Math.sin(e * 2.05 + it.phase * 1.7) * 0.35;
+        const off = (gust * 0.10 + 0.035) * Math.pow(down, 1.5) * it.h
+          + Math.sin(u * 15 + it.phase + down * 3.0) * 0.026 * (0.25 + down)
+          + Math.sin(u * 6.5 - e * 2.7 + down * 7.0) * 0.022 * down;
+        pos.setXYZ(i, top.x + nrm.x * off, top.y - down * it.h * (1 - 0.012 * Math.sin(u * 15 + it.phase)) - 0.008, top.z + nrm.z * off);
+      }
+      pos.needsUpdate = true; it.mesh.geometry.computeVertexNormals();
+    }
+  }
+  return { group, update };
+}
+
+// ── moths ──
+function buildMoths(mat) {
+  const moths = [];
+  const add = (lamp, n) => { for (let i = 0; i < n; i++) moths.push({ lamp, r: rand(0.17, 0.52), w: rand(2.0, 4.6) * (RNG() < 0.5 ? -1 : 1), p1: rand(0, 6.28), p2: rand(0, 6.28), p3: rand(0, 6.28), tilt: rand(-0.7, 0.7), delay: rand(0.2, 2.4), s: rand(0.65, 1.15), f: rand(8.5, 12.5) }); };
+  add(0, 7); add(1, 6);
+  const geo = new THREE.BufferGeometry();
+  const nv = moths.length * 12;
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nv * 3), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(nv * 3), 3));
+  const painted = paint(geo, M.CLOTH, [0.20, 0.16, 0.11], 0.8);
+  const mesh = new THREE.Mesh(painted, mat); mesh.frustumCulled = false;
+  function posAt(m, e) {
+    const L = LAMPS[m.lamp];
+    const since = e - L.on - m.delay;
+    // before the lamp is lit they drift idly further out; afterwards they are drawn in
+    const pull = since > 0 ? 1 + 2.6 * Math.exp(-since * 0.9) : 3.6;
+    const a = m.p1 + m.w * e * (since > 0 ? 1 : 0.45) + 0.6 * Math.sin(e * 2.3 + m.p2);
+    const r = m.r * pull * (1 + 0.28 * Math.sin(e * 3.1 + m.p3));
+    return V3(L.pos.x + Math.cos(a) * r + 0.09 * Math.sin(e * 7.3 + m.p2),
+      L.pos.y + Math.sin(a * 0.8 + m.p3) * r * 0.55 + Math.sin(a) * m.tilt * r + 0.05 * Math.sin(e * 9.1 + m.p1),
+      L.pos.z + Math.sin(a) * r * 0.75 + 0.20 * (m.lamp === 0 ? 1 : 0));
+  }
+  function update(t, cam) {
+    const P = painted.attributes.position, N = painted.attributes.normal; let k = 0;
+    for (const m of moths) {
+      const e = poseTime(t, LAMPS[m.lamp].pos, cam);
+      const c = posAt(m, e), c2 = posAt(m, e + 0.03);
+      const fwd = c2.sub(c).normalize(); if (!isFinite(fwd.x) || fwd.lengthSq() < 0.5) fwd.set(1, 0, 0);
+      const rt = new THREE.Vector3().crossVectors(fwd, V3(0, 1, 0)).normalize(); const up = new THREE.Vector3().crossVectors(rt, fwd).normalize();
+      const flap = Math.sin(e * m.f * 6.283 + m.p2) * 1.05 + 0.25;
+      const s = 0.034 * m.s;
+      for (const side of [-1, 1]) {
+        const wing = rt.clone().multiplyScalar(side * Math.cos(flap)).addScaledVector(up, Math.sin(flap));
+        const root = c.clone().addScaledVector(rt, side * 0.004);
+        const tip1 = root.clone().addScaledVector(wing, s).addScaledVector(fwd, s * 0.55);
+        const tip2 = root.clone().addScaledVector(wing, s * 0.9).addScaledVector(fwd, -s * 0.65);
+        const back = root.clone().addScaledVector(fwd, -s * 0.5), nose = root.clone().addScaledVector(fwd, s * 0.4);
+        const nn = new THREE.Vector3().crossVectors(wing, fwd).normalize();
+        for (const q of [nose, tip1, tip2, nose, tip2, back]) { P.setXYZ(k, q.x, q.y, q.z); N.setXYZ(k, nn.x, nn.y, nn.z); k++; }
+      }
+    }
+    P.needsUpdate = true; N.needsUpdate = true;
+  }
+  return { group: mesh, update };
+}
+
+// ── drips from gutters and wet washing ──
+const DRIPS = [ // x, y (source), z, period, phase
+  [-0.62, 8.9, -6.75, 1.9, 0.2], [-0.28, 8.9, -7.25, 2.7, 1.35], [1.38, 8.6, -5.55, 2.3, 0.75], [1.05, 5.05, -9.3, 1.7, 0.4],
+  [0.55, 5.1, -11.9, 2.1, 1.1], [0.15, 5.0, -13.5, 1.55, 0.05], [-0.15, 5.3, -12.9, 2.9, 2.0], [-1.2, 8.4, -10.7, 2.5, 0.9],
+  [-0.75, 5.6, -16.7, 1.8, 1.6], [0.9, 8.7, -17.3, 2.2, 0.3], [0.7, 8.9, -3.35, 3.1, 2.4], [2.02, 8.8, -8.35, 1.45, 1.0], [-2.35, 9.4, -6.65, 2.05, 0.55],
+];
+const fallTime = y => Math.sqrt(2 * y / 9.81) * 1.04;
+function dripUniforms() { const out = []; for (let i = 0; i < 24; i++) { const d = DRIPS[i]; out.push(d ? new THREE.Vector4(d[0], d[2], d[4] + fallTime(d[1]), d[3]) : new THREE.Vector4(0, 0, 0, 0)); } return out; }
+function buildDrips(mat) {
+  const group = new THREE.Group();
+  const geo = paint(new THREE.SphereGeometry(1, 7, 6), M.BOTTLE, [0.75, 0.85, 0.95], 0.05);
+  const drops = DRIPS.map(d => { const m = new THREE.Mesh(geo, mat); m.frustumCulled = false; group.add(m); return { m, d }; });
+  function update(t, cam) {
+    for (const { m, d } of drops) {
+      const [x, y, z, per, ph] = d;
+      const e = poseTime(t, V3(x, 2, z), cam);
+      let age = (e - ph) % per; if (age < 0) age += per;
+      const yy = y - 0.5 * 9.81 * Math.pow(age / 1.04, 2);
+      if (yy < 0.02) { m.visible = false; continue; }
+      m.visible = true;
+      const v = 9.81 * age; const st = 0.011 + v * 0.0042;
+      m.position.set(x, yy, z); m.scale.set(0.0065, st, 0.0065);
+    }
+  }
+  return { group, update };
+}
+
+// ── the lamp bodies ──
+function buildLampMeshes(mat) {
+  const out = [];
+  { const B = new Builder(); const L = LAMPS[0].pos;
+    sphere(B, L, 0.047, { mat: M.EMIT, color: [1.0, 0.70, 0.38], lamp: 0, glow: 55 }, 1, 1.18, 1, 24);
+    lathe(B, [[0.001, 0.045], [0.026, 0.048], [0.027, 0.095], [0.02, 0.105], [0.001, 0.107]], mtx(L.x, L.y, L.z), { mat: M.BRASS, color: [0.38, 0.28, 0.12] }, 18);
+    out.push(dynMesh(B, mat)); }
+  { const B = new Builder(); buildLanternHead(B); out.push(dynMesh(B, mat)); }
+  { const B = new Builder(); buildNeonTubes(B); out.push(dynMesh(B, mat)); }
+  return out;
+}
+
+// ───────────────────────────── renderer ─────────────────────────────
+const OUT = RENDER_MODE ? 1080 : Math.max(360, Math.min(1080, Math.round(Math.min(innerWidth, innerHeight) * Math.min(devicePixelRatio, 1.5))));
+const SS = RENDER_MODE ? Number(QS.get('ss') || 2) : 1;
+const RES = OUT * SS;
+const SAMPLES = RENDER_MODE ? Number(QS.get('samples') || 16) : 1;
+const HALF = Math.round(RES / 2);
+const REFL = RENDER_MODE ? OUT : Math.round(OUT * 0.6);
+const SHUTTER = 1 / 60;
+const BN = 64;
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', preserveDrawingBuffer: true });
+renderer.setPixelRatio(1); renderer.setSize(OUT, OUT, false);
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.autoClear = true;
+const gl = renderer.getContext();
+gl.getExtension('EXT_float_blend'); gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear');
+
+// ── generated textures ──
+function blueNoise(size, seed) { // void-and-cluster
+  const N = size * size, R = 7; const rng = mulberry32(seed);
+  const kern = []; for (let y = -R; y <= R; y++) for (let x = -R; x <= R; x++) kern.push([x, y, Math.exp(-(x * x + y * y) / (2 * 1.9 * 1.9))]);
+  const on = new Uint8Array(N), E = new Float64Array(N);
+  const splat = (i, s) => { const px = i % size, py = (i / size) | 0; for (const [x, y, w] of kern) E[((py + y + size) % size) * size + ((px + x + size) % size)] += s * w; };
+  const tightest = () => { let b = -1, v = -Infinity; for (let i = 0; i < N; i++) if (on[i] && E[i] > v) { v = E[i]; b = i; } return b; };
+  const voidest = () => { let b = -1, v = Infinity; for (let i = 0; i < N; i++) if (!on[i] && E[i] < v) { v = E[i]; b = i; } return b; };
+  const init = N / 10 | 0; let c = 0; while (c < init) { const i = rng() * N | 0; if (!on[i]) { on[i] = 1; splat(i, 1); c++; } }
+  for (let it = 0; it < 2000; it++) { const t = tightest(); on[t] = 0; splat(t, -1); const v = voidest(); on[v] = 1; splat(v, 1); if (v === t) break; }
+  const rank = new Int32Array(N); const savedOn = on.slice(), savedE = E.slice();
+  for (let r = init - 1; r >= 0; r--) { const t = tightest(); on[t] = 0; splat(t, -1); rank[t] = r; }
+  on.set(savedOn); E.set(savedE);
+  for (let r = init; r < N; r++) { const v = voidest(); on[v] = 1; splat(v, 1); rank[v] = r; }
+  return Float32Array.from(rank, r => (r + 0.5) / N);
+}
+function makeBlueTexture() {
+  const ch = [blueNoise(BN, 11), blueNoise(BN, 23), blueNoise(BN, 37), blueNoise(BN, 51)];
+  const d = new Float32Array(BN * BN * 4);
+  for (let i = 0; i < BN * BN; i++) for (let k = 0; k < 4; k++) d[i * 4 + k] = ch[k][i];
+  const t = new THREE.DataTexture(d, BN, BN, THREE.RGBAFormat, THREE.FloatType); t.needsUpdate = true; return t;
+}
+function makeNoise3D() {
+  const S = 64; const data = new Uint8Array(S * S * S); const rng = mulberry32(99);
+  const octs = [[8, 0.55], [16, 0.3], [32, 0.15]].map(([n, a]) => ({ n, a, v: Float32Array.from({ length: n * n * n }, () => rng()) }));
+  const f = x => x * x * (3 - 2 * x);
+  for (let z = 0; z < S; z++) for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    let s = 0;
+    for (const o of octs) {
+      const n = o.n, gx = x / S * n, gy = y / S * n, gz = z / S * n; const ix = gx | 0, iy = gy | 0, iz = gz | 0; const fx = f(gx - ix), fy = f(gy - iy), fz = f(gz - iz);
+      const v = (i, j, k) => o.v[((i % n) + n * ((j % n) + n * (k % n)))];
+      s += o.a * lerp(lerp(lerp(v(ix, iy, iz), v(ix + 1, iy, iz), fx), lerp(v(ix, iy + 1, iz), v(ix + 1, iy + 1, iz), fx), fy), lerp(lerp(v(ix, iy, iz + 1), v(ix + 1, iy, iz + 1), fx), lerp(v(ix, iy + 1, iz + 1), v(ix + 1, iy + 1, iz + 1), fx), fy), fz);
+    }
+    data[x + S * (y + S * z)] = clamp((s - 0.5) * 1.35 + 0.5, 0, 1) * 255;
+  }
+  const t = new THREE.Data3DTexture(data, S, S, S); t.format = THREE.RedFormat; t.type = THREE.UnsignedByteType;
+  t.wrapS = t.wrapT = t.wrapR = THREE.RepeatWrapping; t.minFilter = t.magFilter = THREE.LinearFilter; t.unpackAlignment = 1; t.needsUpdate = true; return t;
+}
+
+// ── one-bounce virtual lights: where does each lamp's light land? ──
+function buildVPLs() {
+  const ground = { o: V3(-4.6, 0.02, -23), a: V3(9.6, 0, 0), b: V3(0, 0, 26), n: V3(0, 1, 0), albedo: [0.10, 0.095, 0.085] };
+  const rects = [ground, ...PROXIES];
+  const out = [];
+  const trace = (li, count) => {
+    const L = LAMPS[li];
+    for (let i = 0; i < count; i++) {
+      const y = 1 - 2 * (i + 0.5) / count, r = Math.sqrt(1 - y * y), a = i * 2.399963229;
+      const d = V3(Math.cos(a) * r, y, Math.sin(a) * r);
+      let best = 1e9, hit = null;
+      for (const R of rects) {
+        const den = d.dot(R.n); if (Math.abs(den) < 1e-5) continue;
+        const t = R.o.clone().sub(L.pos).dot(R.n) / den; if (t < 0.2 || t >= best) continue;
+        const q = L.pos.clone().addScaledVector(d, t).sub(R.o);
+        const u = q.dot(R.a) / R.a.lengthSq(), v = q.dot(R.b) / R.b.lengthSq();
+        if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+        best = t; hit = { R, den };
+      }
+      if (!hit) continue;
+      const n = hit.R.n.clone(); if (hit.den > 0) n.negate();
+      const p = L.pos.clone().addScaledVector(d, best).addScaledVector(n, 0.06);
+      const flux = L.I * 4 * Math.PI / count * 0.72;
+      out.push({ p, path: best, n, f: hit.R.albedo.map(v => v * flux), li });
+    }
+  };
+  trace(0, 156); trace(1, 34); trace(2, 14);
+  const NV = Math.min(out.length, 112);
+  const data = new Float32Array(112 * 3 * 4);
+  // interleave so that any stride is still a fair sample
+  const order = out.map((_, i) => i).sort((a, b) => ((a * 61) % 197) - ((b * 61) % 197)).slice(0, NV);
+  order.forEach((k, j) => { const v = out[k]; data.set([v.p.x, v.p.y, v.p.z, v.path], j * 4); data.set([v.n.x, v.n.y, v.n.z, 0], (112 + j) * 4); data.set([v.f[0], v.f[1], v.f[2], v.li], (224 + j) * 4); });
+  const t = new THREE.DataTexture(data, 112, 3, THREE.RGBAFormat, THREE.FloatType); t.needsUpdate = true;
+  return { tex: t, count: NV, total: out.length };
+}
+
+// ── targets ──
+function rt(w, h, o = {}) { return new THREE.WebGLRenderTarget(w, h, Object.assign({ type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false }, o)); }
+function gbuffer(w, h) {
+  const g = new THREE.WebGLRenderTarget(w, h, { count: 4, type: THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: true });
+  g.textures[0].type = THREE.FloatType; g.textures[3].type = THREE.FloatType;
+  return g;
+}
+const gMain = gbuffer(RES, RES), gRG = gbuffer(REFL, REFL), gRM = gbuffer(RES, RES);
+const halfRT = new THREE.WebGLRenderTarget(HALF, HALF, { count: 2, type: THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
+const litRT = rt(RES, RES, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+const reflRTg = rt(REFL, REFL, { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
+const reflRTm = rt(RES, RES);
+const accRT = rt(RES, RES, { type: THREE.FloatType });
+const bloomDown = [], bloomUp = [];
+for (let i = 0, s = RES >> 1; i < 7; i++, s >>= 1) { bloomDown.push(rt(s, s)); bloomUp.push(rt(s, s)); }
+
+// ── scene ──
+const blueTex = makeBlueTexture();
+const noise3 = makeNoise3D();
+const gbufUniforms = { uViewPos: { value: V3() }, uClipPlane: { value: new THREE.Vector4(0, 0, 0, 1) }, uTime: { value: 0 }, uDrips: { value: dripUniforms() } };
+const gMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: GBUF_VERT, fragmentShader: GBUF_FRAG, uniforms: gbufUniforms, side: THREE.DoubleSide });
+const distUniforms = { uOrigin: { value: V3() }, uAxis: { value: MOON_DIR.clone() }, uMode: { value: 0 } };
+const distMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: DIST_VERT, fragmentShader: DIST_FRAG, uniforms: distUniforms, side: THREE.DoubleSide });
+
+const scene = new THREE.Scene(); scene.matrixWorldAutoUpdate = true;
+const staticB = buildStreet();
+const staticMesh = new THREE.Mesh(staticB.geometry(), gMat); staticMesh.frustumCulled = false;
+const ground = new THREE.Group();
+ground.add(buildCobbles(gMat));
+{ const grit = new THREE.Mesh(gridPlane(-4.9, 5.1, -25.5, 3.4, 0.07, (x, z) => groundBase(x, z) + 0.0045, M.GRIT, [0.085, 0.072, 0.055]), gMat); grit.frustumCulled = false; ground.add(grit); }
+{ const water = new THREE.Mesh(gridPlane(-4.9, 5.1, -25.5, 3.4, 0.06, () => 0.0, M.WATER, [0, 0, 0], (x, z) => clamp(-(groundBase(x, z) + 0.004) * 34, 0, 1)), gMat); water.frustumCulled = false; ground.add(water); }
+const figure = buildFigure(gMat), cat = buildCat(gMat), laundry = buildLaundry(gMat), moths = buildMoths(gMat), drips = buildDrips(gMat);
+const lampMeshes = buildLampMeshes(gMat);
+scene.add(staticMesh, ground, figure.group, cat.group, laundry.group, moths.group, drips.group, ...lampMeshes);
+const vpl = buildVPLs();
+
+// ── shadow maps ──
+const cubes = LAMPS.map(L => {
+  const target = new THREE.WebGLCubeRenderTarget(L.shadow, { type: THREE.FloatType, format: THREE.RedFormat, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, generateMipmaps: false });
+  const cam = new THREE.CubeCamera(0.04, 90, target); cam.position.copy(L.pos); return { target, cam };
+});
+const MOON_RES = 4096;
+const moonRT = rt(MOON_RES, MOON_RES, { type: THREE.FloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: true });
+const moonCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 140);
+{
+  const ctr = V3(0, 8, -15); moonCam.position.copy(ctr).addScaledVector(MOON_DIR, 60); moonCam.lookAt(ctr); moonCam.updateMatrixWorld(true);
+  const inv = moonCam.matrixWorld.clone().invert(); const bb = new THREE.Box3();
+  for (const x of [-7, 7]) for (const y of [0, 20]) for (const z of [-28, 4]) bb.expandByPoint(V3(x, y, z).applyMatrix4(inv));
+  moonCam.left = bb.min.x; moonCam.right = bb.max.x; moonCam.bottom = bb.min.y; moonCam.top = bb.max.y; moonCam.updateProjectionMatrix();
+}
+const moonMatrix = new THREE.Matrix4().multiplyMatrices(moonCam.projectionMatrix, moonCam.matrixWorldInverse.copy(moonCam.matrixWorld).invert());
+
+function renderShadows() {
+  renderer.setClearColor(new THREE.Color(1, 1, 1), 1);
+  scene.overrideMaterial = distMat;
+  const vis = [ground.visible, moths.group.visible, drips.group.visible, ...lampMeshes.map(m => m.visible)];
+  ground.visible = false; moths.group.visible = false; drips.group.visible = false; lampMeshes.forEach(m => m.visible = false);
+  distUniforms.uMode.value = 0;
+  LAMPS.forEach((L, i) => { distUniforms.uOrigin.value.copy(L.pos); cubes[i].cam.update(renderer, scene); });
+  distUniforms.uMode.value = 1; distUniforms.uOrigin.value.copy(moonCam.position);
+  renderer.setRenderTarget(moonRT); renderer.clear(); renderer.render(scene, moonCam);
+  scene.overrideMaterial = null;
+  [ground.visible, moths.group.visible, drips.group.visible] = vis; lampMeshes.forEach((m, i) => m.visible = vis[3 + i]);
+  renderer.setClearColor(new THREE.Color(0, 0, 0), 0);
+}
+
+// ── full-screen passes ──
+const fsScene = new THREE.Scene(); const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const fsTri = new THREE.BufferGeometry(); fsTri.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+const fsMesh = new THREE.Mesh(fsTri, null); fsMesh.frustumCulled = false; fsScene.add(fsMesh);
+function pass(mat, target) { fsMesh.material = mat; renderer.setRenderTarget(target); renderer.render(fsScene, fsCam); }
+const fsMat = (frag, uniforms, extra = {}) => new THREE.ShaderMaterial(Object.assign({ glslVersion: THREE.GLSL3, vertexShader: FS_VERT, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false }, extra));
+
+const shared = {
+  uShadowDummy: { value: null },
+  tShadow0: { value: cubes[0].target.texture }, tShadow1: { value: cubes[1].target.texture }, tShadow2: { value: cubes[2].target.texture },
+  tMoonShadow: { value: moonRT.texture }, uMoonMatrix: { value: moonMatrix }, uMoonDir: { value: MOON_DIR }, uMoonOrigin: { value: moonCam.position },
+  tNoise3: { value: noise3 }, tBlue: { value: blueTex }, tVpl: { value: vpl.tex }, uVplCount: { value: vpl.count },
+  uLampPos: { value: LAMPS.map(l => l.pos) }, uLampCol: { value: LAMPS.map(l => V3(...l.color)) }, uFlareCol: { value: LAMPS.map(l => V3(...l.flare)) },
+  uLampTiming: { value: LAMPS.map(l => V3(l.on, l.off, l.radius)) }, uLampI: { value: LAMPS.map(l => l.I) },
+};
+delete shared.uShadowDummy;
+const viewUniforms = () => ({ uViewPos: { value: V3() }, uInvViewProj: { value: new THREE.Matrix4() }, uViewProj: { value: new THREE.Matrix4() }, uPlane: { value: new THREE.Vector4(0, 0, 0, 1) }, uIsRefl: { value: 0 }, uSample: { value: 0 }, uTime: { value: 0 }, uAudit: { value: 0 }, uRes: { value: new THREE.Vector2(RES, RES) } });
+const gTex = g => ({ tPos: { value: g.textures[0] }, tNor: { value: g.textures[1] }, tAlb: { value: g.textures[2] }, tEmi: { value: g.textures[3] } });
+
+const halfMat = fsMat(HALF_FRAG, Object.assign({}, shared, viewUniforms(), gTex(gMain)));
+const glassU = (() => {
+  const a = { c: CAFE.p((CAFE_WIN.u0 + CAFE_WIN.u1) / 2, (CAFE_WIN.v0 + CAFE_WIN.v1) / 2, -0.085), hw: (CAFE_WIN.u1 - CAFE_WIN.u0) / 2, hh: (CAFE_WIN.v1 - CAFE_WIN.v0) / 2, U: CAFE.U, N: CAFE.N };
+  const b = { c: ENDW.p((SHOP.u0 + SHOP.u1) / 2, (SHOP.v0 + SHOP.v1) / 2, -0.03), hw: (SHOP.u1 - SHOP.u0) / 2, hh: (SHOP.v1 - SHOP.v0) / 2, U: ENDW.U, N: ENDW.N };
+  const z = { c: V3(), hw: -1, hh: 0, U: V3(1, 0, 0), N: V3(0, 0, 1) };
+  const arr = [a, b, z, z];
+  return { uGlass: { value: arr.map(g => new THREE.Vector4(g.c.x, g.c.y, g.c.z, g.hw)) }, uGlassU: { value: arr.map(g => g.U.clone()) }, uGlassN: { value: arr.map(g => new THREE.Vector4(g.N.x, g.N.y, g.N.z, g.hh)) } };
+})();
+const blankTex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1); blankTex.needsUpdate = true;
+const lightExtra = () => ({ tHalfMist: { value: blankTex }, tHalfInd: { value: blankTex }, tReflG: { value: blankTex }, tReflM: { value: blankTex }, uMirrorN: { value: MIRROR.n } });
+const mainLight = fsMat(LIGHT_FRAG, Object.assign({}, shared, viewUniforms(), gTex(gMain), lightExtra(), glassU));
+mainLight.uniforms.tHalfMist.value = halfRT.textures[0]; mainLight.uniforms.tHalfInd.value = halfRT.textures[1];
+mainLight.uniforms.tReflG.value = reflRTg.texture; mainLight.uniforms.tReflM.value = reflRTm.texture;
+const reflLightG = fsMat(LIGHT_FRAG, Object.assign({}, shared, viewUniforms(), gTex(gRG), lightExtra(), glassU));
+const reflLightM = fsMat(LIGHT_FRAG, Object.assign({}, shared, viewUniforms(), gTex(gRM), lightExtra(), glassU));
+
+const accMat = fsMat(ACC_FRAG, { tSrc: { value: litRT.texture }, uW: { value: 1 } }, { blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendEquation: THREE.AddEquation, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneFactor, transparent: true });
+const downMat = fsMat(DOWN_FRAG, { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uFirst: { value: 0 } });
+const upMat = fsMat(UP_FRAG, { tSrc: { value: null }, tBase: { value: null }, uTexel: { value: new THREE.Vector2() }, uMix: { value: 0.65 } });
+const finalMat = fsMat(FINAL_FRAG, { tHDR: { value: accRT.texture }, tBloom: { value: null }, tBlue: { value: blueTex }, uOut: { value: new THREE.Vector2(OUT, OUT) }, uFrame: { value: 0 }, uSS: { value: SS }, uExposure: { value: Number(QS.get('exp') || 1.0) } });
+
+// ── cameras ──
+const camera = new THREE.PerspectiveCamera(FOV, 1, 0.08, 400);
+const reflCam = new THREE.PerspectiveCamera(FOV, 1, 0.08, 400);
+reflCam.matrixAutoUpdate = false; reflCam.matrixWorldAutoUpdate = false;
+const proj0 = new THREE.Matrix4();
+function reflectionMatrix(n, d) { return new THREE.Matrix4().set(1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, -2 * d * n.x, -2 * n.y * n.x, 1 - 2 * n.y * n.y, -2 * n.y * n.z, -2 * d * n.y, -2 * n.z * n.x, -2 * n.z * n.y, 1 - 2 * n.z * n.z, -2 * d * n.z, 0, 0, 0, 1); }
+const RM_GROUND = reflectionMatrix(V3(0, 1, 0), 0);
+const MIR_D = -MIRROR.n.dot(MIRROR.c);
+const RM_MIRROR = reflectionMatrix(MIRROR.n, MIR_D);
+
+function setView(mat, cam, viewPos) {
+  const u = mat.uniforms;
+  u.uViewPos.value.copy(viewPos);
+  u.uViewProj.value.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+  u.uInvViewProj.value.copy(u.uViewProj.value).invert();
+}
+function drawG(target, cam, viewPos, clip) {
+  gbufUniforms.uViewPos.value.copy(viewPos); gbufUniforms.uClipPlane.value.copy(clip);
+  renderer.setRenderTarget(target); renderer.clear(); renderer.render(scene, cam);
+}
+function renderReflection(RM, n, d, gTarget, lightMat, outRT, camPos, clipOffset, hideGround, scissor) {
+  reflCam.matrixWorldInverse.multiplyMatrices(camera.matrixWorldInverse, RM);
+  reflCam.matrixWorld.copy(reflCam.matrixWorldInverse).invert();
+  reflCam.projectionMatrix.copy(camera.projectionMatrix); reflCam.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+  const mpos = camPos.clone().applyMatrix4(RM);
+  ground.visible = !hideGround;
+  if (scissor) { for (const t of [gTarget, outRT]) { t.scissorTest = true; t.scissor.copy(scissor); } }
+  drawG(gTarget, reflCam, mpos, new THREE.Vector4(n.x, n.y, n.z, d - clipOffset));
+  ground.visible = true;
+  setView(lightMat, reflCam, mpos);
+  lightMat.uniforms.uPlane.value.set(n.x, n.y, n.z, d); lightMat.uniforms.uIsRefl.value = 1;
+  pass(lightMat, outRT);
+}
+function mirrorScissor() { // only the part of the frame the cafe mirror covers needs a reflection
+  let x0 = 1, y0 = 1, x1 = -1, y1 = -1;
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
+    const p = MIRROR.c.clone().addScaledVector(MIRROR.right, sx * MIRROR.hw).addScaledVector(MIRROR.up, sy * MIRROR.hh).project(camera);
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+  }
+  const px = v => clamp(Math.floor((v * 0.5 + 0.5) * RES), 0, RES);
+  const a = Math.max(0, px(x0) - 6), b = Math.max(0, px(y0) - 6), c = Math.min(RES, px(x1) + 6), d = Math.min(RES, px(y1) + 6);
+  return new THREE.Vector4(a, b, Math.max(1, c - a), Math.max(1, d - b));
+}
+
+const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+const debugState = { lastCam: null };
+
+function poseAll(t, camPos) {
+  figure.update(t, camPos); cat.update(t, camPos); laundry.update(t, camPos); moths.update(t, camPos); drips.update(t, camPos);
+  scene.updateMatrixWorld(true);
+}
+
+function renderFrame(t, samples) {
+  const c = cameraAt(t);
+  camera.position.copy(c.pos); camera.lookAt(c.tgt); camera.updateMatrixWorld(true); camera.updateProjectionMatrix();
+  proj0.copy(camera.projectionMatrix);
+  debugState.lastCam = c;
+  poseAll(t, c.pos);
+  renderShadows();
+  renderer.setRenderTarget(accRT); renderer.clear();
+  const frameNo = Math.round(t * 30);
+  for (let k = 0; k < samples; k++) {
+    // jitter in pixel, in shutter time (motion blur of the fronts) and in every stochastic filter
+    const jx = samples > 1 ? halton(k + 1, 2) - 0.5 : 0, jy = samples > 1 ? halton(k + 1, 3) - 0.5 : 0;
+    const tk = samples > 1 ? t + ((((k * 7) % samples) + 0.5) / samples - 0.5) * SHUTTER : t;
+    camera.projectionMatrix.copy(proj0);
+    camera.projectionMatrix.elements[8] += jx * 2 / RES; camera.projectionMatrix.elements[9] += jy * 2 / RES;
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    gbufUniforms.uTime.value = tk;
+    const sid = k;
+    for (const m of [halfMat, mainLight, reflLightG, reflLightM]) { m.uniforms.uTime.value = tk; m.uniforms.uSample.value = sid; }
+    // 1. reflections, each from its mirrored camera: path length |L-P| + |P-C'| is the full bounce path
+    renderReflection(RM_GROUND, V3(0, 1, 0), 0, gRG, reflLightG, reflRTg, c.pos, 0.001, true, null);
+    renderReflection(RM_MIRROR, MIRROR.n, MIR_D, gRM, reflLightM, reflRTm, c.pos, 0.075, false, mirrorScissor());
+    // 2. the street itself
+    drawG(gMain, camera, c.pos, new THREE.Vector4(0, 0, 0, 1));
+    setView(halfMat, camera, c.pos); pass(halfMat, halfRT);
+    setView(mainLight, camera, c.pos); pass(mainLight, litRT);
+    accMat.uniforms.uW.value = 1 / samples;
+    renderer.autoClear = false; pass(accMat, accRT); renderer.autoClear = true;
+  }
+  camera.projectionMatrix.copy(proj0);
+  // bloom
+  let src = accRT;
+  for (let i = 0; i < bloomDown.length; i++) { downMat.uniforms.tSrc.value = src.texture; downMat.uniforms.uTexel.value.set(1 / src.width, 1 / src.height); downMat.uniforms.uFirst.value = i === 0 ? 1 : 0; pass(downMat, bloomDown[i]); src = bloomDown[i]; }
+  let prev = bloomDown[bloomDown.length - 1];
+  for (let i = bloomDown.length - 2; i >= 0; i--) { upMat.uniforms.tSrc.value = prev.texture; upMat.uniforms.tBase.value = bloomDown[i].texture; upMat.uniforms.uTexel.value.set(1 / prev.width, 1 / prev.height); pass(upMat, bloomUp[i]); prev = bloomUp[i]; }
+  finalMat.uniforms.tBloom.value = prev.texture; finalMat.uniforms.uFrame.value = frameNo;
+  pass(finalMat, null);
+}
+
+// ── tools for auditing the physics: world position under a pixel, and the clock ──
+function probe(px, py, t) { // px, py in output pixels, origin top-left; returns the surface under that pixel
+  renderFrame(t, 1);
+  const buf = new Float32Array(4);
+  renderer.readRenderTargetPixels(gMain, Math.floor(px * SS), Math.floor(RES - 1 - py * SS), 1, 1, buf, undefined, 0);
+  return Array.from(buf);
+}
+function projectPoint(x, y, z, t) {
+  const c = cameraAt(t); const cm = new THREE.PerspectiveCamera(FOV, 1, 0.08, 400); cm.position.copy(c.pos); cm.lookAt(c.tgt); cm.updateMatrixWorld(true);
+  const p = V3(x, y, z).project(cm); return [(p.x * 0.5 + 0.5) * OUT, (0.5 - p.y * 0.5) * OUT];
+}
+
+// linear radiance (this lamp only) in a small patch of the shaded frame, plus what the G-buffers hold there
+function audit(px, py, t, lamp) {
+  for (const m of [mainLight, reflLightG, reflLightM]) m.uniforms.uAudit.value = lamp + 1;
+  renderFrame(t, 1);
+  for (const m of [mainLight, reflLightG, reflLightM]) m.uniforms.uAudit.value = 0;
+  const X = Math.floor(px * SS), Y = Math.floor(RES - 1 - py * SS);
+  const h = new Uint16Array(5 * 5 * 4); renderer.readRenderTargetPixels(litRT, X - 2, Y - 2, 5, 5, h);
+  const v = []; for (let i = 0; i < 25; i++) v.push(0.2126 * THREE.DataUtils.fromHalfFloat(h[i * 4]) + 0.7152 * THREE.DataUtils.fromHalfFloat(h[i * 4 + 1]) + 0.0722 * THREE.DataUtils.fromHalfFloat(h[i * 4 + 2]));
+  v.sort((a, b) => a - b);
+  const g = (target, size) => { const b = new Float32Array(4); renderer.readRenderTargetPixels(target, Math.floor((X + 0.5) / RES * size), Math.floor((Y + 0.5) / RES * size), 1, 1, b, undefined, 0); return Array.from(b); };
+  return { value: v[12], center: v, main: g(gMain, RES), reflGround: g(gRG, REFL), reflMirror: g(gRM, RES) };
+}
+
+// ── run ──
+const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+window.gpuInfo = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+window.sceneInfo = { staticTriangles: staticB.pos.length / 9, vpls: vpl.count, vplTotal: vpl.total, res: RES, samples: SAMPLES };
+
+if (RENDER_MODE) {
+  document.body.classList.add('render');
+  window.renderAt = (t) => { renderFrame(t, SAMPLES); gl.finish(); return true; };
+  const viewMat = fsMat(`precision highp float; in vec2 vUv; uniform sampler2D tSrc; uniform float uGain; layout(location=0) out vec4 o; void main(){ vec3 c = textureLod(tSrc, vUv, 0.0).rgb*uGain; o = vec4(pow(c/(1.0+c), vec3(1.0/2.2)),1.0); }`, { tSrc: { value: null }, uGain: { value: 1 } });
+  window.dumpRefl = (t, which, gain) => { renderFrame(t, 1); viewMat.uniforms.tSrc.value = (which === 'g' ? reflRTg : reflRTm).texture; viewMat.uniforms.uGain.value = gain || 1; renderer.setRenderTarget(null); pass(viewMat, null); return canvas.toDataURL('image/png'); };
+  // debug: the same instant in a world where no lamp is ever switched on
+  window.setLampsNeverLit = (v) => { shared.uLampTiming.value.forEach((q, i) => { q.x = v ? 1000 : LAMPS[i].on; }); };
+  window.slow = { cameraAt, LAMPS, MIRROR, MIRROR_AIM, audit, probe, projectPoint, frameData: () => canvas.toDataURL('image/png') };
+  window.ready = true;
+} else {
+  let start = null;
+  const restart = () => { start = null; };
+  addEventListener('click', restart);
+  addEventListener('keydown', e => { if (e.code === 'Space') restart(); });
+  const loop = (now) => {
+    if (start === null) start = now;
+    const t = ((now - start) / 1000) % (DURATION + 1.0);
+    renderFrame(Math.min(t, DURATION), 1);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+const loading = document.getElementById('loading'); if (loading) loading.remove();
+
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+browser: C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe
+page: {"gpu":"ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11)","staticTriangles":227554,"vpls":101,"vplTotal":101,"res":2160,"samples":16}
+frame 60/600  36 s
+frame 120/600  49 s
+frame 180/600  62 s
+frame 240/600  75 s
+frame 300/600  88 s
+frame 360/600  103 s
+frame 420/600  119 s
+frame 480/600  135 s
+frame 540/600  150 s
+frame 600/600  164 s
+page errors: none
+done in 167.7 s
